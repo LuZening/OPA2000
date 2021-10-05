@@ -1,0 +1,2287 @@
+EESchema Schematic File Version 4
+EELAYER 30 0
+EELAYER END
+$Descr A4 11693 8268
+encoding utf-8
+Sheet 2 5
+Title ""
+Date ""
+Rev ""
+Comp ""
+Comment1 ""
+Comment2 ""
+Comment3 ""
+Comment4 ""
+$EndDescr
+Text GLabel 9850 2900 0    50   Input ~ 0
+FWDpeak1
+Text GLabel 9850 3000 0    50   Input ~ 0
+FWD1
+Text GLabel 9850 3100 0    50   Input ~ 0
+REVpeak1
+Text GLabel 9850 3200 0    50   Input ~ 0
+REV1
+Text GLabel 9000 3700 0    50   Input ~ 0
+FWDpeak2
+Text GLabel 9000 3800 0    50   Input ~ 0
+FWD2
+Text GLabel 9000 3900 0    50   Input ~ 0
+REVpeak2
+Text GLabel 9000 4000 0    50   Input ~ 0
+REV2
+Text GLabel 9000 850  0    50   Output ~ 0
+Im_sense
+Text GLabel 9000 750  0    50   Output ~ 0
+Vm_sense
+Text GLabel 8700 1950 0    50   Input ~ 0
+Temp1
+Text GLabel 10350 1950 0    50   Input ~ 0
+Temp2
+$Comp
+L Connector_Generic:Conn_01x06 J8
+U 1 1 5E0EA526
+P 10550 3100
+F 0 "J8" H 10468 2575 50  0000 C CNN
+F 1 "SWR1" H 10468 2666 50  0000 C CNN
+F 2 "Connector_JST:JST_PH_B6B-PH-SM4-TB_1x06-1MP_P2.00mm_Vertical" H 10550 3100 50  0001 C CNN
+F 3 "~" H 10550 3100 50  0001 C CNN
+	1    10550 3100
+	1    0    0    1   
+$EndComp
+$Comp
+L Connector_Generic:Conn_01x06 J9
+U 1 1 5E0EBB82
+P 9700 3900
+F 0 "J9" H 9618 3375 50  0000 C CNN
+F 1 "SWR2" H 9618 3466 50  0000 C CNN
+F 2 "Connector_JST:JST_PH_B6B-PH-SM4-TB_1x06-1MP_P2.00mm_Vertical" H 9700 3900 50  0001 C CNN
+F 3 "~" H 9700 3900 50  0001 C CNN
+	1    9700 3900
+	1    0    0    1   
+$EndComp
+$Comp
+L Connector_Generic:Conn_01x02 J6
+U 1 1 5E0EC068
+P 9650 1850
+F 0 "J6" H 9730 1842 50  0000 L CNN
+F 1 "NTC1" H 9730 1751 50  0000 L CNN
+F 2 "Connector_JST:JST_PH_B2B-PH-SM4-TB_1x02-1MP_P2.00mm_Vertical" H 9650 1850 50  0001 C CNN
+F 3 "~" H 9650 1850 50  0001 C CNN
+	1    9650 1850
+	1    0    0    -1  
+$EndComp
+$Comp
+L Connector_Generic:Conn_01x02 J7
+U 1 1 5E0EC668
+P 10800 1850
+F 0 "J7" H 10880 1842 50  0000 L CNN
+F 1 "NTC2" H 10880 1751 50  0000 L CNN
+F 2 "Connector_JST:JST_PH_B2B-PH-SM4-TB_1x02-1MP_P2.00mm_Vertical" H 10800 1850 50  0001 C CNN
+F 3 "~" H 10800 1850 50  0001 C CNN
+	1    10800 1850
+	1    0    0    -1  
+$EndComp
+$Comp
+L Connector_Generic:Conn_01x04 J5
+U 1 1 5E0ECEE9
+P 9700 850
+F 0 "J5" H 9780 842 50  0000 L CNN
+F 1 "PowerSense" H 9780 751 50  0000 L CNN
+F 2 "Connector_JST:JST_PH_B4B-PH-SM4-TB_1x04-1MP_P2.00mm_Vertical" H 9700 850 50  0001 C CNN
+F 3 "~" H 9700 850 50  0001 C CNN
+	1    9700 850 
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	9000 750  9500 750 
+Wire Wire Line
+	9000 850  9500 850 
+$Comp
+L power:GNDA #PWR067
+U 1 1 5E0EEC17
+P 9400 1050
+F 0 "#PWR067" H 9400 800 50  0001 C CNN
+F 1 "GNDA" H 9405 877 50  0000 C CNN
+F 2 "" H 9400 1050 50  0001 C CNN
+F 3 "" H 9400 1050 50  0001 C CNN
+	1    9400 1050
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	9400 1050 9500 1050
+$Comp
+L power:GNDA #PWR069
+U 1 1 5E0EFC9E
+P 10500 2250
+F 0 "#PWR069" H 10500 2000 50  0001 C CNN
+F 1 "GNDA" H 10505 2077 50  0000 C CNN
+F 2 "" H 10500 2250 50  0001 C CNN
+F 3 "" H 10500 2250 50  0001 C CNN
+	1    10500 2250
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	10500 2000 10500 1950
+Wire Wire Line
+	10500 1950 10600 1950
+Wire Wire Line
+	9850 2900 10350 2900
+Wire Wire Line
+	9850 3000 10350 3000
+Wire Wire Line
+	9850 3100 10350 3100
+Wire Wire Line
+	9850 3200 10350 3200
+$Comp
+L power:GNDA #PWR070
+U 1 1 5E0F1B8E
+P 10250 3350
+F 0 "#PWR070" H 10250 3100 50  0001 C CNN
+F 1 "GNDA" H 10255 3177 50  0000 C CNN
+F 2 "" H 10250 3350 50  0001 C CNN
+F 3 "" H 10250 3350 50  0001 C CNN
+	1    10250 3350
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	10250 3350 10250 3300
+Wire Wire Line
+	10250 3300 10350 3300
+Wire Wire Line
+	10150 2800 10350 2800
+Wire Wire Line
+	9000 3800 9500 3800
+Wire Wire Line
+	9000 3700 9500 3700
+Wire Wire Line
+	9000 3900 9500 3900
+Wire Wire Line
+	9000 4000 9500 4000
+$Comp
+L power:GNDA #PWR066
+U 1 1 5E0F505D
+P 9300 4100
+F 0 "#PWR066" H 9300 3850 50  0001 C CNN
+F 1 "GNDA" H 9305 3927 50  0000 C CNN
+F 2 "" H 9300 4100 50  0001 C CNN
+F 3 "" H 9300 4100 50  0001 C CNN
+	1    9300 4100
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	9300 4100 9500 4100
+$Comp
+L Amplifier_Operational:LMV324 U7
+U 1 1 5E0F755F
+P 6250 1350
+F 0 "U7" H 6700 1550 50  0000 C CNN
+F 1 "LMV324" H 6700 1450 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6200 1450 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6300 1550 50  0001 C CNN
+	1    6250 1350
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U7
+U 2 1 5E1008E9
+P 6250 2150
+F 0 "U7" H 6250 2517 50  0000 C CNN
+F 1 "LMV324" H 6250 2426 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6200 2250 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6300 2350 50  0001 C CNN
+	2    6250 2150
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U7
+U 3 1 5E105FA7
+P 6250 2650
+F 0 "U7" H 6250 3017 50  0000 C CNN
+F 1 "LMV324" H 6250 2926 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6200 2750 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6300 2850 50  0001 C CNN
+	3    6250 2650
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U7
+U 4 1 5E107CED
+P 6250 3150
+F 0 "U7" H 6250 3517 50  0000 C CNN
+F 1 "LMV324" H 6250 3426 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6200 3250 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6300 3350 50  0001 C CNN
+	4    6250 3150
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U7
+U 5 1 5E109628
+P 6250 1350
+F 0 "U7" H 6062 1396 50  0000 R CNN
+F 1 "LMV324" H 6062 1305 50  0000 R CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6200 1450 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6300 1550 50  0001 C CNN
+	5    6250 1350
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Device:C_Small C23
+U 1 1 5E12A93E
+P 6050 950
+F 0 "C23" H 5750 1000 50  0000 L CNN
+F 1 "C_Small" H 5650 900 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6050 950 50  0001 C CNN
+F 3 "~" H 6050 950 50  0001 C CNN
+	1    6050 950 
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6050 850  6350 850 
+Wire Wire Line
+	6350 850  6350 1050
+$Comp
+L power:GNDA #PWR046
+U 1 1 5E12B9B7
+P 6050 1050
+F 0 "#PWR046" H 6050 800 50  0001 C CNN
+F 1 "GNDA" H 6055 877 50  0000 C CNN
+F 2 "" H 6050 1050 50  0001 C CNN
+F 3 "" H 6050 1050 50  0001 C CNN
+	1    6050 1050
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:+3.3V #PWR049
+U 1 1 5E12BEF4
+P 6350 800
+F 0 "#PWR049" H 6350 650 50  0001 C CNN
+F 1 "+3.3V" H 6365 973 50  0000 C CNN
+F 2 "" H 6350 800 50  0001 C CNN
+F 3 "" H 6350 800 50  0001 C CNN
+	1    6350 800 
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6350 800  6350 850 
+Connection ~ 6350 850 
+$Comp
+L power:GNDA #PWR050
+U 1 1 5E12CA16
+P 6350 1800
+F 0 "#PWR050" H 6350 1550 50  0001 C CNN
+F 1 "GNDA" H 6355 1627 50  0000 C CNN
+F 2 "" H 6350 1800 50  0001 C CNN
+F 3 "" H 6350 1800 50  0001 C CNN
+	1    6350 1800
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6350 1800 6350 1650
+Wire Wire Line
+	5950 1350 5900 1350
+Wire Wire Line
+	5900 1350 5900 1700
+Wire Wire Line
+	5900 1700 6600 1700
+Wire Wire Line
+	6600 1700 6600 1450
+Wire Wire Line
+	6600 1450 6550 1450
+Wire Wire Line
+	5950 2150 5900 2150
+Wire Wire Line
+	5900 2150 5900 2400
+Wire Wire Line
+	5900 2400 6600 2400
+Wire Wire Line
+	6600 2400 6600 2250
+Wire Wire Line
+	6600 2250 6550 2250
+Wire Wire Line
+	5950 2650 5900 2650
+Wire Wire Line
+	5900 2650 5900 2900
+Wire Wire Line
+	5900 2900 6600 2900
+Wire Wire Line
+	6600 2900 6600 2750
+Wire Wire Line
+	6600 2750 6550 2750
+Wire Wire Line
+	5950 3150 5900 3150
+Wire Wire Line
+	5900 3150 5900 3400
+Wire Wire Line
+	5900 3400 6600 3400
+Wire Wire Line
+	6600 3400 6600 3250
+Wire Wire Line
+	6600 3250 6550 3250
+$Comp
+L Device:C_Small C13
+U 1 1 5E19AF86
+P 1850 850
+F 0 "C13" H 1942 896 50  0000 L CNN
+F 1 "104" H 1942 805 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 1850 850 50  0001 C CNN
+F 3 "~" H 1850 850 50  0001 C CNN
+	1    1850 850 
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	1850 750  2150 750 
+Wire Wire Line
+	2150 750  2150 950 
+$Comp
+L power:GNDA #PWR019
+U 1 1 5E19AF8E
+P 1850 950
+F 0 "#PWR019" H 1850 700 50  0001 C CNN
+F 1 "GNDA" H 1855 777 50  0000 C CNN
+F 2 "" H 1850 950 50  0001 C CNN
+F 3 "" H 1850 950 50  0001 C CNN
+	1    1850 950 
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:+3.3V #PWR021
+U 1 1 5E19AF94
+P 2150 700
+F 0 "#PWR021" H 2150 550 50  0001 C CNN
+F 1 "+3.3V" H 2300 750 50  0000 C CNN
+F 2 "" H 2150 700 50  0001 C CNN
+F 3 "" H 2150 700 50  0001 C CNN
+	1    2150 700 
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2150 700  2150 750 
+Connection ~ 2150 750 
+$Comp
+L power:GNDA #PWR024
+U 1 1 5E19AF9C
+P 2300 1700
+F 0 "#PWR024" H 2300 1450 50  0001 C CNN
+F 1 "GNDA" H 2305 1527 50  0000 C CNN
+F 2 "" H 2300 1700 50  0001 C CNN
+F 3 "" H 2300 1700 50  0001 C CNN
+	1    2300 1700
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2150 1700 2150 1550
+Wire Wire Line
+	1750 1250 1700 1250
+Wire Wire Line
+	1700 1250 1700 1600
+Wire Wire Line
+	1700 1600 2400 1600
+Wire Wire Line
+	2400 1600 2400 1350
+Wire Wire Line
+	2400 1350 2350 1350
+Wire Wire Line
+	1750 2550 1700 2550
+Wire Wire Line
+	1700 2550 1700 2800
+Wire Wire Line
+	1700 2800 2400 2800
+Wire Wire Line
+	2400 2800 2400 2650
+Wire Wire Line
+	2400 2650 2350 2650
+$Comp
+L Device:R_Small R35
+U 1 1 5E1B0EDC
+P 7050 1250
+F 0 "R35" V 6854 1250 50  0000 C CNN
+F 1 "1K" V 6945 1250 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 7050 1250 50  0001 C CNN
+F 3 "~" H 7050 1250 50  0001 C CNN
+	1    7050 1250
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:C_Small C28
+U 1 1 5E1B2B20
+P 6800 1400
+F 0 "C28" H 6892 1446 50  0000 L CNN
+F 1 "104" H 6892 1355 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6800 1400 50  0001 C CNN
+F 3 "~" H 6800 1400 50  0001 C CNN
+	1    6800 1400
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6550 1250 6800 1250
+Wire Wire Line
+	6800 1300 6800 1250
+Connection ~ 6800 1250
+Wire Wire Line
+	6800 1250 6950 1250
+$Comp
+L power:GNDA #PWR055
+U 1 1 5E1BC757
+P 6800 1600
+F 0 "#PWR055" H 6800 1350 50  0001 C CNN
+F 1 "GNDA" H 6805 1427 50  0000 C CNN
+F 2 "" H 6800 1600 50  0001 C CNN
+F 3 "" H 6800 1600 50  0001 C CNN
+	1    6800 1600
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6800 1500 6800 1600
+Wire Wire Line
+	7150 1250 7250 1250
+Text GLabel 7250 1250 2    50   Input ~ 0
+FWDpeak1
+$Comp
+L Device:R_Small R36
+U 1 1 5E1C863B
+P 7050 2050
+F 0 "R36" V 6854 2050 50  0000 C CNN
+F 1 "1K" V 6945 2050 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 7050 2050 50  0001 C CNN
+F 3 "~" H 7050 2050 50  0001 C CNN
+	1    7050 2050
+	0    1    1    0   
+$EndComp
+Wire Wire Line
+	6950 2050 6800 2050
+$Comp
+L Device:C_Small C29
+U 1 1 5E1CE033
+P 6800 2200
+F 0 "C29" H 6892 2246 50  0000 L CNN
+F 1 "104" H 6892 2155 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6800 2200 50  0001 C CNN
+F 3 "~" H 6800 2200 50  0001 C CNN
+	1    6800 2200
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GNDA #PWR056
+U 1 1 5E1CE33C
+P 6800 2350
+F 0 "#PWR056" H 6800 2100 50  0001 C CNN
+F 1 "GNDA" H 6805 2177 50  0000 C CNN
+F 2 "" H 6800 2350 50  0001 C CNN
+F 3 "" H 6800 2350 50  0001 C CNN
+	1    6800 2350
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6800 2300 6800 2350
+Wire Wire Line
+	6800 2100 6800 2050
+Connection ~ 6800 2050
+Wire Wire Line
+	6800 2050 6550 2050
+Wire Wire Line
+	7150 2050 7250 2050
+Text GLabel 7250 2050 2    50   Input ~ 0
+FWD1
+$Comp
+L Device:R_Small R37
+U 1 1 5E1DD360
+P 7100 2550
+F 0 "R37" V 6904 2550 50  0000 C CNN
+F 1 "1K" V 6995 2550 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 7100 2550 50  0001 C CNN
+F 3 "~" H 7100 2550 50  0001 C CNN
+	1    7100 2550
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:C_Small C30
+U 1 1 5E1DD8E4
+P 6800 2700
+F 0 "C30" H 6892 2746 50  0000 L CNN
+F 1 "104" H 6892 2655 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6800 2700 50  0001 C CNN
+F 3 "~" H 6800 2700 50  0001 C CNN
+	1    6800 2700
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6550 2550 6800 2550
+Wire Wire Line
+	6800 2600 6800 2550
+Connection ~ 6800 2550
+Wire Wire Line
+	6800 2550 7000 2550
+Text GLabel 7300 2550 2    50   Input ~ 0
+REVpeak1
+Wire Wire Line
+	7300 2550 7200 2550
+$Comp
+L power:GNDA #PWR057
+U 1 1 5E1F1528
+P 6800 2800
+F 0 "#PWR057" H 6800 2550 50  0001 C CNN
+F 1 "GNDA" H 6805 2627 50  0000 C CNN
+F 2 "" H 6800 2800 50  0001 C CNN
+F 3 "" H 6800 2800 50  0001 C CNN
+	1    6800 2800
+	1    0    0    -1  
+$EndComp
+$Comp
+L Device:R_Small R38
+U 1 1 5E1F190A
+P 7100 3050
+F 0 "R38" V 6904 3050 50  0000 C CNN
+F 1 "1K" V 6995 3050 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 7100 3050 50  0001 C CNN
+F 3 "~" H 7100 3050 50  0001 C CNN
+	1    7100 3050
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:C_Small C31
+U 1 1 5E1F1B8F
+P 6800 3150
+F 0 "C31" H 6892 3196 50  0000 L CNN
+F 1 "104" H 6892 3105 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6800 3150 50  0001 C CNN
+F 3 "~" H 6800 3150 50  0001 C CNN
+	1    6800 3150
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	7000 3050 6800 3050
+Connection ~ 6800 3050
+Wire Wire Line
+	6800 3050 6550 3050
+$Comp
+L power:GNDA #PWR058
+U 1 1 5E1F72E7
+P 6800 3300
+F 0 "#PWR058" H 6800 3050 50  0001 C CNN
+F 1 "GNDA" H 6805 3127 50  0000 C CNN
+F 2 "" H 6800 3300 50  0001 C CNN
+F 3 "" H 6800 3300 50  0001 C CNN
+	1    6800 3300
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6800 3300 6800 3250
+Text GLabel 7300 3050 2    50   Input ~ 0
+REV1
+Wire Wire Line
+	7300 3050 7200 3050
+$Comp
+L Amplifier_Operational:LMV324 U6
+U 1 1 5E214358
+P 6100 4600
+F 0 "U6" H 6100 4967 50  0000 C CNN
+F 1 "LMV324" H 6100 4876 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6050 4700 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6150 4800 50  0001 C CNN
+	1    6100 4600
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U6
+U 2 1 5E21435E
+P 6100 5400
+F 0 "U6" H 6100 5767 50  0000 C CNN
+F 1 "LMV324" H 6100 5676 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6050 5500 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6150 5600 50  0001 C CNN
+	2    6100 5400
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U6
+U 3 1 5E214364
+P 6100 5900
+F 0 "U6" H 6100 6267 50  0000 C CNN
+F 1 "LMV324" H 6100 6176 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6050 6000 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6150 6100 50  0001 C CNN
+	3    6100 5900
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U6
+U 4 1 5E21436A
+P 6100 6400
+F 0 "U6" H 6100 6767 50  0000 C CNN
+F 1 "LMV324" H 6100 6676 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6050 6500 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6150 6600 50  0001 C CNN
+	4    6100 6400
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U6
+U 5 1 5E214370
+P 6100 4600
+F 0 "U6" H 5912 4646 50  0000 R CNN
+F 1 "LMV324" H 5912 4555 50  0000 R CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 6050 4700 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 6150 4800 50  0001 C CNN
+	5    6100 4600
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Device:C_Small C22
+U 1 1 5E214376
+P 5900 4200
+F 0 "C22" H 5992 4246 50  0000 L CNN
+F 1 "C_Small" H 5992 4155 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 5900 4200 50  0001 C CNN
+F 3 "~" H 5900 4200 50  0001 C CNN
+	1    5900 4200
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	5900 4100 6200 4100
+Wire Wire Line
+	6200 4100 6200 4300
+$Comp
+L power:GNDA #PWR045
+U 1 1 5E21437E
+P 5900 4300
+F 0 "#PWR045" H 5900 4050 50  0001 C CNN
+F 1 "GNDA" H 5905 4127 50  0000 C CNN
+F 2 "" H 5900 4300 50  0001 C CNN
+F 3 "" H 5900 4300 50  0001 C CNN
+	1    5900 4300
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:+3.3V #PWR047
+U 1 1 5E214384
+P 6200 4050
+F 0 "#PWR047" H 6200 3900 50  0001 C CNN
+F 1 "+3.3V" H 6215 4223 50  0000 C CNN
+F 2 "" H 6200 4050 50  0001 C CNN
+F 3 "" H 6200 4050 50  0001 C CNN
+	1    6200 4050
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6200 4050 6200 4100
+Connection ~ 6200 4100
+$Comp
+L power:GNDA #PWR048
+U 1 1 5E21438C
+P 6200 5050
+F 0 "#PWR048" H 6200 4800 50  0001 C CNN
+F 1 "GNDA" H 6205 4877 50  0000 C CNN
+F 2 "" H 6200 5050 50  0001 C CNN
+F 3 "" H 6200 5050 50  0001 C CNN
+	1    6200 5050
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6200 5050 6200 4900
+Wire Wire Line
+	5800 4600 5750 4600
+Wire Wire Line
+	5750 4600 5750 4950
+Wire Wire Line
+	5750 4950 6450 4950
+Wire Wire Line
+	6450 4950 6450 4700
+Wire Wire Line
+	6450 4700 6400 4700
+Wire Wire Line
+	5800 5400 5750 5400
+Wire Wire Line
+	5750 5400 5750 5650
+Wire Wire Line
+	5750 5650 6450 5650
+Wire Wire Line
+	6450 5650 6450 5500
+Wire Wire Line
+	6450 5500 6400 5500
+Wire Wire Line
+	5800 5900 5750 5900
+Wire Wire Line
+	5750 5900 5750 6150
+Wire Wire Line
+	5750 6150 6450 6150
+Wire Wire Line
+	6450 6150 6450 6000
+Wire Wire Line
+	6450 6000 6400 6000
+Wire Wire Line
+	5800 6400 5750 6400
+Wire Wire Line
+	5750 6400 5750 6650
+Wire Wire Line
+	5750 6650 6450 6650
+Wire Wire Line
+	6450 6650 6450 6500
+Wire Wire Line
+	6450 6500 6400 6500
+$Comp
+L Device:R_Small R31
+U 1 1 5E2143A7
+P 6900 4500
+F 0 "R31" V 6704 4500 50  0000 C CNN
+F 1 "1K" V 6795 4500 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 6900 4500 50  0001 C CNN
+F 3 "~" H 6900 4500 50  0001 C CNN
+	1    6900 4500
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:C_Small C24
+U 1 1 5E2143AD
+P 6650 4650
+F 0 "C24" H 6742 4696 50  0000 L CNN
+F 1 "104" H 6742 4605 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6650 4650 50  0001 C CNN
+F 3 "~" H 6650 4650 50  0001 C CNN
+	1    6650 4650
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6400 4500 6650 4500
+Wire Wire Line
+	6650 4550 6650 4500
+Connection ~ 6650 4500
+Wire Wire Line
+	6650 4500 6800 4500
+$Comp
+L power:GNDA #PWR051
+U 1 1 5E2143B7
+P 6650 4850
+F 0 "#PWR051" H 6650 4600 50  0001 C CNN
+F 1 "GNDA" H 6655 4677 50  0000 C CNN
+F 2 "" H 6650 4850 50  0001 C CNN
+F 3 "" H 6650 4850 50  0001 C CNN
+	1    6650 4850
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6650 4750 6650 4850
+Wire Wire Line
+	7000 4500 7100 4500
+$Comp
+L Device:R_Small R32
+U 1 1 5E2143C0
+P 6900 5300
+F 0 "R32" V 6704 5300 50  0000 C CNN
+F 1 "1K" V 6795 5300 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 6900 5300 50  0001 C CNN
+F 3 "~" H 6900 5300 50  0001 C CNN
+	1    6900 5300
+	0    1    1    0   
+$EndComp
+Wire Wire Line
+	6800 5300 6650 5300
+$Comp
+L Device:C_Small C25
+U 1 1 5E2143C7
+P 6650 5450
+F 0 "C25" H 6742 5496 50  0000 L CNN
+F 1 "104" H 6742 5405 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6650 5450 50  0001 C CNN
+F 3 "~" H 6650 5450 50  0001 C CNN
+	1    6650 5450
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GNDA #PWR052
+U 1 1 5E2143CD
+P 6650 5600
+F 0 "#PWR052" H 6650 5350 50  0001 C CNN
+F 1 "GNDA" H 6655 5427 50  0000 C CNN
+F 2 "" H 6650 5600 50  0001 C CNN
+F 3 "" H 6650 5600 50  0001 C CNN
+	1    6650 5600
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6650 5550 6650 5600
+Wire Wire Line
+	6650 5350 6650 5300
+Connection ~ 6650 5300
+Wire Wire Line
+	6650 5300 6400 5300
+Wire Wire Line
+	7000 5300 7100 5300
+$Comp
+L Device:R_Small R33
+U 1 1 5E2143D9
+P 6950 5800
+F 0 "R33" V 6754 5800 50  0000 C CNN
+F 1 "1K" V 6845 5800 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 6950 5800 50  0001 C CNN
+F 3 "~" H 6950 5800 50  0001 C CNN
+	1    6950 5800
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:C_Small C26
+U 1 1 5E2143DF
+P 6650 5950
+F 0 "C26" H 6742 5996 50  0000 L CNN
+F 1 "104" H 6742 5905 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6650 5950 50  0001 C CNN
+F 3 "~" H 6650 5950 50  0001 C CNN
+	1    6650 5950
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6400 5800 6650 5800
+Wire Wire Line
+	6650 5850 6650 5800
+Connection ~ 6650 5800
+Wire Wire Line
+	6650 5800 6850 5800
+Wire Wire Line
+	7150 5800 7050 5800
+$Comp
+L power:GNDA #PWR053
+U 1 1 5E2143EB
+P 6650 6050
+F 0 "#PWR053" H 6650 5800 50  0001 C CNN
+F 1 "GNDA" H 6655 5877 50  0000 C CNN
+F 2 "" H 6650 6050 50  0001 C CNN
+F 3 "" H 6650 6050 50  0001 C CNN
+	1    6650 6050
+	1    0    0    -1  
+$EndComp
+$Comp
+L Device:R_Small R34
+U 1 1 5E2143F1
+P 6950 6300
+F 0 "R34" V 6754 6300 50  0000 C CNN
+F 1 "1K" V 6845 6300 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 6950 6300 50  0001 C CNN
+F 3 "~" H 6950 6300 50  0001 C CNN
+	1    6950 6300
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:C_Small C27
+U 1 1 5E2143F7
+P 6650 6400
+F 0 "C27" H 6742 6446 50  0000 L CNN
+F 1 "104" H 6742 6355 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 6650 6400 50  0001 C CNN
+F 3 "~" H 6650 6400 50  0001 C CNN
+	1    6650 6400
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6850 6300 6650 6300
+Connection ~ 6650 6300
+Wire Wire Line
+	6650 6300 6400 6300
+$Comp
+L power:GNDA #PWR054
+U 1 1 5E214400
+P 6650 6550
+F 0 "#PWR054" H 6650 6300 50  0001 C CNN
+F 1 "GNDA" H 6655 6377 50  0000 C CNN
+F 2 "" H 6650 6550 50  0001 C CNN
+F 3 "" H 6650 6550 50  0001 C CNN
+	1    6650 6550
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	6650 6550 6650 6500
+Wire Wire Line
+	7150 6300 7050 6300
+Text GLabel 7100 4500 2    50   Input ~ 0
+FWDpeak2
+Text GLabel 7100 5300 2    50   Input ~ 0
+FWD2
+Text GLabel 7150 5800 2    50   Input ~ 0
+REVpeak2
+Text GLabel 7150 6300 2    50   Input ~ 0
+REV2
+Wire Wire Line
+	5900 1350 5400 1350
+Wire Wire Line
+	5400 1350 5400 1250
+Connection ~ 5900 1350
+Wire Wire Line
+	5900 2150 5400 2150
+Connection ~ 5900 2150
+Connection ~ 5900 2650
+Wire Wire Line
+	5200 2550 5200 2650
+Wire Wire Line
+	5200 2650 5900 2650
+Connection ~ 5750 4600
+Wire Wire Line
+	5600 5250 5600 5400
+Wire Wire Line
+	5600 5400 5750 5400
+Connection ~ 5750 5400
+Wire Wire Line
+	5450 5850 5450 5900
+Wire Wire Line
+	5450 5900 5750 5900
+Connection ~ 5750 5900
+$Comp
+L Amplifier_Operational:LMV324 U4
+U 1 1 5E296026
+P 2100 4550
+F 0 "U4" H 2250 4400 50  0000 C CNN
+F 1 "LMV324" H 2100 4826 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 2050 4650 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2150 4750 50  0001 C CNN
+	1    2100 4550
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U4
+U 2 1 5E29602C
+P 2100 5350
+F 0 "U4" H 2100 5717 50  0000 C CNN
+F 1 "LMV324" H 2100 5626 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 2050 5450 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2150 5550 50  0001 C CNN
+	2    2100 5350
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV324 U4
+U 5 1 5E29603E
+P 2100 4550
+F 0 "U4" H 1900 4800 50  0000 R CNN
+F 1 "LMV324" H 2800 4500 50  0000 R CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 2050 4650 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2150 4750 50  0001 C CNN
+	5    2100 4550
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Device:C_Small C14
+U 1 1 5E296044
+P 1900 4150
+F 0 "C14" H 1992 4196 50  0000 L CNN
+F 1 "104" H 1992 4105 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 1900 4150 50  0001 C CNN
+F 3 "~" H 1900 4150 50  0001 C CNN
+	1    1900 4150
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	1900 4050 2200 4050
+Wire Wire Line
+	2200 4050 2200 4250
+$Comp
+L power:GNDA #PWR020
+U 1 1 5E29604C
+P 1900 4250
+F 0 "#PWR020" H 1900 4000 50  0001 C CNN
+F 1 "GNDA" H 1905 4077 50  0000 C CNN
+F 2 "" H 1900 4250 50  0001 C CNN
+F 3 "" H 1900 4250 50  0001 C CNN
+	1    1900 4250
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:+3.3V #PWR022
+U 1 1 5E296052
+P 2200 4000
+F 0 "#PWR022" H 2200 3850 50  0001 C CNN
+F 1 "+3.3V" H 2215 4173 50  0000 C CNN
+F 2 "" H 2200 4000 50  0001 C CNN
+F 3 "" H 2200 4000 50  0001 C CNN
+	1    2200 4000
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2200 4000 2200 4050
+Connection ~ 2200 4050
+$Comp
+L power:GNDA #PWR023
+U 1 1 5E29605A
+P 2200 5000
+F 0 "#PWR023" H 2200 4750 50  0001 C CNN
+F 1 "GNDA" H 2205 4827 50  0000 C CNN
+F 2 "" H 2200 5000 50  0001 C CNN
+F 3 "" H 2200 5000 50  0001 C CNN
+	1    2200 5000
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2200 5000 2200 4850
+Wire Wire Line
+	1800 4550 1750 4550
+Wire Wire Line
+	1750 4550 1750 4900
+Wire Wire Line
+	1750 4900 2450 4900
+Wire Wire Line
+	2450 4900 2450 4650
+Wire Wire Line
+	2450 4650 2400 4650
+$Comp
+L Device:R_Small R26
+U 1 1 5E2A2BD7
+P 3000 4450
+F 0 "R26" V 2804 4450 50  0000 C CNN
+F 1 "1K" V 2895 4450 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 3000 4450 50  0001 C CNN
+F 3 "~" H 3000 4450 50  0001 C CNN
+	1    3000 4450
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:C_Small C17
+U 1 1 5E2A3477
+P 8900 2150
+F 0 "C17" H 8992 2196 50  0000 L CNN
+F 1 "104" H 8992 2105 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 8900 2150 50  0001 C CNN
+F 3 "~" H 8900 2150 50  0001 C CNN
+	1    8900 2150
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GNDA #PWR027
+U 1 1 5E2B87E3
+P 8900 2250
+F 0 "#PWR027" H 8900 2000 50  0001 C CNN
+F 1 "GNDA" H 8905 2077 50  0000 C CNN
+F 2 "" H 8900 2250 50  0001 C CNN
+F 3 "" H 8900 2250 50  0001 C CNN
+	1    8900 2250
+	1    0    0    -1  
+$EndComp
+Text GLabel 3200 4450 2    50   Input ~ 0
+Temp1
+Wire Wire Line
+	3200 4450 3100 4450
+Wire Wire Line
+	1750 4550 1450 4550
+Wire Wire Line
+	1450 4550 1450 5100
+Wire Wire Line
+	1450 5100 2600 5100
+Wire Wire Line
+	2600 5100 2600 5450
+Connection ~ 1750 4550
+$Comp
+L Device:R_Small R21
+U 1 1 5E2DA8D2
+P 2950 5100
+F 0 "R21" H 2891 5054 50  0000 R CNN
+F 1 "2.2K" H 2891 5145 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 2950 5100 50  0001 C CNN
+F 3 "~" H 2950 5100 50  0001 C CNN
+	1    2950 5100
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	2400 5250 2950 5250
+$Comp
+L Device:R_Small R22
+U 1 1 5E2E6A29
+P 2950 5400
+F 0 "R22" H 2891 5354 50  0000 R CNN
+F 1 "1K" H 2891 5445 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 2950 5400 50  0001 C CNN
+F 3 "~" H 2950 5400 50  0001 C CNN
+	1    2950 5400
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	2950 5200 2950 5250
+Connection ~ 2950 5250
+Wire Wire Line
+	2950 5250 2950 5300
+$Comp
+L power:GNDA #PWR032
+U 1 1 5E2F28B6
+P 2950 5550
+F 0 "#PWR032" H 2950 5300 50  0001 C CNN
+F 1 "GNDA" H 2955 5377 50  0000 C CNN
+F 2 "" H 2950 5550 50  0001 C CNN
+F 3 "" H 2950 5550 50  0001 C CNN
+	1    2950 5550
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2950 5550 2950 5500
+Wire Wire Line
+	2950 5000 2950 4950
+$Comp
+L power:+3.3V #PWR031
+U 1 1 5E30A31E
+P 2950 4950
+F 0 "#PWR031" H 2950 4800 50  0001 C CNN
+F 1 "+3.3V" H 2965 5123 50  0000 C CNN
+F 2 "" H 2950 4950 50  0001 C CNN
+F 3 "" H 2950 4950 50  0001 C CNN
+	1    2950 4950
+	1    0    0    -1  
+$EndComp
+$Comp
+L Device:R_Small R39
+U 1 1 5E30AF6A
+P 10500 2100
+F 0 "R39" H 10441 2054 50  0000 R CNN
+F 1 "3.3K" H 10441 2145 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 10500 2100 50  0001 C CNN
+F 3 "~" H 10500 2100 50  0001 C CNN
+	1    10500 2100
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	10500 2200 10500 2250
+$Comp
+L Device:R_Small R40
+U 1 1 5E325089
+P 9350 2150
+F 0 "R40" H 9291 2104 50  0000 R CNN
+F 1 "3.3K" H 9291 2195 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 9350 2150 50  0001 C CNN
+F 3 "~" H 9350 2150 50  0001 C CNN
+	1    9350 2150
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	1300 4550 1450 4550
+Connection ~ 1450 4550
+Wire Wire Line
+	2450 6300 2400 6300
+Wire Wire Line
+	2450 6450 2450 6300
+Wire Wire Line
+	1750 6450 2450 6450
+Wire Wire Line
+	1750 6200 1750 6450
+Wire Wire Line
+	1800 6200 1750 6200
+$Comp
+L Amplifier_Operational:LMV324 U4
+U 3 1 5E296032
+P 2100 6200
+F 0 "U4" H 2100 6567 50  0000 C CNN
+F 1 "LMV324" H 2100 6476 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 2050 6300 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2150 6400 50  0001 C CNN
+	3    2100 6200
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Device:R_Small R23
+U 1 1 5E38EC8D
+P 2950 6100
+F 0 "R23" V 2754 6100 50  0000 C CNN
+F 1 "1K" V 2845 6100 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 2950 6100 50  0001 C CNN
+F 3 "~" H 2950 6100 50  0001 C CNN
+	1    2950 6100
+	0    1    1    0   
+$EndComp
+Text GLabel 3200 6100 2    50   Input ~ 0
+Temp2
+Wire Wire Line
+	3200 6100 3050 6100
+Connection ~ 1750 6200
+Wire Wire Line
+	1550 6200 1550 6700
+Wire Wire Line
+	1550 6700 2600 6700
+Wire Wire Line
+	2600 6700 2600 7050
+Wire Wire Line
+	1350 6200 1550 6200
+Connection ~ 1550 6200
+Wire Wire Line
+	1550 6200 1750 6200
+Wire Wire Line
+	2400 6850 2950 6850
+$Comp
+L Device:R_Small R24
+U 1 1 5E42907A
+P 2950 6700
+F 0 "R24" H 2891 6654 50  0000 R CNN
+F 1 "1K" H 2891 6745 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 2950 6700 50  0001 C CNN
+F 3 "~" H 2950 6700 50  0001 C CNN
+	1    2950 6700
+	-1   0    0    1   
+$EndComp
+$Comp
+L Device:R_Small R25
+U 1 1 5E4293BE
+P 2950 7000
+F 0 "R25" H 2891 6954 50  0000 R CNN
+F 1 "1K" H 2891 7045 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 2950 7000 50  0001 C CNN
+F 3 "~" H 2950 7000 50  0001 C CNN
+	1    2950 7000
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	2950 6800 2950 6850
+Connection ~ 2950 6850
+Wire Wire Line
+	2950 6850 2950 6900
+$Comp
+L power:+3.3V #PWR033
+U 1 1 5E43831F
+P 2950 6550
+F 0 "#PWR033" H 2950 6400 50  0001 C CNN
+F 1 "+3.3V" H 3100 6600 50  0000 C CNN
+F 2 "" H 2950 6550 50  0001 C CNN
+F 3 "" H 2950 6550 50  0001 C CNN
+	1    2950 6550
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2950 6600 2950 6550
+$Comp
+L power:GNDA #PWR034
+U 1 1 5E448460
+P 2950 7200
+F 0 "#PWR034" H 2950 6950 50  0001 C CNN
+F 1 "GNDA" H 2955 7027 50  0000 C CNN
+F 2 "" H 2950 7200 50  0001 C CNN
+F 3 "" H 2950 7200 50  0001 C CNN
+	1    2950 7200
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2950 7200 2950 7150
+$Comp
+L Device:R_Small R15
+U 1 1 5E48743D
+P 2900 1150
+F 0 "R15" V 2704 1150 50  0000 C CNN
+F 1 "1K" V 2795 1150 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 2900 1150 50  0001 C CNN
+F 3 "~" H 2900 1150 50  0001 C CNN
+	1    2900 1150
+	0    1    1    0   
+$EndComp
+Wire Wire Line
+	2800 1150 2650 1150
+$Comp
+L Device:C_Small C15
+U 1 1 5E4975F0
+P 2650 1400
+F 0 "C15" H 2742 1446 50  0000 L CNN
+F 1 "104" H 2742 1355 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 2650 1400 50  0001 C CNN
+F 3 "~" H 2650 1400 50  0001 C CNN
+	1    2650 1400
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2650 1300 2650 1150
+Connection ~ 2650 1150
+Wire Wire Line
+	2650 1150 2350 1150
+$Comp
+L power:GNDA #PWR025
+U 1 1 5E4A796A
+P 2650 1650
+F 0 "#PWR025" H 2650 1400 50  0001 C CNN
+F 1 "GNDA" H 2655 1477 50  0000 C CNN
+F 2 "" H 2650 1650 50  0001 C CNN
+F 3 "" H 2650 1650 50  0001 C CNN
+	1    2650 1650
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2650 1650 2650 1500
+Wire Wire Line
+	3000 1150 3150 1150
+Text GLabel 3150 1150 2    50   Input ~ 0
+Vm_sense
+Wire Wire Line
+	2750 2450 2600 2450
+$Comp
+L Device:C_Small C16
+U 1 1 5E4FC4B3
+P 2600 2600
+F 0 "C16" H 2692 2646 50  0000 L CNN
+F 1 "104" H 2692 2555 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 2600 2600 50  0001 C CNN
+F 3 "~" H 2600 2600 50  0001 C CNN
+	1    2600 2600
+	1    0    0    1   
+$EndComp
+Wire Wire Line
+	2600 2500 2600 2450
+Connection ~ 2600 2450
+$Comp
+L power:GNDA #PWR026
+U 1 1 5E50D396
+P 2600 2750
+F 0 "#PWR026" H 2600 2500 50  0001 C CNN
+F 1 "GNDA" H 2605 2577 50  0000 C CNN
+F 2 "" H 2600 2750 50  0001 C CNN
+F 3 "" H 2600 2750 50  0001 C CNN
+	1    2600 2750
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2600 2750 2600 2700
+Text GLabel 3100 2450 2    50   Input ~ 0
+Im_sense
+Wire Wire Line
+	3100 2450 2950 2450
+Wire Wire Line
+	2150 1700 2300 1700
+Wire Wire Line
+	1700 2550 1500 2550
+Connection ~ 1700 2550
+Connection ~ 1700 1250
+Wire Wire Line
+	9500 950  8800 950 
+Wire Wire Line
+	2350 2450 2600 2450
+Text Notes 7950 1400 0    50   ~ 0
+Power Enable Signal\nLow Effect
+Text Notes 9650 2100 0    50   ~ 0
+NTC
+Text Notes 10900 2050 0    50   ~ 0
+NTC
+Wire Wire Line
+	5200 6350 5200 5900
+Wire Wire Line
+	5200 5900 5450 5900
+Connection ~ 5450 5900
+$Comp
+L power:+3.3V #PWR043
+U 1 1 5E96AD9A
+P 5050 5950
+F 0 "#PWR043" H 5050 5800 50  0001 C CNN
+F 1 "+3.3V" H 5065 6123 50  0000 C CNN
+F 2 "" H 5050 5950 50  0001 C CNN
+F 3 "" H 5050 5950 50  0001 C CNN
+	1    5050 5950
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	5050 5950 5050 6100
+Text HLabel 1300 1250 0    50   Output ~ 0
+Vm_AD
+Text HLabel 1500 2550 0    50   Output ~ 0
+Im_AD
+Text HLabel 1300 4550 0    50   Output ~ 0
+Temp1_AD
+Text HLabel 1400 5350 0    50   Output ~ 0
+Temp1_HIGH
+Text HLabel 1350 6200 0    50   Output ~ 0
+Temp2_AD
+Text HLabel 1400 6950 0    50   Output ~ 0
+Temp2_HIGH
+Text HLabel 8250 5150 0    50   Output ~ 0
+\REV1_HIGH
+Text HLabel 5400 1250 1    50   Output ~ 0
+FWDpeak1_AD
+Text HLabel 5400 2000 1    50   Output ~ 0
+FWD1_AD
+Wire Wire Line
+	5400 2000 5400 2150
+Text HLabel 5200 2550 1    50   Output ~ 0
+REVpeak1_AD
+Connection ~ 5900 3150
+Text HLabel 5600 3150 0    50   Output ~ 0
+REV1_AD
+Wire Wire Line
+	5600 3150 5900 3150
+Text HLabel 5550 4600 0    50   Output ~ 0
+FWDpeak2_AD
+Wire Wire Line
+	5550 4600 5750 4600
+Text HLabel 5600 5250 1    50   Output ~ 0
+FWD2_AD
+Text HLabel 5600 6400 0    50   Output ~ 0
+REV2_AD
+Wire Wire Line
+	5600 6400 5750 6400
+Connection ~ 5750 6400
+Text HLabel 5450 5850 1    50   Output ~ 0
+REVpeak2_AD
+Wire Wire Line
+	10150 2750 10150 2800
+$Comp
+L power:+5V #PWR064
+U 1 1 5E0F23A0
+P 10150 2750
+F 0 "#PWR064" H 10150 2600 50  0001 C CNN
+F 1 "+5V" H 10165 2923 50  0000 C CNN
+F 2 "" H 10150 2750 50  0001 C CNN
+F 3 "" H 10150 2750 50  0001 C CNN
+	1    10150 2750
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	9300 3600 9500 3600
+$Comp
+L power:+5V #PWR065
+U 1 1 5E0F465C
+P 9300 3600
+F 0 "#PWR065" H 9300 3450 50  0001 C CNN
+F 1 "+5V" H 9315 3773 50  0000 C CNN
+F 2 "" H 9300 3600 50  0001 C CNN
+F 3 "" H 9300 3600 50  0001 C CNN
+	1    9300 3600
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GNDA #PWR038
+U 1 1 5E3EE66A
+P 10350 1650
+F 0 "#PWR038" H 10350 1400 50  0001 C CNN
+F 1 "GNDA" H 10355 1477 50  0000 C CNN
+F 2 "" H 10350 1650 50  0001 C CNN
+F 3 "" H 10350 1650 50  0001 C CNN
+	1    10350 1650
+	1    0    0    -1  
+$EndComp
+$Comp
+L Device:C_Small C20
+U 1 1 5E3D1D69
+P 10350 1550
+F 0 "C20" H 10442 1596 50  0000 L CNN
+F 1 "104" H 10442 1505 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 10350 1550 50  0001 C CNN
+F 3 "~" H 10350 1550 50  0001 C CNN
+	1    10350 1550
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2400 5450 2600 5450
+$Comp
+L Amplifier_Operational:LMV324 U4
+U 4 1 5E296038
+P 2100 6950
+F 0 "U4" H 2100 7317 50  0000 C CNN
+F 1 "LMV324" H 2100 7226 50  0000 C CNN
+F 2 "lc_lib:SOIC-14_150MIL" H 2050 7050 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2150 7150 50  0001 C CNN
+	4    2100 6950
+	-1   0    0    -1  
+$EndComp
+Wire Wire Line
+	1400 6950 1800 6950
+Wire Wire Line
+	2400 7050 2600 7050
+Text Notes 3200 5200 0    50   ~ 0
+Approx 70C
+Text Notes 3200 6800 0    50   ~ 0
+Approx 50C
+Text Notes 3550 1600 0    50   ~ 0
+Limit ADC at 2.6V\nApprox. Vmain=58.5V
+$Comp
+L Connector_Generic:Conn_01x08 J19
+U 1 1 612F5452
+P 11000 5500
+F 0 "J19" H 11080 5492 50  0000 L CNN
+F 1 "RF" H 11080 5401 50  0000 L CNN
+F 2 "Connector_JST:JST_PH_B8B-PH-SM4-TB_1x08-1MP_P2.00mm_Vertical" H 11000 5500 50  0001 C CNN
+F 3 "~" H 11000 5500 50  0001 C CNN
+	1    11000 5500
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	10400 5200 10550 5200
+Text GLabel 10550 5300 0    50   Output ~ 0
+ImainFault
+Wire Wire Line
+	10550 5300 10800 5300
+Text GLabel 10550 5400 0    50   Output ~ 0
+RevFault
+Wire Wire Line
+	10550 5400 10800 5400
+Text GLabel 10550 5500 0    50   Output ~ 0
+VgFault
+Wire Wire Line
+	10550 5500 10800 5500
+Text GLabel 10550 5600 0    50   Output ~ 0
+VgSense
+Wire Wire Line
+	10550 5600 10800 5600
+Text GLabel 10550 5700 0    50   Input ~ 0
+PwrOnSig
+Wire Wire Line
+	10550 5700 10800 5700
+Wire Wire Line
+	10650 5900 10800 5900
+Wire Wire Line
+	10650 5900 10650 6050
+$Comp
+L power:GNDA #PWR0102
+U 1 1 613E5388
+P 10650 6050
+F 0 "#PWR0102" H 10650 5800 50  0001 C CNN
+F 1 "GNDA" H 10655 5877 50  0000 C CNN
+F 2 "" H 10650 6050 50  0001 C CNN
+F 3 "" H 10650 6050 50  0001 C CNN
+	1    10650 6050
+	1    0    0    -1  
+$EndComp
+Text GLabel 10550 5800 0    50   Output ~ 0
+SpareSig1
+Wire Wire Line
+	10550 5800 10800 5800
+Wire Wire Line
+	9100 1750 9100 1850
+Wire Wire Line
+	2400 4450 2900 4450
+Wire Wire Line
+	10350 1450 10350 1400
+Wire Wire Line
+	2400 6100 2850 6100
+$Comp
+L Device:C_Small C12
+U 1 1 6180FFD2
+P 3400 5350
+F 0 "C12" H 3492 5396 50  0000 L CNN
+F 1 "104" H 3492 5305 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 3400 5350 50  0001 C CNN
+F 3 "~" H 3400 5350 50  0001 C CNN
+	1    3400 5350
+	1    0    0    1   
+$EndComp
+Wire Wire Line
+	3400 5250 2950 5250
+Wire Wire Line
+	3400 5450 3400 5550
+Wire Wire Line
+	3400 5550 2950 5550
+Connection ~ 2950 5550
+$Comp
+L Device:C_Small C18
+U 1 1 6183B286
+P 3400 7000
+F 0 "C18" H 3492 7046 50  0000 L CNN
+F 1 "104" H 3492 6955 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 3400 7000 50  0001 C CNN
+F 3 "~" H 3400 7000 50  0001 C CNN
+	1    3400 7000
+	1    0    0    1   
+$EndComp
+Wire Wire Line
+	3400 6900 3400 6850
+Wire Wire Line
+	3400 6850 2950 6850
+Wire Wire Line
+	3400 7100 3400 7150
+Wire Wire Line
+	3400 7150 2950 7150
+Connection ~ 2950 7150
+Wire Wire Line
+	2950 7150 2950 7100
+$Comp
+L power:+3.3V #PWR0107
+U 1 1 6186989B
+P 9100 1750
+F 0 "#PWR0107" H 9100 1600 50  0001 C CNN
+F 1 "+3.3V" H 9200 1700 50  0000 C CNN
+F 2 "" H 9100 1750 50  0001 C CNN
+F 3 "" H 9100 1750 50  0001 C CNN
+	1    9100 1750
+	1    0    0    -1  
+$EndComp
+$Comp
+L Device:C_Small C21
+U 1 1 61883B84
+P 10800 2900
+F 0 "C21" H 10892 2946 50  0000 L CNN
+F 1 "10uF" H 10892 2855 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 10800 2900 50  0001 C CNN
+F 3 "~" H 10800 2900 50  0001 C CNN
+	1    10800 2900
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	10800 2800 10350 2800
+Connection ~ 10350 2800
+$Comp
+L power:GNDA #PWR0133
+U 1 1 6189BBC5
+P 10800 3050
+F 0 "#PWR0133" H 10800 2800 50  0001 C CNN
+F 1 "GNDA" H 10805 2877 50  0000 C CNN
+F 2 "" H 10800 3050 50  0001 C CNN
+F 3 "" H 10800 3050 50  0001 C CNN
+	1    10800 3050
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	10800 3050 10800 3000
+$Comp
+L Device:C_Small C19
+U 1 1 618B283E
+P 9950 3700
+F 0 "C19" H 10042 3746 50  0000 L CNN
+F 1 "10uF" H 10042 3655 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 9950 3700 50  0001 C CNN
+F 3 "~" H 9950 3700 50  0001 C CNN
+	1    9950 3700
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	9950 3600 9500 3600
+Connection ~ 9500 3600
+$Comp
+L power:GNDA #PWR0134
+U 1 1 618C9714
+P 9950 3850
+F 0 "#PWR0134" H 9950 3600 50  0001 C CNN
+F 1 "GNDA" H 9955 3677 50  0000 C CNN
+F 2 "" H 9950 3850 50  0001 C CNN
+F 3 "" H 9950 3850 50  0001 C CNN
+	1    9950 3850
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	9950 3850 9950 3800
+Text HLabel 4200 6450 0    50   Output ~ 0
+REV2_HIGH
+Wire Wire Line
+	4200 6450 4300 6450
+$Comp
+L Device:R_Small R30
+U 1 1 5E93C449
+P 5050 6850
+F 0 "R30" H 4991 6804 50  0000 R CNN
+F 1 "1K" H 4991 6895 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 5050 6850 50  0001 C CNN
+F 3 "~" H 5050 6850 50  0001 C CNN
+	1    5050 6850
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	5050 6950 5050 7050
+Wire Wire Line
+	5050 6550 5050 6750
+Wire Wire Line
+	4900 6550 5050 6550
+Connection ~ 5050 6550
+Wire Wire Line
+	5050 6300 5050 6550
+$Comp
+L Device:R_Small R29
+U 1 1 5E93C9F5
+P 5050 6200
+F 0 "R29" H 4991 6154 50  0000 R CNN
+F 1 "1K" H 4991 6245 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 5050 6200 50  0001 C CNN
+F 3 "~" H 5050 6200 50  0001 C CNN
+	1    5050 6200
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	4900 6350 5200 6350
+$Comp
+L Amplifier_Operational:LMV358 U5
+U 2 1 5E84A0F0
+P 4600 6450
+F 0 "U5" H 4600 6817 50  0000 C CNN
+F 1 "LMV358" H 4600 6726 50  0000 C CNN
+F 2 "lc_lib:SOIC-8_150MIL" H 4600 6450 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 4600 6450 50  0001 C CNN
+	2    4600 6450
+	-1   0    0    -1  
+$EndComp
+$Comp
+L power:GNDA #PWR044
+U 1 1 5E98353D
+P 5050 7050
+F 0 "#PWR044" H 5050 6800 50  0001 C CNN
+F 1 "GNDA" H 5055 6877 50  0000 C CNN
+F 2 "" H 5050 7050 50  0001 C CNN
+F 3 "" H 5050 7050 50  0001 C CNN
+	1    5050 7050
+	1    0    0    -1  
+$EndComp
+$Comp
+L Transistor_BJT:DTC144E Q1
+U 1 1 619D197B
+P 9050 4900
+F 0 "Q1" H 9238 4946 50  0000 L CNN
+F 1 "DTC144E" H 9238 4855 50  0000 L CNN
+F 2 "lc_lib:SOT-23(SOT-23-3)" H 9050 4900 50  0001 L CNN
+F 3 "" H 9050 4900 50  0001 L CNN
+	1    9050 4900
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Transistor_BJT:DTC144E Q6
+U 1 1 61A0615A
+P 9300 5350
+F 0 "Q6" H 9488 5396 50  0000 L CNN
+F 1 "DTC144E" H 9488 5305 50  0000 L CNN
+F 2 "lc_lib:SOT-23(SOT-23-3)" H 9300 5350 50  0001 L CNN
+F 3 "" H 9300 5350 50  0001 L CNN
+	1    9300 5350
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Transistor_BJT:DTC144E Q4
+U 1 1 61A074C4
+P 9050 5800
+F 0 "Q4" H 9238 5846 50  0000 L CNN
+F 1 "DTC144E" H 9238 5755 50  0000 L CNN
+F 2 "lc_lib:SOT-23(SOT-23-3)" H 9050 5800 50  0001 L CNN
+F 3 "" H 9050 5800 50  0001 L CNN
+	1    9050 5800
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Transistor_BJT:DTC144E Q7
+U 1 1 61A07E57
+P 9300 6250
+F 0 "Q7" H 9488 6296 50  0000 L CNN
+F 1 "DTC144E" H 9488 6205 50  0000 L CNN
+F 2 "lc_lib:SOT-23(SOT-23-3)" H 9300 6250 50  0001 L CNN
+F 3 "" H 9300 6250 50  0001 L CNN
+	1    9300 6250
+	-1   0    0    -1  
+$EndComp
+Text GLabel 9500 4900 2    50   Input ~ 0
+ImainFault
+Wire Wire Line
+	9500 4900 9300 4900
+Text GLabel 9600 5350 2    50   Input ~ 0
+RevFault
+Wire Wire Line
+	9600 5350 9550 5350
+Text GLabel 9400 5800 2    50   Input ~ 0
+VgFault
+Wire Wire Line
+	9400 5800 9300 5800
+Text GLabel 9650 6250 2    50   Input ~ 0
+SpareSig1
+Wire Wire Line
+	9650 6250 9550 6250
+Wire Wire Line
+	8950 4650 8950 4700
+$Comp
+L power:+3.3V #PWR0135
+U 1 1 61C75B35
+P 8450 4200
+F 0 "#PWR0135" H 8450 4050 50  0001 C CNN
+F 1 "+3.3V" H 8465 4373 50  0000 C CNN
+F 2 "" H 8450 4200 50  0001 C CNN
+F 3 "" H 8450 4200 50  0001 C CNN
+	1    8450 4200
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GNDA #PWR0136
+U 1 1 61CD84F7
+P 8700 6300
+F 0 "#PWR0136" H 8700 6050 50  0001 C CNN
+F 1 "GNDA" H 8705 6127 50  0000 C CNN
+F 2 "" H 8700 6300 50  0001 C CNN
+F 3 "" H 8700 6300 50  0001 C CNN
+	1    8700 6300
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	8700 6300 8850 6300
+Wire Wire Line
+	8850 6300 8850 6450
+Wire Wire Line
+	8850 6450 9200 6450
+Wire Wire Line
+	8850 5100 8950 5100
+Connection ~ 8850 6300
+Wire Wire Line
+	9200 5550 8850 5550
+Wire Wire Line
+	8850 5100 8850 5550
+Connection ~ 8850 5550
+Wire Wire Line
+	8850 5550 8850 6000
+Wire Wire Line
+	8950 6000 8850 6000
+Connection ~ 8850 6000
+Wire Wire Line
+	8850 6000 8850 6300
+$Comp
+L Device:R_Small R14
+U 1 1 61D5AE1D
+P 8600 4450
+F 0 "R14" H 8541 4404 50  0000 R CNN
+F 1 "10K" H 8541 4495 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 8600 4450 50  0001 C CNN
+F 3 "~" H 8600 4450 50  0001 C CNN
+	1    8600 4450
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	8600 4550 8600 4650
+Wire Wire Line
+	8600 4650 8950 4650
+$Comp
+L Device:R_Small R16
+U 1 1 61D75875
+P 8600 5050
+F 0 "R16" H 8541 5004 50  0000 R CNN
+F 1 "10K" H 8541 5095 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 8600 5050 50  0001 C CNN
+F 3 "~" H 8600 5050 50  0001 C CNN
+	1    8600 5050
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	8600 5150 9200 5150
+$Comp
+L Device:R_Small R17
+U 1 1 61D8DD08
+P 8600 5500
+F 0 "R17" H 8541 5454 50  0000 R CNN
+F 1 "10K" H 8541 5545 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 8600 5500 50  0001 C CNN
+F 3 "~" H 8600 5500 50  0001 C CNN
+	1    8600 5500
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	8600 5600 8950 5600
+$Comp
+L Device:R_Small R19
+U 1 1 61DA6096
+P 8600 5950
+F 0 "R19" H 8541 5904 50  0000 R CNN
+F 1 "10K" H 8541 5995 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 8600 5950 50  0001 C CNN
+F 3 "~" H 8600 5950 50  0001 C CNN
+	1    8600 5950
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	8600 6050 9200 6050
+Wire Wire Line
+	8450 4200 8450 4350
+Wire Wire Line
+	8450 4350 8600 4350
+Wire Wire Line
+	8450 4350 8450 4950
+Wire Wire Line
+	8450 4950 8600 4950
+Connection ~ 8450 4350
+Wire Wire Line
+	8450 4950 8450 5400
+Wire Wire Line
+	8450 5400 8600 5400
+Connection ~ 8450 4950
+Wire Wire Line
+	8450 5400 8450 5850
+Wire Wire Line
+	8450 5850 8600 5850
+Connection ~ 8450 5400
+Connection ~ 8600 4650
+Connection ~ 8600 5150
+Connection ~ 8600 5600
+Wire Wire Line
+	8600 6050 8250 6050
+Connection ~ 8600 6050
+Text HLabel 8250 4650 0    50   Output ~ 0
+\Im_HIGH
+$Comp
+L Amplifier_Operational:LMV358 U3
+U 1 1 61F1FEAF
+P 2050 1250
+F 0 "U3" H 1700 1650 50  0000 C CNN
+F 1 "LMV358" H 1650 1550 50  0000 C CNN
+F 2 "lc_lib:SOIC-8_150MIL" H 2050 1250 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2050 1250 50  0001 C CNN
+	1    2050 1250
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV358 U3
+U 2 1 61F23E11
+P 2050 2550
+F 0 "U3" H 2050 2917 50  0000 C CNN
+F 1 "LMV358" H 2050 2826 50  0000 C CNN
+F 2 "lc_lib:SOIC-8_150MIL" H 2050 2550 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2050 2550 50  0001 C CNN
+	2    2050 2550
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV358 U3
+U 3 1 61F3BE40
+P 2050 1250
+F 0 "U3" H 1750 1600 50  0001 R CNN
+F 1 "LMV358" H 1750 1500 50  0001 R CNN
+F 2 "lc_lib:SOIC-8_150MIL" H 2050 1250 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 2050 1250 50  0001 C CNN
+	3    2050 1250
+	-1   0    0    -1  
+$EndComp
+Text HLabel 8250 5600 0    50   Output ~ 0
+\Overdrive
+Text HLabel 8250 6050 0    50   Output ~ 0
+\SpareSig
+Text HLabel 10400 5200 0    50   Input ~ 0
+PrtctSig
+Text HLabel 8500 950  0    50   Input ~ 0
+PWR_On
+$Comp
+L Device:R_Small R20
+U 1 1 6254BD08
+P 8800 1050
+F 0 "R20" H 8741 1004 50  0000 R CNN
+F 1 "10K" H 8741 1095 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 8800 1050 50  0001 C CNN
+F 3 "~" H 8800 1050 50  0001 C CNN
+	1    8800 1050
+	-1   0    0    1   
+$EndComp
+Connection ~ 8800 950 
+Wire Wire Line
+	8800 950  8500 950 
+$Comp
+L power:GNDA #PWR0137
+U 1 1 6254D3F1
+P 8800 1150
+F 0 "#PWR0137" H 8800 900 50  0001 C CNN
+F 1 "GNDA" H 8805 977 50  0000 C CNN
+F 2 "" H 8800 1150 50  0001 C CNN
+F 3 "" H 8800 1150 50  0001 C CNN
+	1    8800 1150
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	1300 1250 1700 1250
+$Comp
+L Amplifier_Operational:LMV358 U5
+U 1 1 615009D4
+P 3850 3200
+F 0 "U5" H 4000 3450 50  0000 C CNN
+F 1 "LMV358" H 4000 3350 50  0000 C CNN
+F 2 "lc_lib:SOIC-8_150MIL" H 3850 3200 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 3850 3200 50  0001 C CNN
+	1    3850 3200
+	-1   0    0    -1  
+$EndComp
+$Comp
+L Amplifier_Operational:LMV358 U5
+U 3 1 61506028
+P 3850 3200
+F 0 "U5" H 3850 3567 50  0001 C CNN
+F 1 "LMV358" H 3850 3476 50  0001 C CNN
+F 2 "lc_lib:SOIC-8_150MIL" H 3850 3200 50  0001 C CNN
+F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 3850 3200 50  0001 C CNN
+	3    3850 3200
+	-1   0    0    -1  
+$EndComp
+Text GLabel 4350 3100 2    50   Input ~ 0
+Vm_sense
+Wire Wire Line
+	4350 3100 4150 3100
+$Comp
+L power:+3.3V #PWR028
+U 1 1 6154117B
+P 3950 2700
+F 0 "#PWR028" H 3950 2550 50  0001 C CNN
+F 1 "+3.3V" H 4100 2750 50  0000 C CNN
+F 2 "" H 3950 2700 50  0001 C CNN
+F 3 "" H 3950 2700 50  0001 C CNN
+	1    3950 2700
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	3950 2700 3950 2750
+$Comp
+L Device:C_Small C38
+U 1 1 61556717
+P 4150 2850
+F 0 "C38" H 4242 2896 50  0000 L CNN
+F 1 "104" H 4242 2805 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 4150 2850 50  0001 C CNN
+F 3 "~" H 4150 2850 50  0001 C CNN
+	1    4150 2850
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	4150 2750 3950 2750
+Connection ~ 3950 2750
+Wire Wire Line
+	3950 2750 3950 2900
+$Comp
+L power:GNDA #PWR030
+U 1 1 6156C467
+P 4150 2950
+F 0 "#PWR030" H 4150 2700 50  0001 C CNN
+F 1 "GNDA" H 4350 2900 50  0000 C CNN
+F 2 "" H 4150 2950 50  0001 C CNN
+F 3 "" H 4150 2950 50  0001 C CNN
+	1    4150 2950
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GNDA #PWR029
+U 1 1 6156D935
+P 3950 3550
+F 0 "#PWR029" H 3950 3300 50  0001 C CNN
+F 1 "GNDA" H 3955 3377 50  0000 C CNN
+F 2 "" H 3950 3550 50  0001 C CNN
+F 3 "" H 3950 3550 50  0001 C CNN
+	1    3950 3550
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	3950 3550 3950 3500
+$Comp
+L Device:R_Small R53
+U 1 1 61583612
+P 4400 3500
+F 0 "R53" V 4550 3500 50  0000 C CNN
+F 1 "10K" V 4500 3500 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 4400 3500 50  0001 C CNN
+F 3 "~" H 4400 3500 50  0001 C CNN
+	1    4400 3500
+	-1   0    0    1   
+$EndComp
+$Comp
+L Device:R_Small R18
+U 1 1 5E4EB82F
+P 2850 2450
+F 0 "R18" V 2654 2450 50  0000 C CNN
+F 1 "1K" V 2745 2450 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 2850 2450 50  0001 C CNN
+F 3 "~" H 2850 2450 50  0001 C CNN
+	1    2850 2450
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:R_Small R64
+U 1 1 615996B8
+P 4550 3300
+F 0 "R64" V 4650 3300 50  0000 C CNN
+F 1 "10K" V 4445 3300 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 4550 3300 50  0001 C CNN
+F 3 "~" H 4550 3300 50  0001 C CNN
+	1    4550 3300
+	0    -1   -1   0   
+$EndComp
+Wire Wire Line
+	4450 3300 4400 3300
+Wire Wire Line
+	4400 3300 4400 3400
+Wire Wire Line
+	4150 3300 4400 3300
+Connection ~ 4400 3300
+$Comp
+L power:GNDA #PWR035
+U 1 1 615DADF6
+P 4400 3600
+F 0 "#PWR035" H 4400 3350 50  0001 C CNN
+F 1 "GNDA" H 4405 3427 50  0000 C CNN
+F 2 "" H 4400 3600 50  0001 C CNN
+F 3 "" H 4400 3600 50  0001 C CNN
+	1    4400 3600
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:+3.3V #PWR036
+U 1 1 615DDA11
+P 4750 3300
+F 0 "#PWR036" H 4750 3150 50  0001 C CNN
+F 1 "+3.3V" H 4900 3350 50  0000 C CNN
+F 2 "" H 4750 3300 50  0001 C CNN
+F 3 "" H 4750 3300 50  0001 C CNN
+	1    4750 3300
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	4650 3300 4750 3300
+Text HLabel 3300 3200 0    50   Output ~ 0
+Vm_HIGH
+Wire Wire Line
+	3300 3200 3550 3200
+Wire Wire Line
+	1400 5350 1800 5350
+$Comp
+L MySchLib:D_Schottky_Small D5
+U 1 1 616E3528
+P 1450 3350
+F 0 "D5" H 1550 3400 50  0000 C CNN
+F 1 "SD103" H 1450 3464 50  0001 C CNN
+F 2 "lc_lib:SOD-123" V 1450 3350 50  0001 C CNN
+F 3 "~" V 1450 3350 50  0001 C CNN
+	1    1450 3350
+	-1   0    0    1   
+$EndComp
+$Comp
+L MySchLib:D_Schottky_Small D6
+U 1 1 616E3893
+P 1450 3450
+F 0 "D6" H 1550 3500 50  0000 C CNN
+F 1 "SD103" H 1450 3564 50  0001 C CNN
+F 2 "lc_lib:SOD-123" V 1450 3450 50  0001 C CNN
+F 3 "~" V 1450 3450 50  0001 C CNN
+	1    1450 3450
+	-1   0    0    1   
+$EndComp
+$Comp
+L MySchLib:D_Schottky_Small D7
+U 1 1 616E3B06
+P 1450 3550
+F 0 "D7" H 1550 3600 50  0000 C CNN
+F 1 "SD103" H 1400 3650 50  0000 C CNN
+F 2 "lc_lib:SOD-123" V 1450 3550 50  0001 C CNN
+F 3 "~" V 1450 3550 50  0001 C CNN
+	1    1450 3550
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	1550 3350 2200 3350
+Wire Wire Line
+	1550 3450 2200 3450
+Wire Wire Line
+	1550 3550 2200 3550
+Wire Wire Line
+	1350 3350 1200 3350
+Wire Wire Line
+	1200 3350 1200 3450
+Wire Wire Line
+	1200 3550 1350 3550
+Wire Wire Line
+	1350 3450 1200 3450
+Connection ~ 1200 3450
+Wire Wire Line
+	1200 3450 1200 3550
+Wire Wire Line
+	1200 3450 1050 3450
+Text HLabel 1050 3450 0    50   Output ~ 0
+\Fatal
+Wire Wire Line
+	9450 1850 9100 1850
+Wire Wire Line
+	9350 2050 9350 1950
+Wire Wire Line
+	9350 1950 9450 1950
+Connection ~ 9350 1950
+$Comp
+L power:GNDA #PWR037
+U 1 1 61B0D3CB
+P 9350 2250
+F 0 "#PWR037" H 9350 2000 50  0001 C CNN
+F 1 "GNDA" H 9355 2077 50  0000 C CNN
+F 2 "" H 9350 2250 50  0001 C CNN
+F 3 "" H 9350 2250 50  0001 C CNN
+	1    9350 2250
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	8700 1950 9350 1950
+Wire Wire Line
+	8900 1850 9100 1850
+Wire Wire Line
+	8900 1850 8900 2050
+Connection ~ 9100 1850
+Wire Wire Line
+	10350 1950 10500 1950
+Connection ~ 10500 1950
+Wire Wire Line
+	10600 1850 10600 1400
+Wire Wire Line
+	10600 1400 10350 1400
+$Comp
+L power:+3.3V #PWR039
+U 1 1 61C4175C
+P 10600 1350
+F 0 "#PWR039" H 10600 1200 50  0001 C CNN
+F 1 "+3.3V" H 10750 1400 50  0000 C CNN
+F 2 "" H 10600 1350 50  0001 C CNN
+F 3 "" H 10600 1350 50  0001 C CNN
+	1    10600 1350
+	1    0    0    -1  
+$EndComp
+Connection ~ 10600 1400
+Wire Wire Line
+	10600 1350 10600 1400
+$Comp
+L Device:R_Small R73
+U 1 1 61CADB20
+P 10650 5200
+F 0 "R73" H 10591 5154 50  0000 R CNN
+F 1 "1K" H 10591 5245 50  0000 R CNN
+F 2 "lc_lib:0805_R" H 10650 5200 50  0001 C CNN
+F 3 "~" H 10650 5200 50  0001 C CNN
+	1    10650 5200
+	0    1    1    0   
+$EndComp
+Wire Wire Line
+	10750 5200 10800 5200
+$Comp
+L Device:C_Small C65
+U 1 1 61CC8BEE
+P 10800 4900
+F 0 "C65" H 10892 4946 50  0000 L CNN
+F 1 "104" H 10892 4855 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 10800 4900 50  0001 C CNN
+F 3 "~" H 10800 4900 50  0001 C CNN
+	1    10800 4900
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	10800 5000 10800 5200
+Connection ~ 10800 5200
+$Comp
+L power:GNDA #PWR040
+U 1 1 61CE5D47
+P 11000 4800
+F 0 "#PWR040" H 11000 4550 50  0001 C CNN
+F 1 "GNDA" H 11005 4627 50  0000 C CNN
+F 2 "" H 11000 4800 50  0001 C CNN
+F 3 "" H 11000 4800 50  0001 C CNN
+	1    11000 4800
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	11000 4800 11000 4750
+Wire Wire Line
+	11000 4750 10800 4750
+Wire Wire Line
+	10800 4750 10800 4800
+$Comp
+L Device:R_Small R4
+U 1 1 61D26891
+P 1200 3150
+F 0 "R4" V 1004 3150 50  0000 C CNN
+F 1 "10K" V 1095 3150 50  0000 C CNN
+F 2 "lc_lib:0805_R" H 1200 3150 50  0001 C CNN
+F 3 "~" H 1200 3150 50  0001 C CNN
+	1    1200 3150
+	-1   0    0    1   
+$EndComp
+Wire Wire Line
+	1200 3250 1200 3350
+Connection ~ 1200 3350
+$Comp
+L power:+3.3V #PWR0108
+U 1 1 61D40E30
+P 1200 2950
+F 0 "#PWR0108" H 1200 2800 50  0001 C CNN
+F 1 "+3.3V" H 1350 3000 50  0000 C CNN
+F 2 "" H 1200 2950 50  0001 C CNN
+F 3 "" H 1200 2950 50  0001 C CNN
+	1    1200 2950
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	1200 2950 1200 3050
+Wire Wire Line
+	8250 4650 8600 4650
+Wire Wire Line
+	8250 5150 8600 5150
+Wire Wire Line
+	8250 5600 8600 5600
+Text HLabel 2200 3450 0    50   Output ~ 0
+\REV1_HIGH
+Text HLabel 2200 3350 0    50   Output ~ 0
+\Im_HIGH
+Text HLabel 2200 3550 0    50   Output ~ 0
+\Overdrive
+$EndSCHEMATC

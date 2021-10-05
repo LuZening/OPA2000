@@ -1,0 +1,9 @@
+本产品配有多个例程，有高级的emWin，中级的ucGUI及基础级的简单例程。
+建议一开始从最简单看起，这个例程不限单片机，用IO口模拟，只要你的单片机有IO口就可以用，是最简单最容易移植的一个版本。
+1、TK499_LCD_TK043F1508_模拟IO_简单刷图片写中英文字例程RM68120.rar
+
+
+液晶屏的驱动比较简单，只有三个根函数，分别是：写命令、写数据、开窗函数
+void WriteComm(unsigned int CMD);
+void WriteData(u32 dat) ;
+void BlockWrite(unsigned int Xstart,unsigned int Xend,unsigned int Ystart,unsigned int Yend) ;

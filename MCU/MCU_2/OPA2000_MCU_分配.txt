@@ -1,0 +1,10 @@
+Analog In
+主电压采样	Vm_AD	ADC3_10
+主电流采样	Im_AD	ADC3_11
+核心温度		Temp1_AD	ADC3_12
+箱内温度		Temp2_AD	ADC3_13
+前向功率1	FWD1_AD	ADC1_3
+前向功率1峰值	FWDpeak1_AD	ADC1_4
+反射功率1峰值 	REVpeak1_AD	ADC1_5
+反射功率1	REV1_AD	ADC1_6
+ 

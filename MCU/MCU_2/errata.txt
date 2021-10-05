@@ -1,0 +1,6 @@
+ 修改：
+PTT延时改用555定时
+PTT不按下时，经过衰减器
+板上数字ALC信号与RFOUT ALC信号混合
+板上Fault改为由MCU处理
+MCU死机时PTT按不下去

@@ -20,7 +20,7 @@ P 950 2000
 AR Path="/5E7D94C5/5EA99E3C" Ref="J?"  Part="1" 
 AR Path="/5EA95119/5EA99E3C" Ref="J14"  Part="1" 
 F 0 "J14" V 914 1812 50  0000 R CNN
-F 1 "Conn_01x02" V 823 1812 50  0000 R CNN
+F 1 "TX_GND" V 823 1812 50  0000 R CNN
 F 2 "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical" H 950 2000 50  0001 C CNN
 F 3 "~" H 950 2000 50  0001 C CNN
 	1    950  2000
@@ -39,7 +39,7 @@ P 4850 2000
 AR Path="/5E7D94C5/5EA99E4D" Ref="J?"  Part="1" 
 AR Path="/5EA95119/5EA99E4D" Ref="J18"  Part="1" 
 F 0 "J18" V 4814 1812 50  0000 R CNN
-F 1 "Conn_01x02" V 4723 1812 50  0000 R CNN
+F 1 "BAND" V 4723 1812 50  0000 R CNN
 F 2 "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical" H 4850 2000 50  0001 C CNN
 F 3 "~" H 4850 2000 50  0001 C CNN
 	1    4850 2000
@@ -63,15 +63,15 @@ Wire Wire Line
 $Comp
 L Connector_Generic:Conn_01x02 J?
 U 1 1 5EA9F740
-P 1700 5150
+P 1700 5050
 AR Path="/5E814668/5EA9F740" Ref="J?"  Part="1" 
 AR Path="/5EA95119/5EA9F740" Ref="J15"  Part="1" 
-F 0 "J15" H 1618 4825 50  0000 C CNN
-F 1 "Conn_01x02" H 1618 4916 50  0000 C CNN
-F 2 "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical" H 1700 5150 50  0001 C CNN
-F 3 "~" H 1700 5150 50  0001 C CNN
-	1    1700 5150
-	-1   0    0    1   
+F 0 "J15" H 1618 4725 50  0000 C CNN
+F 1 "SW" H 1618 4816 50  0000 C CNN
+F 2 "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical" H 1700 5050 50  0001 C CNN
+F 3 "~" H 1700 5050 50  0001 C CNN
+	1    1700 5050
+	-1   0    0    -1  
 $EndComp
 $Comp
 L power:GND #PWR?
@@ -92,40 +92,6 @@ Wire Wire Line
 	2000 5150 2000 5250
 Text Notes 1500 5350 0    50   ~ 0
 Power On
-$Comp
-L Connector_Generic:Conn_01x02 J?
-U 1 1 5EAA244F
-P 1700 6100
-AR Path="/5E814668/5EAA244F" Ref="J?"  Part="1" 
-AR Path="/5EA95119/5EAA244F" Ref="J16"  Part="1" 
-F 0 "J16" H 1618 5775 50  0000 C CNN
-F 1 "Conn_01x02" H 1618 5866 50  0000 C CNN
-F 2 "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical" H 1700 6100 50  0001 C CNN
-F 3 "~" H 1700 6100 50  0001 C CNN
-	1    1700 6100
-	-1   0    0    1   
-$EndComp
-Text GLabel 2850 6000 2    50   Input ~ 0
-SW_Bypass
-$Comp
-L power:GND #PWR?
-U 1 1 5EAA2C57
-P 2000 6150
-AR Path="/5E814668/5EAA2C57" Ref="#PWR?"  Part="1" 
-AR Path="/5EA95119/5EAA2C57" Ref="#PWR097"  Part="1" 
-F 0 "#PWR097" H 2000 5900 50  0001 C CNN
-F 1 "GND" H 2005 5977 50  0000 C CNN
-F 2 "" H 2000 6150 50  0001 C CNN
-F 3 "" H 2000 6150 50  0001 C CNN
-	1    2000 6150
-	1    0    0    -1  
-$EndComp
-Wire Wire Line
-	2000 6150 2000 6100
-Wire Wire Line
-	2000 6100 1900 6100
-Text Notes 1550 6400 0    50   ~ 0
-Bypass
 Text HLabel 5300 3850 3    50   Output ~ 0
 BAND
 Wire Wire Line
@@ -141,7 +107,7 @@ L Connector_Generic:Conn_01x04 J17
 U 1 1 5F1DAB3E
 P 1850 2000
 F 0 "J17" V 1814 1712 50  0000 R CNN
-F 1 "Conn_01x04" V 1723 1712 50  0000 R CNN
+F 1 "COM" V 1723 1712 50  0000 R CNN
 F 2 "Connector_JST:JST_PH_B4B-PH-SM4-TB_1x04-1MP_P2.00mm_Vertical" H 1850 2000 50  0001 C CNN
 F 3 "~" H 1850 2000 50  0001 C CNN
 	1    1850 2000
@@ -550,23 +516,10 @@ Wire Wire Line
 	800  2450 800  2400
 Wire Wire Line
 	800  2400 950  2400
-$Comp
-L Device:Ferrite_Bead_Small FB3
-U 1 1 5E4A8DD2
-P 2650 6000
-F 0 "FB3" V 2413 6000 50  0000 C CNN
-F 1 "1K" V 2504 6000 50  0000 C CNN
-F 2 "lc_lib:0805_R" V 2580 6000 50  0001 C CNN
-F 3 "~" H 2650 6000 50  0001 C CNN
-	1    2650 6000
-	0    1    1    0   
-$EndComp
 Wire Wire Line
 	800  2650 800  2700
 Wire Wire Line
 	1550 2700 1550 2800
-Wire Wire Line
-	2750 6000 2850 6000
 $Comp
 L power:GNDD #PWR0146
 U 1 1 5E65BD42
@@ -797,7 +750,7 @@ L Connector_Generic:Conn_01x04 J21
 U 1 1 620F832A
 P 3250 2000
 F 0 "J21" V 3214 1712 50  0000 R CNN
-F 1 "Conn_01x04" V 3123 1712 50  0000 R CNN
+F 1 "COM_R" V 3123 1712 50  0000 R CNN
 F 2 "Connector_JST:JST_PH_B4B-PH-SM4-TB_1x04-1MP_P2.00mm_Vertical" H 3250 2000 50  0001 C CNN
 F 3 "~" H 3250 2000 50  0001 C CNN
 	1    3250 2000
@@ -1246,17 +1199,6 @@ $EndComp
 Text GLabel 2850 5050 2    50   Input ~ 0
 SW_PWR
 $Comp
-L Device:D_TVS D15
-U 1 1 6188138C
-P 2350 6250
-F 0 "D15" H 2350 6467 50  0000 C CNN
-F 1 "16V" H 2350 6376 50  0000 C CNN
-F 2 "lc_lib:SMA(DO-214AC)_S4" H 2350 6250 50  0001 C CNN
-F 3 "~" H 2350 6250 50  0001 C CNN
-	1    2350 6250
-	0    -1   -1   0   
-$EndComp
-$Comp
 L Device:D_TVS D12
 U 1 1 61881392
 P 2350 5200
@@ -1283,26 +1225,6 @@ F 1 "GND" H 2355 5177 50  0000 C CNN
 F 2 "" H 2350 5350 50  0001 C CNN
 F 3 "" H 2350 5350 50  0001 C CNN
 	1    2350 5350
-	1    0    0    -1  
-$EndComp
-Wire Wire Line
-	1900 6000 2350 6000
-Wire Wire Line
-	2350 6100 2350 6000
-Connection ~ 2350 6000
-Wire Wire Line
-	2350 6000 2550 6000
-$Comp
-L power:GND #PWR?
-U 1 1 618B9365
-P 2350 6400
-AR Path="/5E814668/618B9365" Ref="#PWR?"  Part="1" 
-AR Path="/5EA95119/618B9365" Ref="#PWR0118"  Part="1" 
-F 0 "#PWR0118" H 2350 6150 50  0001 C CNN
-F 1 "GND" H 2355 6227 50  0000 C CNN
-F 2 "" H 2350 6400 50  0001 C CNN
-F 3 "" H 2350 6400 50  0001 C CNN
-	1    2350 6400
 	1    0    0    -1  
 $EndComp
 Wire Wire Line

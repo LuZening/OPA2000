@@ -206,7 +206,7 @@ L Device:C_Small C2
 U 1 1 5E0C9447
 P 3200 3100
 F 0 "C2" V 2971 3100 50  0000 C CNN
-F 1 "C_Small" V 3062 3100 50  0000 C CNN
+F 1 "20" V 3062 3100 50  0000 C CNN
 F 2 "lc_lib:0805_C" H 3200 3100 50  0001 C CNN
 F 3 "~" H 3200 3100 50  0001 C CNN
 	1    3200 3100
@@ -229,7 +229,7 @@ L Device:C_Small C1
 U 1 1 5E0CE945
 P 3200 2900
 F 0 "C1" V 2971 2900 50  0000 C CNN
-F 1 "C_Small" V 3062 2900 50  0000 C CNN
+F 1 "20" V 3062 2900 50  0000 C CNN
 F 2 "lc_lib:0805_C" H 3200 2900 50  0001 C CNN
 F 3 "~" H 3200 2900 50  0001 C CNN
 	1    3200 2900
@@ -314,30 +314,19 @@ F23 "PWR_On" I R 10100 900 50
 F24 "\\Fatal" O R 10100 750 50 
 $EndSheet
 $Sheet
-S 7950 2550 2150 1400
-U 5E7D94C5
-F0 "OutputSignals" 50
-F1 "OutputSignals.sch" 50
-F2 "ALC_trig" I L 7950 2800 50 
-F3 "Transmit" O L 7950 3000 50 
-F4 "\\PTT" I L 7950 3750 50 
-F5 "\\Fatal" I L 7950 3200 50 
-$EndSheet
-$Sheet
 S 7950 4650 2150 850 
 U 5EA95119
 F0 "ExternalInput" 50
 F1 "ExternalInput.sch" 50
-F2 "BAND" O L 7950 4900 50 
-F3 "TX" O L 7950 5250 50 
-F4 "RX" O L 7950 5350 50 
-F5 "CAN_TX" I R 10100 5350 50 
-F6 "CAN_RX" O R 10100 5200 50 
-F7 "TX_R" I R 10100 5000 50 
-F8 "RX_R" O R 10100 4850 50 
-F9 "\\PTT_SUPPRESS" I L 7950 4750 50 
-F10 "\\PTT_OUT" O L 7950 5100 50 
-F11 "\\Fatal" I L 7950 5450 50 
+F2 "TX" O L 7950 5250 50 
+F3 "RX" O L 7950 5350 50 
+F4 "CAN_TX" I R 10100 5350 50 
+F5 "CAN_RX" O R 10100 5200 50 
+F6 "TX_R" I R 10100 5000 50 
+F7 "RX_R" O R 10100 4850 50 
+F8 "\\PTT_SUPPRESS" I L 7950 4750 50 
+F9 "\\PTT_OUT" O L 7950 5100 50 
+F10 "\\Fatal" I L 7950 5450 50 
 $EndSheet
 Text Label 5800 1850 0    50   ~ 0
 ADC1_3
@@ -383,8 +372,6 @@ Wire Wire Line
 	5800 5050 5700 5050
 Wire Wire Line
 	5700 4950 5800 4950
-Wire Wire Line
-	6250 4250 6100 4250
 Text Label 5800 1650 0    50   ~ 0
 ADC3_1
 Wire Wire Line
@@ -419,17 +406,6 @@ Connection ~ 5000 1100
 Wire Wire Line
 	5000 1100 5100 1100
 $Comp
-L Device:C_Small C6
-U 1 1 5EBD54F8
-P 3850 900
-F 0 "C6" H 3942 946 50  0000 L CNN
-F 1 "104" H 3942 855 50  0000 L CNN
-F 2 "lc_lib:0805_C" H 3850 900 50  0001 C CNN
-F 3 "~" H 3850 900 50  0001 C CNN
-	1    3850 900 
-	1    0    0    -1  
-$EndComp
-$Comp
 L Device:C_Small C7
 U 1 1 5EBD61FA
 P 4000 900
@@ -463,17 +439,6 @@ F 3 "~" H 4300 900 50  0001 C CNN
 	1    0    0    -1  
 $EndComp
 $Comp
-L Device:C_Small C5
-U 1 1 5EBD698B
-P 3700 900
-F 0 "C5" H 3792 946 50  0000 L CNN
-F 1 "104" H 3792 855 50  0000 L CNN
-F 2 "lc_lib:0805_C" H 3700 900 50  0001 C CNN
-F 3 "~" H 3700 900 50  0001 C CNN
-	1    3700 900 
-	1    0    0    -1  
-$EndComp
-$Comp
 L Device:C_Small C4
 U 1 1 5EBD6DBD
 P 3550 900
@@ -503,12 +468,7 @@ Wire Wire Line
 Connection ~ 4300 800 
 Wire Wire Line
 	4300 800  4150 800 
-Wire Wire Line
-	3550 1000 3700 1000
 Connection ~ 4300 1000
-Connection ~ 3700 1000
-Wire Wire Line
-	3700 1000 3850 1000
 Connection ~ 3850 1000
 Wire Wire Line
 	3850 1000 4000 1000
@@ -934,13 +894,9 @@ Text Label 5800 4750 0    50   ~ 0
 T_INT
 Wire Wire Line
 	5800 4750 5700 4750
-Text Label 7800 4900 2    50   ~ 0
-ADC3_1
-Wire Wire Line
-	7800 4900 7950 4900
-Text Label 6600 2400 0    50   ~ 0
+Text Label 6300 2400 0    50   ~ 0
 TX
-Text Label 6600 2550 0    50   ~ 0
+Text Label 6300 2550 0    50   ~ 0
 RX
 Text Label 7800 5250 0    50   ~ 0
 TX
@@ -990,7 +946,7 @@ U 1 1 5F63A683
 P 7150 3400
 F 0 "J4" H 7230 3392 50  0000 L CNN
 F 1 "SWD" H 7230 3301 50  0000 L CNN
-F 2 "Connector_JST:JST_PH_B4B-PH-SM4-TB_1x04-1MP_P2.00mm_Vertical" H 7150 3400 50  0001 C CNN
+F 2 "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical" H 7150 3400 50  0001 C CNN
 F 3 "~" H 7150 3400 50  0001 C CNN
 	1    7150 3400
 	1    0    0    -1  
@@ -1063,32 +1019,6 @@ Text Label 6300 4150 0    50   ~ 0
 T_CS
 Wire Wire Line
 	6300 4150 5700 4150
-$Comp
-L Device:Ferrite_Bead_Small L2
-U 1 1 5E2775FC
-P 6400 2400
-F 0 "L2" V 6163 2400 50  0000 C CNN
-F 1 "600Ohm" V 6254 2400 50  0000 C CNN
-F 2 "lc_lib:0805_L" V 6330 2400 50  0001 C CNN
-F 3 "~" H 6400 2400 50  0001 C CNN
-	1    6400 2400
-	0    1    1    0   
-$EndComp
-$Comp
-L Device:Ferrite_Bead_Small L3
-U 1 1 5E277E4F
-P 6400 2550
-F 0 "L3" V 6500 2500 50  0000 C CNN
-F 1 "600Ohm" V 6500 2750 50  0000 C CNN
-F 2 "lc_lib:0805_L" V 6330 2550 50  0001 C CNN
-F 3 "~" H 6400 2550 50  0001 C CNN
-	1    6400 2550
-	0    1    1    0   
-$EndComp
-Wire Wire Line
-	6600 2550 6500 2550
-Wire Wire Line
-	6600 2400 6500 2400
 Wire Wire Line
 	5700 2550 6300 2550
 Wire Wire Line
@@ -1533,9 +1463,9 @@ Wire Wire Line
 	5800 5550 5700 5550
 Wire Wire Line
 	3800 3350 3900 3350
-Text Label 6350 4350 2    50   ~ 0
+Text Label 6000 4350 2    50   ~ 0
 RX3
-Text Label 6250 4250 0    50   ~ 0
+Text Label 5900 4250 0    50   ~ 0
 TX3
 Text Label 6050 1200 1    50   ~ 0
 MCU_STATE
@@ -1618,32 +1548,8 @@ Text Label 10300 5000 0    50   ~ 0
 TX3
 Wire Wire Line
 	10300 5000 10100 5000
-$Comp
-L Device:Ferrite_Bead_Small L7
-U 1 1 626356E7
-P 6100 4350
-F 0 "L7" V 5950 4200 50  0000 C CNN
-F 1 "600Ohm" V 6050 4100 50  0000 C CNN
-F 2 "lc_lib:0805_L" V 6030 4350 50  0001 C CNN
-F 3 "~" H 6100 4350 50  0001 C CNN
-	1    6100 4350
-	0    -1   -1   0   
-$EndComp
-Wire Wire Line
-	6350 4350 6200 4350
 Wire Wire Line
 	6000 4350 5700 4350
-$Comp
-L Device:Ferrite_Bead_Small L6
-U 1 1 6269B499
-P 6000 4250
-F 0 "L6" V 5950 4400 50  0000 C CNN
-F 1 "600Ohm" V 5950 4050 50  0000 C CNN
-F 2 "lc_lib:0805_L" V 5930 4250 50  0001 C CNN
-F 3 "~" H 6000 4250 50  0001 C CNN
-	1    6000 4250
-	0    1    1    0   
-$EndComp
 Wire Wire Line
 	5900 4250 5700 4250
 Text GLabel 10250 1100 2    50   Input ~ 0
@@ -1658,10 +1564,8 @@ Text GLabel 5800 5850 2    50   Input ~ 0
 \SpareSig
 Wire Wire Line
 	5800 5850 5700 5850
-Text GLabel 5850 5750 2    50   Output ~ 0
+Text GLabel 3700 5550 0    50   Output ~ 0
 \PTT_SUPPRESS
-Wire Wire Line
-	5850 5750 5700 5750
 Text GLabel 7850 4750 0    50   Input ~ 0
 \PTT_SUPPRESS
 Wire Wire Line
@@ -1895,4 +1799,67 @@ Wire Wire Line
 Connection ~ 6050 7050
 Wire Wire Line
 	6350 7000 6900 7000
+Wire Wire Line
+	3700 5550 3900 5550
+$Comp
+L Device:C_Small C37
+U 1 1 61F032A5
+P 3400 900
+F 0 "C37" H 3492 946 50  0000 L CNN
+F 1 "104" H 3492 855 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 3400 900 50  0001 C CNN
+F 3 "~" H 3400 900 50  0001 C CNN
+	1    3400 900 
+	1    0    0    1   
+$EndComp
+Wire Wire Line
+	3400 800  3550 800 
+Connection ~ 3550 800 
+Wire Wire Line
+	3400 1000 3550 1000
+Connection ~ 3550 1000
+$Comp
+L Device:C_Small C40
+U 1 1 61F6254A
+P 3500 700
+F 0 "C40" H 3592 746 50  0000 L CNN
+F 1 "104" H 3592 655 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 3500 700 50  0001 C CNN
+F 3 "~" H 3500 700 50  0001 C CNN
+	1    3500 700 
+	0    1    -1   0   
+$EndComp
+Wire Wire Line
+	3600 700  3700 700 
+Connection ~ 3700 700 
+Wire Wire Line
+	3400 700  3300 700 
+Wire Wire Line
+	3300 700  3300 1000
+Wire Wire Line
+	3300 1000 3400 1000
+Connection ~ 3400 1000
+$Comp
+L Device:C_Small C6
+U 1 1 5EBD54F8
+P 3850 900
+F 0 "C6" H 3942 946 50  0000 L CNN
+F 1 "104" H 3942 855 50  0000 L CNN
+F 2 "lc_lib:0805_C" H 3850 900 50  0001 C CNN
+F 3 "~" H 3850 900 50  0001 C CNN
+	1    3850 900 
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	3550 1000 3850 1000
+$Sheet
+S 7950 2550 2150 1400
+U 5E7D94C5
+F0 "OutputSignals" 50
+F1 "OutputSignals.sch" 50
+F2 "ALC_trig" I L 7950 2800 50 
+F3 "Transmit" O L 7950 3000 50 
+F4 "\\PTT" I L 7950 3750 50 
+F5 "\\Fatal" I L 7950 3200 50 
+$EndSheet
 $EndSCHEMATC

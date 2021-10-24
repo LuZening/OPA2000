@@ -3,7 +3,7 @@ EELAYER 30 0
 EELAYER END
 $Descr A4 11693 8268
 encoding utf-8
-Sheet 4 5
+Sheet 3 5
 Title ""
 Date ""
 Rev ""
@@ -32,34 +32,6 @@ Wire Wire Line
 	1150 2300 1050 2300
 Wire Wire Line
 	1050 2300 1050 2200
-$Comp
-L Connector_Generic:Conn_01x02 J?
-U 1 1 5EA99E4D
-P 4850 2000
-AR Path="/5E7D94C5/5EA99E4D" Ref="J?"  Part="1" 
-AR Path="/5EA95119/5EA99E4D" Ref="J18"  Part="1" 
-F 0 "J18" V 4814 1812 50  0000 R CNN
-F 1 "BAND" V 4723 1812 50  0000 R CNN
-F 2 "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical" H 4850 2000 50  0001 C CNN
-F 3 "~" H 4850 2000 50  0001 C CNN
-	1    4850 2000
-	0    -1   -1   0   
-$EndComp
-$Comp
-L power:GND #PWR?
-U 1 1 5EA99E55
-P 5250 2300
-AR Path="/5E7D94C5/5EA99E55" Ref="#PWR?"  Part="1" 
-AR Path="/5EA95119/5EA99E55" Ref="#PWR099"  Part="1" 
-F 0 "#PWR099" H 5250 2050 50  0001 C CNN
-F 1 "GND" H 5255 2127 50  0000 C CNN
-F 2 "" H 5250 2300 50  0001 C CNN
-F 3 "" H 5250 2300 50  0001 C CNN
-	1    5250 2300
-	1    0    0    -1  
-$EndComp
-Wire Wire Line
-	4950 2250 4950 2200
 $Comp
 L Connector_Generic:Conn_01x02 J?
 U 1 1 5EA9F740
@@ -92,8 +64,6 @@ Wire Wire Line
 	2000 5150 2000 5250
 Text Notes 1500 5350 0    50   ~ 0
 Power On
-Text HLabel 5300 3850 3    50   Output ~ 0
-BAND
 Wire Wire Line
 	950  2200 950  2400
 Text Notes 900  1900 0    50   ~ 0
@@ -130,47 +100,6 @@ F 3 "~" H 3850 5950 50  0001 C CNN
 	1    3850 5950
 	0    1    1    0   
 $EndComp
-$Comp
-L Device:R_Small R62
-U 1 1 5E2E974A
-P 4850 2450
-F 0 "R62" H 4909 2496 50  0000 L CNN
-F 1 "100" H 4909 2405 50  0000 L CNN
-F 2 "lc_lib:0805_R" H 4850 2450 50  0001 C CNN
-F 3 "~" H 4850 2450 50  0001 C CNN
-	1    4850 2450
-	1    0    0    -1  
-$EndComp
-Wire Wire Line
-	4850 2550 4850 2650
-$Comp
-L Device:C_Small C40
-U 1 1 5E2EA49A
-P 5150 2650
-F 0 "C40" V 5250 2650 50  0000 C CNN
-F 1 "104" V 5300 2650 50  0000 C CNN
-F 2 "lc_lib:0805_C" H 5150 2650 50  0001 C CNN
-F 3 "~" H 5150 2650 50  0001 C CNN
-	1    5150 2650
-	0    1    1    0   
-$EndComp
-Wire Wire Line
-	5050 2650 4850 2650
-$Comp
-L power:GND #PWR?
-U 1 1 5E2EAA47
-P 5650 2800
-AR Path="/5E7D94C5/5E2EAA47" Ref="#PWR?"  Part="1" 
-AR Path="/5EA95119/5E2EAA47" Ref="#PWR0100"  Part="1" 
-F 0 "#PWR0100" H 5650 2550 50  0001 C CNN
-F 1 "GND" H 5655 2627 50  0000 C CNN
-F 2 "" H 5650 2800 50  0001 C CNN
-F 3 "" H 5650 2800 50  0001 C CNN
-	1    5650 2800
-	1    0    0    -1  
-$EndComp
-Text Notes 4800 1900 0    50   ~ 0
-Band
 $Comp
 L Interface_UART:MAX3232 U16
 U 1 1 5E403A54
@@ -297,17 +226,6 @@ Wire Wire Line
 	4750 5000 4750 4900
 Text HLabel 3650 6750 0    50   Output ~ 0
 RX
-$Comp
-L Device:R_Small R61
-U 1 1 5F387D6B
-P 2850 7200
-F 0 "R61" H 2950 7050 50  0000 L CNN
-F 1 "1K" H 2950 7150 50  0000 L CNN
-F 2 "lc_lib:0805_R" H 2850 7200 50  0001 C CNN
-F 3 "~" H 2850 7200 50  0001 C CNN
-	1    2850 7200
-	0    1    1    0   
-$EndComp
 Wire Wire Line
 	3650 6350 4100 6350
 $Comp
@@ -343,34 +261,6 @@ F 3 "" H 3550 5850 50  0001 C CNN
 	1    3550 5850
 	1    0    0    -1  
 $EndComp
-$Comp
-L MySchLib:LED D14
-U 1 1 5E42F239
-P 3100 7050
-F 0 "D14" V 3047 7128 50  0000 L CNN
-F 1 "LED" V 3138 7128 50  0000 L CNN
-F 2 "lc_lib:0805_LED_S1" H 3100 7050 50  0001 C CNN
-F 3 "~" H 3100 7050 50  0001 C CNN
-	1    3100 7050
-	0    1    1    0   
-$EndComp
-Wire Wire Line
-	2950 7200 3100 7200
-$Comp
-L power:+3.3V #PWR0127
-U 1 1 5E431F98
-P 2650 7150
-F 0 "#PWR0127" H 2650 7000 50  0001 C CNN
-F 1 "+3.3V" H 2665 7323 50  0000 C CNN
-F 2 "" H 2650 7150 50  0001 C CNN
-F 3 "" H 2650 7150 50  0001 C CNN
-	1    2650 7150
-	1    0    0    -1  
-$EndComp
-Wire Wire Line
-	2650 7150 2650 7200
-Wire Wire Line
-	2650 7200 2750 7200
 $Comp
 L power:GNDD #PWR0128
 U 1 1 5E435017
@@ -422,92 +312,6 @@ F 3 "~" H 6000 6750 50  0001 C CNN
 $EndComp
 Wire Wire Line
 	6100 6750 6150 6750
-Wire Wire Line
-	4850 2350 4850 2200
-Wire Wire Line
-	5400 3050 5800 3050
-Wire Wire Line
-	5800 3050 5800 3700
-Wire Wire Line
-	5800 3700 5300 3700
-Wire Wire Line
-	5300 3700 5300 3650
-$Comp
-L power:GND #PWR?
-U 1 1 5E46C360
-P 6000 3350
-AR Path="/5E7D94C5/5E46C360" Ref="#PWR?"  Part="1" 
-AR Path="/5EA95119/5E46C360" Ref="#PWR0129"  Part="1" 
-F 0 "#PWR0129" H 6000 3100 50  0001 C CNN
-F 1 "GND" H 6005 3177 50  0000 C CNN
-F 2 "" H 6000 3350 50  0001 C CNN
-F 3 "" H 6000 3350 50  0001 C CNN
-	1    6000 3350
-	1    0    0    -1  
-$EndComp
-Wire Wire Line
-	6000 3250 6000 3350
-Wire Wire Line
-	5600 3250 6000 3250
-$Comp
-L power:+3.3V #PWR0130
-U 1 1 5E46DBA6
-P 4900 3250
-F 0 "#PWR0130" H 4900 3100 50  0001 C CNN
-F 1 "+3.3V" V 4915 3378 50  0000 L CNN
-F 2 "" H 4900 3250 50  0001 C CNN
-F 3 "" H 4900 3250 50  0001 C CNN
-	1    4900 3250
-	0    -1   -1   0   
-$EndComp
-Wire Wire Line
-	4900 3250 5000 3250
-Connection ~ 4850 2650
-$Comp
-L Device:R_Small R72
-U 1 1 5E47FF06
-P 5350 2950
-F 0 "R72" H 5200 2900 50  0000 L CNN
-F 1 "1K" H 5200 3000 50  0000 L CNN
-F 2 "lc_lib:0805_R" H 5350 2950 50  0001 C CNN
-F 3 "~" H 5350 2950 50  0001 C CNN
-	1    5350 2950
-	0    1    1    0   
-$EndComp
-Wire Wire Line
-	5200 3050 5200 2950
-Connection ~ 5200 2950
-Wire Wire Line
-	5200 2950 5250 2950
-Wire Wire Line
-	5450 2950 5450 2800
-Wire Wire Line
-	5450 2800 5650 2800
-Wire Wire Line
-	5450 2650 5450 2800
-Wire Wire Line
-	5250 2650 5450 2650
-Connection ~ 5450 2800
-Wire Wire Line
-	4850 2950 5200 2950
-Wire Wire Line
-	5250 2250 5250 2300
-Wire Wire Line
-	4950 2250 5250 2250
-Wire Wire Line
-	5300 3700 5300 3850
-Connection ~ 5300 3700
-$Comp
-L Amplifier_Operational:LMV321 U15
-U 1 1 5E4950BC
-P 5300 3350
-F 0 "U15" V 5254 3006 50  0000 R CNN
-F 1 "LMV321" V 5345 3006 50  0000 R CNN
-F 2 "lc_lib:SOT-23-5" H 5300 3350 50  0001 L CNN
-F 3 "http://www.ti.com/lit/ds/symlink/lmv324.pdf" H 5300 3350 50  0001 C CNN
-	1    5300 3350
-	0    -1   1    0   
-$EndComp
 Wire Wire Line
 	1550 2500 1550 2400
 Wire Wire Line
@@ -571,13 +375,13 @@ $EndComp
 $Comp
 L Connector_Generic:Conn_01x02 J20
 U 1 1 5E54ECE3
-P 7300 2150
-F 0 "J20" V 7264 2230 50  0000 L CNN
-F 1 "CAN" V 7173 2230 50  0000 L CNN
-F 2 "Connector_JST:JST_PH_B2B-PH-SM4-TB_1x02-1MP_P2.00mm_Vertical" H 7300 2150 50  0001 C CNN
-F 3 "~" H 7300 2150 50  0001 C CNN
-	1    7300 2150
-	0    1    -1   0   
+P 7200 2150
+F 0 "J20" V 7164 2230 50  0000 L CNN
+F 1 "CAN" V 7073 2230 50  0000 L CNN
+F 2 "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical" H 7200 2150 50  0001 C CNN
+F 3 "~" H 7200 2150 50  0001 C CNN
+	1    7200 2150
+	0    -1   -1   0   
 $EndComp
 $Comp
 L Interface_CAN_LIN:TJA1042T U17
@@ -840,10 +644,6 @@ Wire Wire Line
 	3650 6750 3800 6750
 Wire Wire Line
 	3650 6950 4000 6950
-Wire Wire Line
-	3100 6900 3100 6850
-Wire Wire Line
-	3100 6850 3800 6850
 Wire Wire Line
 	3800 6850 3800 6750
 Connection ~ 3800 6750
@@ -1145,8 +945,6 @@ Wire Wire Line
 Connection ~ 2250 3750
 Wire Wire Line
 	2250 3750 2100 3750
-Wire Wire Line
-	4850 2650 4850 2950
 $Comp
 L Device:D_TVS D11
 U 1 1 617EA0AB
@@ -1176,8 +974,6 @@ F 3 "~" H 3700 2600 50  0001 C CNN
 	1    3700 2600
 	-1   0    0    1   
 $EndComp
-Wire Wire Line
-	3950 2600 3850 2600
 Wire Wire Line
 	3550 2600 3150 2600
 Wire Wire Line
@@ -1250,4 +1046,64 @@ F 3 "" H 2500 2700 50  0001 C CNN
 $EndComp
 Wire Wire Line
 	2500 2700 2500 2600
+Wire Wire Line
+	3100 6850 3800 6850
+Wire Wire Line
+	3100 6900 3100 6850
+Wire Wire Line
+	2650 7200 2750 7200
+Wire Wire Line
+	2650 7150 2650 7200
+$Comp
+L power:+3.3V #PWR0127
+U 1 1 5E431F98
+P 2650 7150
+F 0 "#PWR0127" H 2650 7000 50  0001 C CNN
+F 1 "+3.3V" H 2665 7323 50  0000 C CNN
+F 2 "" H 2650 7150 50  0001 C CNN
+F 3 "" H 2650 7150 50  0001 C CNN
+	1    2650 7150
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	2950 7200 3100 7200
+$Comp
+L MySchLib:LED D14
+U 1 1 5E42F239
+P 3100 7050
+F 0 "D14" V 3047 7128 50  0000 L CNN
+F 1 "LED" V 3138 7128 50  0000 L CNN
+F 2 "lc_lib:0805_LED_S1" H 3100 7050 50  0001 C CNN
+F 3 "~" H 3100 7050 50  0001 C CNN
+	1    3100 7050
+	0    1    1    0   
+$EndComp
+$Comp
+L Device:R_Small R61
+U 1 1 5F387D6B
+P 2850 7200
+F 0 "R61" H 2950 7050 50  0000 L CNN
+F 1 "1K" H 2950 7150 50  0000 L CNN
+F 2 "lc_lib:0805_R" H 2850 7200 50  0001 C CNN
+F 3 "~" H 2850 7200 50  0001 C CNN
+	1    2850 7200
+	0    1    1    0   
+$EndComp
+$Comp
+L power:GND #PWR?
+U 1 1 6230A516
+P 4000 2700
+AR Path="/5E7D94C5/6230A516" Ref="#PWR?"  Part="1" 
+AR Path="/5EA95119/6230A516" Ref="#PWR?"  Part="1" 
+F 0 "#PWR?" H 4000 2450 50  0001 C CNN
+F 1 "GND" H 4005 2527 50  0000 C CNN
+F 2 "" H 4000 2700 50  0001 C CNN
+F 3 "" H 4000 2700 50  0001 C CNN
+	1    4000 2700
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	4000 2700 4000 2600
+Wire Wire Line
+	3850 2600 4000 2600
 $EndSCHEMATC

@@ -312,6 +312,7 @@ F21 "\\SpareSig" O R 10100 1250 50
 F22 "PrtctSig" I R 10100 1100 50 
 F23 "PWR_On" I R 10100 900 50 
 F24 "\\Fatal" O R 10100 750 50 
+F25 "RF_bias_on" I L 8050 2050 50 
 $EndSheet
 $Sheet
 S 7950 4650 2150 850 
@@ -841,10 +842,8 @@ Wire Wire Line
 	1700 7100 3250 7100
 Wire Wire Line
 	1800 7000 3250 7000
-Text GLabel 5800 6350 2    50   Input ~ 0
-AUTO_BAND
 Wire Wire Line
-	5800 6350 5700 6350
+	6100 6350 5700 6350
 Text GLabel 5800 6250 2    50   Output ~ 0
 SEL1
 Wire Wire Line
@@ -1862,4 +1861,12 @@ F3 "Transmit" O L 7950 3000 50
 F4 "\\PTT" I L 7950 3750 50 
 F5 "\\Fatal" I L 7950 3200 50 
 $EndSheet
+Text Label 7550 2050 0    50   ~ 0
+RF_bias_on
+Wire Wire Line
+	7550 2050 8050 2050
+Text Label 7050 2300 0    50   ~ 0
+RF_bias_on
+Text Label 6100 6350 0    50   ~ 0
+RF_bias_on
 $EndSCHEMATC

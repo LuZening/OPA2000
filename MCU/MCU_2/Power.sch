@@ -1280,4 +1280,15 @@ Wire Wire Line
 Connection ~ 5300 1400
 Wire Wire Line
 	5300 1400 5300 1650
+$Comp
+L Device:R_Small R5
+U 1 1 618FCDB0
+P 6050 2550
+F 0 "R5" V 5854 2550 50  0000 C CNN
+F 1 "0" V 5945 2550 50  0000 C CNN
+F 2 "lc_lib:0603_R" H 6050 2550 50  0001 C CNN
+F 3 "~" H 6050 2550 50  0001 C CNN
+	1    6050 2550
+	0    1    1    0   
+$EndComp
 $EndSCHEMATC

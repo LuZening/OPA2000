@@ -3,7 +3,7 @@ EELAYER 30 0
 EELAYER END
 $Descr A4 11693 8268
 encoding utf-8
-Sheet 4 5
+Sheet 3 5
 Title ""
 Date ""
 Rev ""
@@ -975,8 +975,6 @@ F 3 "~" H 3700 2600 50  0001 C CNN
 	-1   0    0    1   
 $EndComp
 Wire Wire Line
-	3950 2600 3850 2600
-Wire Wire Line
 	3550 2600 3150 2600
 Wire Wire Line
 	3150 2600 3150 2400
@@ -1091,4 +1089,21 @@ F 3 "~" H 2850 7200 50  0001 C CNN
 	1    2850 7200
 	0    1    1    0   
 $EndComp
+$Comp
+L power:GND #PWR?
+U 1 1 6230A516
+P 4000 2700
+AR Path="/5E7D94C5/6230A516" Ref="#PWR?"  Part="1" 
+AR Path="/5EA95119/6230A516" Ref="#PWR0130"  Part="1" 
+F 0 "#PWR0130" H 4000 2450 50  0001 C CNN
+F 1 "GND" H 4005 2527 50  0000 C CNN
+F 2 "" H 4000 2700 50  0001 C CNN
+F 3 "" H 4000 2700 50  0001 C CNN
+	1    4000 2700
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	4000 2700 4000 2600
+Wire Wire Line
+	3850 2600 4000 2600
 $EndSCHEMATC

@@ -4,6 +4,27 @@
 
 ---
 
+## 规则 0：自己实现的函数必须有测试
+
+所有由 Agent 自己实现（非 CubeMX 自动生成）的函数，必须**先写单元测试**，并**在本地独立编译 + 运行验证通过后**，才允许合并到主代码。
+
+具体执行步骤：
+1. **写测试**：每个新函数/新模块至少有一个 happy path 测试 + 一个边界/异常测试。
+2. **本地编译 + 运行**：在 worktree 内 `cmake --build build/...` + 跑测试 harness（用 host x86/ARM Cortex-M 仿真或 STM32CubeIDE simulator）。不能用 main build 跑通就当 OK。
+3. **记录**：commit message 必须列出该 commit 引入的测试清单 + 测试结果。
+4. **不通过的不入主分支**：单元测试失败的功能不能 commit；CI / 用户 review 会要求看到测试输出。
+
+测试实现方式（任选其一，推荐混合）：
+- **Host-side unit test**：用 CMocka / Unity / 自写 assert + 桩函数，host x86 上跑纯算法逻辑（如 SWR 计算、NTC LUT 查表、CC6920 零点校准状态机）。
+- **Target-side integration test**：build 完整固件，在真板或 QEMU 上通过 OpenOCD + GDB 触发调试断言。
+- **HIL（hardware-in-the-loop）**：用真板 + radio signal generator + dummy load。
+
+例外：
+- 纯 ISR 钩子（无返回值、只操作 GPIO）允许仅 review + 集成测试，不强制单元测试
+- 简单的 `set`/`get` getter 不强制测试
+
+---
+
 ## 规则 1：CubeMX 生成的代码只能动 Section 区间
 
 STM32CubeMX 在每个自动生成文件里嵌入 `/* USER CODE BEGIN <name> */` … `/* USER CODE END <name> */` 段落。**CubeMX 重新生成代码时只覆盖 section 区间外的部分**；你写在 section 外的修改会被 ST 厂家代码覆盖丢失。

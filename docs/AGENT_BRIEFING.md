@@ -110,7 +110,7 @@ E:\Projects\RADIO\Projects\OPA2000\Code_2\
 
 **Priority Group = NVIC_PRIORITYGROUP_4**
 
-ioc 现状没有 ADC1_2/COMP/EXTI15_10 的 NVIC 行 → **必须打开 CubeMX 手动勾选**（文档 [第 193-200 行] 已列精确配置）。
+ioc 现状没有 ADC1_2/COMP/EXTI15_10 的 NVIC 行 → **必须打开 CubeMX 手动勾选**（你或 Control agent 都需要）。
 
 **严禁在 ISR 中调用 FreeRTOS API**（除 `port_yield_from_isr` 类 if necessary，AIC）。
 
@@ -278,6 +278,7 @@ PE12 (COMP1_OUT) → D1、PE8 (COMP2_OUT) → D6、PB13 → D7，三只二极管
 8. **ioc 修改必须重新生成 Core/ 目录** — 不要手动改 Core/Inc 或 Core/Src
 9. **GPIO 输出冲突**：GUI 不要碰 PC14/PE5/PE4/PE3/PE2/PE1、PG2/PG3/PG4/PG5/PG7、PD4/PD5/PC8/PD14/PD15/PE6/PG0 — 这些都是 Control 的
 10. **EXTI4 已被释放**（PF4 = REAR_RESERVED1 普通 GPIO），不要用 EXTI4 给触屏
+11. **自己写的函数必须先有测试**（见 [GLOBAL_RULES.md](GLOBAL_RULES.md) 规则 0）。每个新功能要有 happy path + 边界测试，本地跑通后再 commit。
 
 ---
 

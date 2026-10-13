@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+EWARM/
+cmake-build-*/
+*.o
+*.obj
+*.su
+*.dep
+*.map
+*.elf
+*.hex
+*.bin
+
+# Tooling caches (do not track)
+.trae/
+.claude/
+.vscode/
+*.pyc
+__pycache__/
+auto_silks/
+
+# Local workspace notes
+KEY.md
+LCEDA.md
+reminders.txt
+Screenshot*.png
+STM32H7*.md
+
+# CMake / IDE generated
+compile_commands.json
+
+# Misc
+*.bak
+*.log
+*.tmp
+*.stackdump
+bash.exe.stackdump

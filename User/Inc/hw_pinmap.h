@@ -1,0 +1,287 @@
+/**
+ * @file    hw_pinmap.h
+ * @brief   Hardware pin/port macros for OPA2000 H7 Control firmware
+ *
+ * @details This header is the single source of truth for every GPIO
+ *          pin, ADC channel rank, timer channel and external IRQ that
+ *          the firmware touches.  All sources files (Control / GUI /
+ *          Networking) include this header rather than redefining the
+ *          pinout locally.
+ *
+ *          Reference: OPA2000_h7.ioc + lceda Control schematic
+ *          (U5 = STM32H7B0ZBT6 LQFP144).  Cross-checked against
+ *          .trae/all_nets.json 2026-10.
+ *
+ *          DO NOT MODIFY without updating both ioc and the firmware
+ *          design spec.  The MCU is U5 in the schematic (not U1).
+ *
+ * @version 1.0
+ * @date    2026-10
+ * @author  Control Agent (wt-control branch)
+ */
+
+#ifndef HW_PINMAP_H
+#define HW_PINMAP_H
+
+#include "stm32h7xx_hal.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ===========================================================================
+ *  1. MCU identification
+ * ===========================================================================*/
+#define OPA2000_MCU_NAME         "STM32H7B0ZBT6"
+#define OPA2000_MCU_DESIGNATOR   "U5"   /*!< lceda schematic designator */
+
+/* ===========================================================================
+ *  2. LPF band switching (HIGH-ACTIVE, OC1 / OC2 ... LPF6)
+ * ===========================================================================*/
+#define LPF1_GPIO_Port   GPIOC
+#define LPF1_Pin         GPIO_PIN_14   /* PC14, R105 -> H3-7 */
+#define LPF2_GPIO_Port   GPIOE
+#define LPF2_Pin         GPIO_PIN_5    /* PE5, R62  -> H3-6 */
+#define LPF3_GPIO_Port   GPIOE
+#define LPF3_Pin         GPIO_PIN_4    /* PE4, R61  -> H3-5 */
+#define LPF4_GPIO_Port   GPIOE
+#define LPF4_Pin         GPIO_PIN_3    /* PE3, R51  -> H3-4 */
+#define LPF5_GPIO_Port   GPIOE
+#define LPF5_Pin         GPIO_PIN_2    /* PE2, R50  -> H3-3 */
+#define LPF6_GPIO_Port   GPIOE
+#define LPF6_Pin         GPIO_PIN_1    /* PE1, R45  -> H3-2 */
+/*! LPF is high-active: SET the corresponding pin to enable the band relay. */
+#define LPF_ACTIVE(level)       ((level) ? GPIO_PIN_SET : GPIO_PIN_RESET)
+
+/* ===========================================================================
+ *  3. Power / relay control
+ * ===========================================================================*/
+/* RELAY1 (PG4): high-active, drives Q1 low-side to enable main PSU */
+#define RELAY1_GPIO_Port  GPIOG
+#define RELAY1_Pin        GPIO_PIN_4
+#define RELAY1_ON()       HAL_GPIO_WritePin(RELAY1_GPIO_Port, RELAY1_Pin, GPIO_PIN_SET)
+#define RELAY1_OFF()      HAL_GPIO_WritePin(RELAY1_GPIO_Port, RELAY1_Pin, GPIO_PIN_RESET)
+
+/* RELAY2 (PG3): high-active, drives Q2 low-side for +12V output */
+#define RELAY2_GPIO_Port  GPIOG
+#define RELAY2_Pin        GPIO_PIN_3
+#define RELAY2_ON()       HAL_GPIO_WritePin(RELAY2_GPIO_Port, RELAY2_Pin, GPIO_PIN_SET)
+#define RELAY2_OFF()      HAL_GPIO_WritePin(RELAY2_GPIO_Port, RELAY2_Pin, GPIO_PIN_RESET)
+
+/* MAIN_PSU_ON_SIG (PG5): high-to-power-on, low-to-power-off (via Q9 inverting into PC13) */
+#define PSU_ON_GPIO_Port   GPIOG
+#define PSU_ON_Pin         GPIO_PIN_5
+#define PSU_ON_PWR_ON()    HAL_GPIO_WritePin(PSU_ON_GPIO_Port, PSU_ON_Pin, GPIO_PIN_SET)
+#define PSU_ON_PWR_OFF()   HAL_GPIO_WritePin(PSU_ON_GPIO_Port, PSU_ON_Pin, GPIO_PIN_RESET)
+
+/* PWR_ON_SIG (PG7): high-active, drives H1-2 (high-voltage power supply enable) */
+#define PWR_ON_GPIO_Port   GPIOG
+#define PWR_ON_Pin         GPIO_PIN_7
+#define PWR_ON_ENABLE()    HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, GPIO_PIN_SET)
+#define PWR_ON_DISABLE()   HAL_GPIO_WritePin(PWR_ON_GPIO_Port, PWR_ON_Pin, GPIO_PIN_RESET)
+
+/* RF_BIAS_ON (PG2): high-active, drives R47 -> H5-3 PA bias enable */
+#define RF_BIAS_GPIO_Port  GPIOG
+#define RF_BIAS_Pin        GPIO_PIN_2
+#define RF_BIAS_ENABLE()   HAL_GPIO_WritePin(RF_BIAS_GPIO_Port, RF_BIAS_Pin, GPIO_PIN_SET)
+#define RF_BIAS_DISABLE()  HAL_GPIO_WritePin(RF_BIAS_GPIO_Port, RF_BIAS_Pin, GPIO_PIN_RESET)
+
+/* HARDPWR_ERR (PB12): EXTI12 rising edge, hardware fault from supply */
+#define HARDPWR_ERR_GPIO_Port   GPIOB
+#define HARDPWR_ERR_Pin         GPIO_PIN_12
+
+/* RF_IN_PROTECT_CPU_SIG (PB13): fault output (push-pull, pull to high) */
+#define RF_IN_PROTECT_GPIO_Port  GPIOB
+#define RF_IN_PROTECT_Pin        GPIO_PIN_13
+#define RF_IN_PROTECT_RAISE()   HAL_GPIO_WritePin(RF_IN_PROTECT_GPIO_Port, RF_IN_PROTECT_Pin, GPIO_PIN_SET)
+#define RF_IN_PROTECT_CLEAR()   HAL_GPIO_WritePin(RF_IN_PROTECT_GPIO_Port, RF_IN_PROTECT_Pin, GPIO_PIN_RESET)
+
+/* CPU_READY (PD8): GPIO output (status indication) */
+#define CPU_READY_GPIO_Port  GPIOD
+#define CPU_READY_Pin        GPIO_PIN_8
+
+/* LIGHTNING_PROTECTION_A / B (PB9 / PD9): GPIO outputs, jumper pads */
+#define LIGHTNING_A_GPIO_Port  GPIOB
+#define LIGHTNING_A_Pin        GPIO_PIN_9
+#define LIGHTNING_B_GPIO_Port  GPIOD
+#define LIGHTNING_B_Pin        GPIO_PIN_9
+
+/* ===========================================================================
+ *  4. PTT key input / wake-up
+ * ===========================================================================*/
+/* PTT_INX (PF5): EXTI5 input, low-active (foot pedal) */
+#define PTT_IN_GPIO_Port   GPIOF
+#define PTT_IN_Pin         GPIO_PIN_5
+#define PTT_IN_ACTIVE_LOW  1
+
+/* KEY1_WKUP (PC13): PWR_WKUP4, EXTI13 reserved for wake-up */
+#define KEY1_WKUP_GPIO_Port  GPIOC
+#define KEY1_WKUP_Pin        GPIO_PIN_13
+
+/* ===========================================================================
+ *  5. Fan / pump control
+ * ===========================================================================*/
+/* FAN1_PWM (PC8): TIM3_CH3, 10kHz, high-active */
+#define FAN1_PWM_GPIO_Port  GPIOC
+#define FAN1_PWM_Pin        GPIO_PIN_8
+#define FAN1_PWM_TIM_INSTANCE  TIM3
+#define FAN1_PWM_TIM_CHANNEL  TIM_CHANNEL_3
+
+/* PUMP_PWM (PD15): TIM4_CH4, 10kHz, high-active */
+#define PUMP_PWM_GPIO_Port  GPIOD
+#define PUMP_PWM_Pin        GPIO_PIN_15
+#define PUMP_PWM_TIM_INSTANCE TIM4
+#define PUMP_PWM_TIM_CHANNEL TIM_CHANNEL_4
+
+/* BL_PWM (PD14): TIM4_CH3, backlight PWM */
+#define BL_PWM_GPIO_Port    GPIOD
+#define BL_PWM_Pin          GPIO_PIN_14
+#define BL_PWM_TIM_INSTANCE TIM4
+#define BL_PWM_TIM_CHANNEL  TIM_CHANNEL_3
+
+/* FAN1_SENSEX (PD4): GPIO input, TACH feedback from fan FG pin */
+#define FAN1_SENSE_GPIO_Port  GPIOD
+#define FAN1_SENSE_Pin        GPIO_PIN_4
+
+/* PUMP_SENSEX (PD5): GPIO input, TACH feedback from pump FG pin */
+#define PUMP_SENSE_GPIO_Port  GPIOD
+#define PUMP_SENSE_Pin        GPIO_PIN_5
+
+/* ===========================================================================
+ *  6. Buzzer (TIM15_CH2 state machine, no DMA)
+ * ===========================================================================*/
+#define BUZZER_GPIO_Port    GPIOE
+#define BUZZER_Pin          GPIO_PIN_6
+#define BUZZER_TIM_INSTANCE TIM15
+#define BUZZER_TIM_CHANNEL  TIM_CHANNEL_2
+
+/* ===========================================================================
+ *  7. ALC PWM (TIM2 OC + DMA -> PG0 BSRR, ~200kHz)
+ * ===========================================================================*/
+#define ALC_PWM_GPIO_Port   GPIOG
+#define ALC_PWM_Pin         GPIO_PIN_0
+#define ALC_PWM_TIM_INSTANCE TIM2
+#define ALC_PWM_TIM_CHANNEL_RISE TIM_CHANNEL_1   /* CCR1 -> BSRR set bit 0 */
+#define ALC_PWM_TIM_CHANNEL_FALL TIM_CHANNEL_2   /* CCR2 -> BSRR reset bit 0 */
+
+/* ===========================================================================
+ *  8. ETR frequency detect (TIM1 ETR mode 2)
+ * ===========================================================================*/
+#define ETR_FREQDET_GPIO_Port  GPIOE
+#define ETR_FREQDET_Pin        GPIO_PIN_7
+#define ETR_FREQDET_TIM_INSTANCE TIM1
+#define ETR_FREQDET_PRESCALER  31U
+#define ETR_FREQDET_SAMPLE_PERIOD_US 100U
+
+/* ===========================================================================
+ *  9. I2C bus + touch controller (used by GUI agent too)
+ * ===========================================================================*/
+#define I2C2_SCL_GPIO_Port   GPIOF
+#define I2C2_SCL_Pin         GPIO_PIN_1
+#define I2C2_SDA_GPIO_Port   GPIOF
+#define I2C2_SDA_Pin         GPIO_PIN_0
+#define I2C2_INSTANCE        I2C2
+
+/* PF4 / PF5 / PF3 = GPIO; LCT_INT on PF2 (EXTI2 for GT911 only) */
+#define REAR_RESERVED1_GPIO_Port  GPIOF    /* PF4: ordinary GPIO, no EXTI */
+#define REAR_RESERVED1_Pin        GPIO_PIN_4
+#define RTouch_PENIRQX_NOW_GPIO_Port GPIOF  /* legacy name; PF4 only as GPIO */
+#define RTouch_PENIRQX_NOW_Pin       GPIO_PIN_4
+#define CTouch_RSTX_GPIO_Port   GPIOF
+#define CTouch_RSTX_Pin         GPIO_PIN_3
+#define CTouch_INTX_GPIO_Port   GPIOF
+#define CTouch_INTX_Pin         GPIO_PIN_2   /* EXTI2 */
+
+/* ===========================================================================
+ * 10. Communication bus pin allocation
+ * ===========================================================================*/
+/* LPUART1 (PB6/PB7): PC comm */
+#define LPUART1_TX_GPIO_Port  GPIOB
+#define LPUART1_TX_Pin        GPIO_PIN_6
+#define LPUART1_RX_GPIO_Port  GPIOB
+#define LPUART1_RX_Pin        GPIO_PIN_7
+#define LPUART1_INSTANCE      LPUART1
+#define LPUART1_DEFAULT_BAUD  19200U
+
+/* UART4 (PC10/PC11): radio communication */
+#define UART4_TX_GPIO_Port    GPIOC
+#define UART4_TX_Pin          GPIO_PIN_10
+#define UART4_RX_GPIO_Port    GPIOC
+#define UART4_RX_Pin          GPIO_PIN_11
+#define UART4_INSTANCE        UART4
+
+/* USB OTG HS */
+#define USB_DM_GPIO_Port       GPIOA
+#define USB_DM_Pin             GPIO_PIN_11
+#define USB_DP_GPIO_Port       GPIOA
+#define USB_DP_Pin             GPIO_PIN_12
+#define USB_VBUS_GPIO_Port     GPIOA
+#define USB_VBUS_Pin           GPIO_PIN_9
+
+/* ===========================================================================
+ * 11. SD card / SPI / OCTOSPI / FDCAN pins (used by drivers)
+ * ===========================================================================*/
+#define SDIO_D0_GPIO_Port  GPIOC
+#define SDIO_D0_Pin        GPIO_PIN_8
+#define SDIO_D1_GPIO_Port  GPIOC
+#define SDIO_D1_Pin        GPIO_PIN_9
+#define SDIO_D2_GPIO_Port  GPIOC
+#define SDIO_D2_Pin        GPIO_PIN_10
+#define SDIO_D3_GPIO_Port  GPIOC
+#define SDIO_D3_Pin        GPIO_PIN_11
+#define SDIO_CK_GPIO_Port  GPIOC
+#define SDIO_CK_Pin        GPIO_PIN_12
+#define SDIO_CMD_GPIO_Port GPIOD
+#define SDIO_CMD_Pin       GPIO_PIN_2
+#define SD_CD_GPIO_Port    GPIOG
+#define SD_CD_Pin          GPIO_PIN_15
+
+/* FDCAN1 (PD0/PD1) */
+#define FDCAN1_RX_GPIO_Port  GPIOD
+#define FDCAN1_RX_Pin        GPIO_PIN_0
+#define FDCAN1_TX_GPIO_Port  GPIOD
+#define FDCAN1_TX_Pin        GPIO_PIN_1
+
+/* ===========================================================================
+ * 12. ADC channel rank (must match ioc Rank-N configuration)
+ * ===========================================================================*/
+/* ADC1: DMA circular, 9 ranks */
+#define ADC1_RANK_RF_IN      0U   /* INP4  (PC4)  - RF1 input power    */
+#define ADC1_RANK_IM         1U   /* INP5  (PB1)  - main current (CC6920BSO-50A) */
+#define ADC1_RANK_REV1       2U   /* INP6  (PF12) - reflected 1 (PA<->LPF)  */
+#define ADC1_RANK_FWD1       3U   /* INP8  (PC5)  - forward 1            */
+#define ADC1_RANK_REV2       4U   /* INP9  (PB0)  - reflected 2 (LPF<->ANT) */
+#define ADC1_RANK_VBIAS      5U   /* INP14 (PA2)  - VBIAS_SENSE          */
+#define ADC1_RANK_FWD2       6U   /* INP15 (PA3)  - forward 2            */
+#define ADC1_RANK_VM         7U   /* INP16 (PA0)  - main voltage          */
+#define ADC1_RANK_KEY_ADC    8U   /* INP17 (PA1)  - key resistor divider */
+
+/* ADC2: DMA circular, 2 ranks + 3 injected */
+#define ADC2_RANK_IF_PA      0U   /* INP0  (PC2_C) - PA output 455kHz IF */
+#define ADC2_RANK_IF_RADIO   1U   /* INP1  (PC3_C) - radio input 455kHz IF */
+#define ADC2_INJ_NTC_CORE    0U   /* InjectedRank 1 = INP2 (PF13) - core NTC */
+#define ADC2_INJ_NTC_AUX     1U   /* InjectedRank 2 = INP6 (PF14) - aux NTC  */
+#define ADC2_INJ_TSENSE      2U   /* InjectedRank 3 = TEMPSENSOR           */
+
+/* ===========================================================================
+ * 13. ADC hardware watchdog channels
+ * ===========================================================================*/
+#define AWD1_CHANNEL         ADC_CHANNEL_4   /* RF input */
+#define AWD2_CHANNEL         ADC_CHANNEL_5   /* main current */
+#define AWD3_CHANNEL         ADC_CHANNEL_6   /* reflected power 1 */
+
+/* ===========================================================================
+ * 14. DAC outputs feeding COMP threshold inputs
+ * ===========================================================================*/
+/* COMP1 negative input = DAC1_OUT1 (RF input overdrive threshold) */
+#define COMP1_INM_DAC_CHANNEL   DAC_CHANNEL_1
+#define COMP1_INM_DAC_HANDLE     DAC1
+/* COMP2 negative input = DAC1_OUT2 (main current threshold) */
+#define COMP2_INM_DAC_CHANNEL   DAC_CHANNEL_2
+#define COMP2_INM_DAC_HANDLE     DAC1
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* HW_PINMAP_H */

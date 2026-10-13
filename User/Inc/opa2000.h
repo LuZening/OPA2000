@@ -1,6 +1,16 @@
 /**
  * @file opa2000.h
  * @brief OPA2000 Global Definitions and Types
+ *
+ * @details This is the SHARED shared-type header between Control, GUI
+ *          and Networking agents.  It defines:
+ *            - band enumeration and frequency ranges
+ *            - power / alert / fan / touch / radio enums
+ *            - the cross-task `AdcDataType` and `ConfigType` blobs
+ *
+ *          GPIO pin assignments live in User/Inc/hw_pinmap.h.
+ *          ADC channel rank conversion functions live in
+ *          User/Inc/adc_calibration.h.
  */
 
 #ifndef OPA2000_H
@@ -10,121 +20,106 @@
 extern "C" {
 #endif
 
-/* Includes */
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-#ifndef LVGL_SIM
-#include "main.h"
-#endif
-
 /*============================================================================
- * Configuration Constants
+ * Configuration constants
  *============================================================================*/
 
-/* ADC Channels - ADC1 (5ch) + ADC2 (4ch) = 9 total */
-/* ADC1: 发射功率1, 反射功率1, 发射功率2, 反射功率2, RF输入功率 */
-/* ADC2: 主电流, 主电压, 核心NTC温度传感器, 输出检波采样 */
-#define ADC_CHANNEL_TX_POWER1     0   /* Transmit Power 1 / 发射功率1 */
-#define ADC_CHANNEL_REF_POWER1    1   /* Reflected Power 1 / 反射功率1 */
-#define ADC_CHANNEL_TX_POWER2     2   /* Transmit Power 2 / 发射功率2 */
-#define ADC_CHANNEL_REF_POWER2    3   /* Reflected Power 2 / 反射功率2 */
-#define ADC_CHANNEL_RF_INPUT      4   /* RF Input Power / RF输入功率 */
-#define ADC_CHANNEL_MAIN_CURRENT  5   /* Main Current / 主电流 */
-#define ADC_CHANNEL_MAIN_VOLTAGE  6   /* Main Voltage / 主电压 */
-#define ADC_CHANNEL_NTC_TEMP      7   /* NTC Temperature / 核心NTC温度传感器 */
-#define ADC_CHANNEL_DETECTOR      8   /* Output Sampling / 输出检波采样 */
+/* ADC1 ranks - order MUST match dma_buf_adc1[] layout in user_adc.c.
+ * dma_buf_adc1[ADC1_RANK_*] is filled by ADC1 DMA circular scan. */
+#define ADC1_RANK_RF_IN        0U  /*!< INP4  (PC4)  - RF1 input power      */
+#define ADC1_RANK_IM           1U  /*!< INP5  (PB1)  - main current IM       */
+#define ADC1_RANK_REV1         2U  /*!< INP6  (PF12) - reflected power 1    */
+#define ADC1_RANK_FWD1         3U  /*!< INP8  (PC5)  - forward power 1       */
+#define ADC1_RANK_REV2         4U  /*!< INP9  (PB0)  - reflected power 2    */
+#define ADC1_RANK_VBIAS        5U  /*!< INP14 (PA2)  - VBIAS_SENSE          */
+#define ADC1_RANK_FWD2         6U  /*!< INP15 (PA3)  - forward power 2       */
+#define ADC1_RANK_VM           7U  /*!< INP16 (PA0)  - main voltage          */
+#define ADC1_RANK_KEY_ADC      8U  /*!< INP17 (PA1)  - key resistor divider */
+#define ADC1_RANK_COUNT        9U
 
-#define ADC_CHANNEL_COUNT         9
+/* ADC2 ranks */
+#define ADC2_RANK_IF_PA        0U  /*!< INP0  (PC2_C) - PA output 455kHz IF */
+#define ADC2_RANK_IF_RADIO     1U  /*!< INP1  (PC3_C) - radio input 455kHz IF */
+#define ADC2_INJ_NTC_CORE      0U  /*!< InjRank 1 = INP2  (PF13) - core NTC */
+#define ADC2_INJ_NTC_AUX       1U  /*!< InjRank 2 = INP6  (PF14) - aux NTC  */
+#define ADC2_INJ_TSENSE        2U  /*!< InjRank 3 = TEMPSENSOR             */
 
-/* Protection Thresholds (default values) */
+/* Protection defaults (overridable by config_t) */
 #define DEFAULT_PROTECT_REFLECT_POWER2_W     400     /* Watts */
 #define DEFAULT_PROTECT_REFLECT_POWER2_SWR   200     /* Watts */
-#define DEFAULT_PROTECT_SWR_THRESHOLD        2.0f    /* SWR */
+#define DEFAULT_PROTECT_SWR_THRESHOLD_X100   200     /* 2.00 */
 #define DEFAULT_PROTECT_REFLECT_POWER1_W     600     /* Watts */
-#define DEFAULT_PROTECT_MAIN_CURRENT_A       40.0f   /* Amperes */
-#define DEFAULT_PROTECT_NTC_TEMP_C           90.0f   /* Celsius */
-#define DEFAULT_PROTECT_TX_POWER1_W          1100.0f /* Watts */
-#define DEFAULT_PROTECT_TX_POWER2_W          1050.0f /* Watts */
+#define DEFAULT_PROTECT_MAIN_CURRENT_A       30      /* Amperes */
+#define DEFAULT_PROTECT_NTC_TEMP_C           90      /* Celsius */
+#define DEFAULT_PROTECT_TX_POWER1_W         1100    /* Watts */
+#define DEFAULT_PROTECT_TX_POWER2_W         1050    /* Watts */
 
-/* Fan Control */
+/* Fan control */
 #define FAN_SPEED_50_PERCENT     50
 #define FAN_SPEED_80_PERCENT     80
 #define FAN_SPEED_100_PERCENT    100
-#define FAN_TEMP_THRESHOLD_80    60      /* Celsius */
-#define FAN_TEMP_THRESHOLD_100   70      /* Celsius */
-#define FAN_HYSTERESIS           10      /* Hysteresis for speed decrease */
+#define FAN_TEMP_THRESHOLD_80    60      /* Celsius - to 80% */
+#define FAN_TEMP_THRESHOLD_100   70      /* Celsius - to 100% */
+#define FAN_HYSTERESIS           10      /* degrees - sticky decrease */
 
-/* Software Protection Limits */
-#define MAX_NTC_TEMP_C           90      /* Maximum NTC temperature in Celsius */
-#define MAX_TX_POWER1_W          1100    /* Maximum transmit power 1 in Watts */
-#define MAX_TX_POWER2_W          1050    /* Maximum transmit power 2 in Watts */
+/* Software protection limits */
+#define MAX_NTC_TEMP_C           90
+#define MAX_TX_POWER1_W          1100
+#define MAX_TX_POWER2_W          1050
+#define MAX_MAIN_CURRENT_A       30
 
-/* Band Frequency Ranges (Hz) - 5 combined bands */
-#define BAND_160M_MIN    1800000
-#define BAND_160M_MAX    2100000
-#define BAND_80M_MIN     3500000
-#define BAND_80M_MAX     3900000
-#define BAND_40M_30M_MIN 7000000
-#define BAND_40M_30M_MAX 10150000
-#define BAND_20M_17M_MIN 14000000
-#define BAND_20M_17M_MAX 18168000
-#define BAND_15M_10M_MIN 21000000
-#define BAND_15M_10M_MAX 29700000
+/* Band frequency ranges (Hz) - 5 combined bands.
+ * freq_to_band() returns BAND_* based on these. */
+#define BAND_160M_MIN       1800000U
+#define BAND_160M_MAX       2100000U
+#define BAND_80M_MIN        3500000U
+#define BAND_80M_MAX        3900000U
+#define BAND_40M_30M_MIN    7000000U
+#define BAND_40M_30M_MAX   10150000U
+#define BAND_20M_17M_MIN   14000000U
+#define BAND_20M_17M_MAX   18168000U
+#define BAND_15M_10M_MIN   21000000U
+#define BAND_15M_10M_MAX   29700000U
 
-/* Band Selection Masks (for GPIO relay control) */
-#define BAND_SEL_160M     0x01    /* BAND_SEL5X */
-#define BAND_SEL_80M      0x02    /* BAND_SEL4X */
-#define BAND_SEL_40M_30M  0x04    /* BAND_SEL3X */
-#define BAND_SEL_20M_17M  0x08    /* BAND_SEL2X */
-#define BAND_SEL_15M_10M  0x10    /* BAND_SEL1X */
+#define DEFAULT_PC_BAUD_RATE      19200U
 
-/* Band strings for display */
-extern const char* strFreqRanges[];
-extern const char* strBands[];
+/* Frequency detection (TIM1 ETR + TIM7 100us tick)
+ * TIM7 ticks every 100us; counts accumulated; freq = count * 10000 */
+#define FREQDET_MULTIPLIER         10000U  /*!< count * 10000 = Hz (1s/100us) */
+#define FREQDET_MIN_VALID_FREQ_HZ  1000000U /*!< 1 MHz threshold */
 
-/* Communication */
-#define DEFAULT_PC_BAUD_RATE      19200
-#define RX_QUEUE_SIZE             256
-#define TX_QUEUE_SIZE             256
-
-/* Frequency Detection */
-/* TIM7 fires every 100us to check TIM4 ETR counter */
-#define FREQDET_CHECK_INTERVAL_US  100     /* microseconds */
-#define FREQDET_MULTIPLIER         10000   /* count * 10000 = Hz (1s/100us) */
-#define FREQDET_MIN_VALID_FREQ_HZ  1000000 /* 1MHz threshold: ignore noise */
-
-/* TIM7 config for 100us period (timer clock ~200MHz) */
-#define FREQDET_TIM7_PRESCALER     19      /* divider = 20 */
-#define FREQDET_TIM7_PERIOD        999     /* period = 1000 ticks */
-/* 200MHz / 20 / 1000 = 10KHz = 100us */
-
-/* Buzzer */
-#define BUZZER_NOTE_DURATION_MS    300
-#define BUZZER_INTERVAL_MS         3000
+/* Buzzer 3-tone warning timing */
+#define BUZZER_NOTE_DURATION_MS    300U
+#define BUZZER_NOTE_INTERVAL_MS    3000U
+#define BUZZER_NOTE_HIGH_HZ        2500U
+#define BUZZER_NOTE_MID_HZ         1500U
+#define BUZZER_NOTE_LOW_HZ         800U
 
 /*============================================================================
- * Data Types
+ * Data types
  *============================================================================*/
 
-/* Language Type */
+/* Language */
 typedef enum {
     MULTILANG_CHINESE = 0,
     MULTILANG_ENGLISH,
 } LanguageType;
 
-/* Radio Type */
+/* Radio protocol (Networking agent owns the parser) */
 typedef enum {
     RADIO_TYPE_UNKNOWN = 0,
     RADIO_TYPE_ICOM_CIV,
     RADIO_TYPE_YAESU,
-    RADIO_TYPE_KENWOOD
+    RADIO_TYPE_KENWOOD,
 } RadioType;
 
-/* Band Type */
+/* Band */
 typedef enum {
     BAND_NONE = 0,
     BAND_160M,
@@ -132,17 +127,17 @@ typedef enum {
     BAND_40M_30M,
     BAND_20M_17M,
     BAND_15M_10M,
-    BAND_FAULT      /* Invalid frequency */
+    BAND_FAULT,            /*!< Invalid frequency */
 } BandType;
 
-/* Power State */
+/* Power state machine */
 typedef enum {
     POWER_STATE_OFF = 0,
     POWER_STATE_STANDBY,
-    POWER_STATE_TX
+    POWER_STATE_TX,
 } PowerStateType;
 
-/* Alert Type */
+/* Alert cause */
 typedef enum {
     ALERT_NONE = 0,
     ALERT_SWR_HIGH,
@@ -150,149 +145,132 @@ typedef enum {
     ALERT_CURRENT_HIGH,
     ALERT_HARDWARE_FAULT,
     ALERT_OVERDRIVE,
-    ALERT_FREQ_MISMATCH
+    ALERT_FREQ_MISMATCH,
+    ALERT_NTC_OVERHEAT,
+    ALERT_VBIAS_FAULT,
 } AlertType;
 
-/* Fan Speed */
+/* Fan speed state */
 typedef enum {
-    FAN_SPEED_LOW = 0,
-    FAN_SPEED_MED,
-    FAN_SPEED_HIGH
+    FAN_SPEED_LOW = 0,   /*!< 50 % */
+    FAN_SPEED_MED,       /*!< 80 % */
+    FAN_SPEED_HIGH,      /*!< 100 % */
 } FanSpeedType;
 
-/* Touch Screen Type */
-typedef enum {
-    TOUCH_NONE = 0,
-    TOUCH_RESISTIVE,
-    TOUCH_CAPACITIVE
-} TouchType;
-
 /*============================================================================
- * Multi-language String Structure
+ * Cross-task shared structures
  *============================================================================*/
 
+/* Multi-language string for GUI */
 typedef struct {
-    const char *zh;    /* Chinese string */
-    const char *en;    /* English string */
+    const char *zh;
+    const char *en;
 } MultiLangStr;
 
-/*============================================================================
- * ADC Data Structure
- *============================================================================*/
-
+/* ADC processed data - written by Control agent (user_adc.c),
+ * read by GUI (via accessor) and protection task. */
 typedef struct {
-    uint16_t raw[ADC_CHANNEL_COUNT];      /* Raw ADC values */
-    float voltage;                         /* Main voltage (V) */
-    float current;                         /* Main current (A) */
-    float tx_power1;                       /* Transmit power 1 (W) */
-    float tx_power2;                       /* Transmit power 2 (W) */
-    float ref_power1;                      /* Reflected power 1 (W) */
-    float ref_power2;                      /* Reflected power 2 (W) */
-    float rf_input;                        /* RF input power (W) */
-    float ntc_temp;                        /* NTC temperature (C) */
-    float detector;                        /* Detector sample (V) */
-    float swr;                             /* VSWR calculation */
+    /* Raw 16-bit ADC values from DMA buffer, indexed by ADC1_RANK_*. */
+    volatile uint16_t adc1_raw[ADC1_RANK_COUNT];
+    volatile uint16_t adc2_if_pa_raw;
+    volatile uint16_t adc2_if_radio_raw;
+    volatile uint16_t adc2_inj_ntc_core_raw;
+    volatile uint16_t adc2_inj_ntc_aux_raw;
+    volatile uint16_t adc2_inj_tsense_raw;
+
+    /* Engineering units.  All values are post-calibration; physical
+     * units documented in OPA2000_H7_固件设计要求.txt. */
+    volatile int32_t im_mA;              /*!< main current, milli-Ampere */
+    volatile int32_t vm_mV;              /*!< main voltage, milli-Volt */
+    volatile int32_t fwd1_mW;            /*!< forward power 1, milli-Watt */
+    volatile int32_t fwd2_mW;            /*!< forward power 2 */
+    volatile int32_t rev1_mW;            /*!< reflected power 1 */
+    volatile int32_t rev2_mW;            /*!< reflected power 2 */
+    volatile int32_t rf_in_mW;           /*!< RF input power */
+    volatile int32_t vbias_mV;           /*!< PA bias voltage, mV */
+    volatile int32_t ntc_core_tenth_c;    /*!< core NTC, 0.1 Celsius */
+    volatile int32_t ntc_aux_tenth_c;     /*!< aux NTC, 0.1 Celsius */
+    volatile int32_t mcu_int_tenth_c;    /*!< MCU internal temp, 0.1 Celsius */
+
+    /* VSWR - derived from fwd2_mW and rev2_mW.
+     * If fwd2_mW < 10W (10 000 mW), swr is forced to 100 (=1.0). */
+    volatile int32_t swr_x100;           /*!< SWR * 100 */
+
+    /* Sequence counter (increments on every fresh DMA batch) */
+    volatile uint32_t seq;
 } AdcDataType;
 
-/*============================================================================
- * Calibration Data Structure
- *============================================================================*/
-
+/* Calibration for a single forward / reflected channel */
 typedef struct {
-    float forward_slope;       /* Forward power slope */
-    float forward_offset;      /* Forward power offset */
-    float reflect_slope;       /* Reflected power slope */
-    float reflect_offset;      /* Reflected power offset */
-} CalDataType;
+    int32_t a_q16;     /*!< slope, Q16.16 fixed-point */
+    int32_t b_mW;      /*!< intercept, milli-Watt */
+} coupler_t;
 
-/*============================================================================
- * Touch Calibration Structure
- *============================================================================*/
-
+/* Persistent configuration blob.  Stored at /fs/config.bin by
+ * Networking/sdconfig.cpp.  Mirrored by config.c into the global g_config. */
 typedef struct {
-    float x_slope;
-    float x_offset;
-    float y_slope;
-    float y_offset;
-    bool valid;
-} TouchCalDataType;
-
-/*============================================================================
- * Configuration Structure
- *============================================================================*/
-
-typedef struct {
-    /* Communication */
     uint32_t pc_baud_rate;
     RadioType radio_type;
     uint32_t radio_baud_rate;
 
-    /* Protection thresholds */
-    float protect_reflect_power2_w;
-    float protect_reflect_power2_swr;
-    float protect_swr_threshold;
-    float protect_reflect_power1_w;
-    float protect_main_current_a;
-    float protect_ntc_temp_c;
-    float protect_tx_power1_w;
-    float protect_tx_power2_w;
+    /* Per-band protection thresholds (Hz / Watts / Amps / Celsius) */
+    uint16_t band_rf_in_max_w[6];     /*!< AWD1 RF input threshold, by band */
+    uint16_t band_rev1_max_w;        /*!< AWD3 reflected 1 threshold */
+    uint16_t band_rev2_max_w;        /*!< software REV2 threshold */
+    uint16_t band_rev2_swr_w;        /*!< SWR-check REV2 threshold */
+    uint16_t band_swr_max_x100;      /*!< SWR threshold * 100 */
+    uint16_t band_ntc_max_tenth_c;   /*!< NTC overheat threshold */
+    uint16_t band_fwd1_max_w;        /*!< FWD1 software threshold */
+    uint16_t band_fwd2_max_w;        /*!< FWD2 software threshold */
+    uint16_t band_im_max_a;          /*!< main current threshold */
+    uint16_t band_vbias_max_mV;      /*!< VBIAS threshold */
 
-    /* Calibration */
-    CalDataType cal_tx_power1;
-    CalDataType cal_tx_power2;
-    CalDataType cal_ref_power1;
-    CalDataType cal_ref_power2;
-    CalDataType cal_rf_input;
+    /* Coupler calibration (linear fit y = (a/65536) * raw + b) */
+    coupler_t fwd1, fwd2, rev1, rev2;
 
-    /* Touch calibration */
-    TouchCalDataType touch_cal;
+    /* IM zero-offset calibration */
+    uint16_t im_zero_offset_adc;
+    uint8_t  im_calibrated;
 
-    /* Language */
+    /* Misc */
     LanguageType language;
+    uint8_t  buzzer_enable;
+    uint8_t  reserved[6];
 
-    /* Valid flag */
     uint32_t crc32;
 } ConfigType;
 
 /*============================================================================
- * Global Variables Declaration
+ * Global state (declared; defined in opa2000.c)
  *============================================================================*/
 
-/* ADC Data - placed in SRAM for DMA access */
-extern volatile AdcDataType g_adc_data;
-
-/* Configuration */
-extern ConfigType g_config;
-
-/* Current power state */
+extern volatile AdcDataType    g_adc_data;
 extern volatile PowerStateType g_power_state;
+extern volatile BandType       g_current_band;
+extern volatile bool           g_ptt_active;
+extern volatile bool           g_allow_rf;        /*!< CC6920 zero-offset done */
+extern volatile AlertType      g_alert_active;
+extern volatile bool           g_alert_flag;
+extern volatile FanSpeedType   g_fan_speed;
+extern volatile uint32_t       g_radio_freq_hz;   /*!< last measured Hz */
 
-/* Current band */
-extern volatile BandType g_current_band;
+extern ConfigType  g_config;
 
-/* PTT state */
-extern volatile bool g_ptt_active;
-
-/* Alert state */
-extern volatile AlertType g_alert_active;
-extern volatile bool g_alert_flag;
-
-/* Touch type detected */
-extern TouchType g_touch_type;
-
-/* Fan speed */
-extern volatile FanSpeedType g_fan_speed;
+/* Band strings for GUI display (defined in opa2000.c) */
+extern const char *strFreqRanges[];
+extern const char *strBands[];
 
 /*============================================================================
- * Function Prototypes
+ * Function prototypes
  *============================================================================*/
 
 /* Utility functions */
 uint32_t crc32_calculate(const uint8_t *data, uint32_t length);
-float linear_interpolate(float x, float x1, float y1, float x2, float y2);
 BandType frequency_to_band(uint32_t frequency_hz);
-float apply_calibration(uint16_t raw_adc, const CalDataType *cal, bool is_reflect);
-float calculate_swr(float forward_power, float reflect_power);
+int32_t  calculate_swr_x100(int32_t fwd2_mW, int32_t rev2_mW);
+
+/* Initialization (called once at startup) */
+void opa2000_init(void);
 
 #ifdef __cplusplus
 }

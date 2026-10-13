@@ -1,192 +1,194 @@
 /**
  * @file opa2000.c
- * @brief OPA2000 Global Variables and Utility Functions
+ * @brief OPA2000 Global State and Utility Functions
+ *
+ * @details Defines all `extern volatile` globals declared in opa2000.h
+ *          and provides band/SWR/CRC helpers shared between Control,
+ *          GUI and Networking.
+ *
+ * @warning All `volatile` globals are touched from multiple tasks and
+ *          ISRs (ADC DMA, COMP, EXTI).  Variables that are only read
+ *          by the task side use `volatile` + `const` pattern.
  */
 
 #include "opa2000.h"
-#include "config.h"
+#include <math.h>     /*!< logf() for NTC B-equation */
 
 /*============================================================================
- * Global Variables
+ *  1. Global state (defined here, declared volatile in opa2000.h)
  *============================================================================*/
 
-/* ADC Data - placed in non-cached SRAM for DMA access */
-/* The ADC DMA buffer will be placed in a specific memory region */
-volatile AdcDataType g_adc_data = {0};
+/* NOTE: g_adc_data, g_config live in RAM (default).  The DMA buffer
+ * itself is placed in DTCMRAM by the linker script (see .ld). */
 
-/* Configuration - loaded from EEPROM or initialized */
-ConfigType g_config = {
-    .pc_baud_rate = DEFAULT_PC_BAUD_RATE,
-    .radio_type = RADIO_TYPE_UNKNOWN,
-    .radio_baud_rate = 19200,
-    .protect_reflect_power2_w = DEFAULT_PROTECT_REFLECT_POWER2_W,
-    .protect_reflect_power2_swr = DEFAULT_PROTECT_REFLECT_POWER2_SWR,
-    .protect_swr_threshold = DEFAULT_PROTECT_SWR_THRESHOLD,
-    .protect_reflect_power1_w = DEFAULT_PROTECT_REFLECT_POWER1_W,
-    .protect_main_current_a = DEFAULT_PROTECT_MAIN_CURRENT_A,
-    .cal_tx_power1 = {1.0f, 0.0f, 1.0f, 0.0f},
-    .cal_tx_power2 = {1.0f, 0.0f, 1.0f, 0.0f},
-    .cal_ref_power1 = {1.0f, 0.0f, 1.0f, 0.0f},
-    .cal_ref_power2 = {1.0f, 0.0f, 1.0f, 0.0f},
-    .touch_cal = {1.0f, 0.0f, 1.0f, 0.0f, false},
-    .language = MULTILANG_ENGLISH,
-    .crc32 = 0
-};
+/* Raw + engineering values - updated by Control task from ADC DMA */
+volatile AdcDataType    g_adc_data;
 
-/* Power state */
+/* Power state machine - written by Control, read by GUI */
 volatile PowerStateType g_power_state = POWER_STATE_OFF;
+volatile BandType       g_current_band = BAND_NONE;
+volatile bool           g_ptt_active   = false;
 
-/* Current band detected from radio/freq detector */
-volatile BandType g_current_band = BAND_NONE;
+/* IM zero-offset calibration gate (Control sets true after success).
+ * PWR_ON_SIG (PG7) and RF_BIAS_ON (PG2) are only allowed to be HIGH
+ * when g_allow_rf is true. */
+volatile bool           g_allow_rf     = false;
 
-/* PTT state */
-volatile bool g_ptt_active = false;
+/* Alert */
+volatile AlertType      g_alert_active = ALERT_NONE;
+volatile bool           g_alert_flag   = false;
 
-/* Alert state */
-volatile AlertType g_alert_active = ALERT_NONE;
-volatile bool g_alert_flag = false;
+/* Fan speed */
+volatile FanSpeedType   g_fan_speed    = FAN_SPEED_LOW;
 
-/* Touch screen type */
-TouchType g_touch_type = TOUCH_NONE;
+/* Last measured RF frequency in Hz, written by Control freq_detect task */
+volatile uint32_t       g_radio_freq_hz = 0U;
 
-/* Fan speed control */
-volatile FanSpeedType g_fan_speed = FAN_SPEED_LOW;
-
-/* Measured frequency from frequency detector */
-volatile uint32_t g_measured_frequency = 0;
+/* Persistent config blob.  Default-initialised in opa2000_init(); the
+ * Networking agent's sdconfig.cpp overwrites it from /fs/config.bin
+ * after startup. */
+ConfigType g_config;
 
 /*============================================================================
- * Utility Functions
+ *  2. Band / frequency helpers
  *============================================================================*/
 
-/**
- * @brief Calculate CRC32 of data
- * @param data Pointer to data
- * @param length Length of data in bytes
- * @return CRC32 value
- */
+BandType frequency_to_band(uint32_t frequency_hz)
+{
+    if (frequency_hz < BAND_160M_MIN) return BAND_NONE;
+    if (frequency_hz <= BAND_160M_MAX) return BAND_160M;
+    if (frequency_hz < BAND_80M_MIN)  return BAND_FAULT;
+    if (frequency_hz <= BAND_80M_MAX)  return BAND_80M;
+    if (frequency_hz < BAND_40M_30M_MIN) return BAND_FAULT;
+    if (frequency_hz <= BAND_40M_30M_MAX) return BAND_40M_30M;
+    if (frequency_hz < BAND_20M_17M_MIN) return BAND_FAULT;
+    if (frequency_hz <= BAND_20M_17M_MAX) return BAND_20M_17M;
+    if (frequency_hz < BAND_15M_10M_MIN) return BAND_FAULT;
+    if (frequency_hz <= BAND_15M_10M_MAX) return BAND_15M_10M;
+    return BAND_FAULT;
+}
+
+/* VSWR = (1 + |Gamma|) / (1 - |Gamma|), |Gamma| = sqrt(Pr / P_fwd).
+ * Returned as x100 (e.g. 150 = 1.50).  Below 10W forward power the
+ * result is forced to 100 (=1.00) per design spec to avoid noise
+ * inflating SWR at low signal levels. */
+int32_t calculate_swr_x100(int32_t fwd2_mW, int32_t rev2_mW)
+{
+    if (fwd2_mW < 10000) {           /* 10 W */
+        return 100;
+    }
+    if (rev2_mW <= 0 || rev2_mW >= fwd2_mW) {
+        return 999;                  /* invalid; clamp */
+    }
+    /* integer sqrt approximation: x = (n + fwd / n) >> 1, 8 iterations */
+    int64_t ratio = (int64_t)rev2_mW * 1000000 / fwd2_mW;   /* Q.6 */
+    int64_t gamma_sq_x = ratio;
+    /* Newton's sqrt */
+    int64_t n = 1000;                /* initial guess for sqrt(gamma_sq_x*1e6) */
+    for (int i = 0; i < 8; i++) {
+        int64_t next = (n + (gamma_sq_x * 1000) / n) >> 1;
+        if (next >= n - 1 && next <= n + 1) break;
+        n = next;
+    }
+    /* gamma ~ n / 1000 (i.e. sqrt of gamma_sq_x * 1e-3) */
+    /* SWR = (1 + gamma) / (1 - gamma), scale x100 */
+    int64_t swr_x100 = (1000 + n) * 100 / (1000 - n);
+    if (swr_x100 < 100) swr_x100 = 100;
+    if (swr_x100 > 999) swr_x100 = 999;
+    return (int32_t)swr_x100;
+}
+
+/*============================================================================
+ *  3. CRC32 (polynomial 0xEDB88320, IEEE 802.3)
+ *============================================================================*/
+
 uint32_t crc32_calculate(const uint8_t *data, uint32_t length)
 {
-    uint32_t crc = 0xFFFFFFFF;
-
+    uint32_t crc = 0xFFFFFFFFU;
     for (uint32_t i = 0; i < length; i++) {
         crc ^= data[i];
-        for (uint32_t j = 0; j < 8; j++) {
-            if (crc & 1) {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
+        for (uint8_t b = 0; b < 8; b++) {
+            uint32_t mask = (crc & 1U) ? 0xEDB88320U : 0U;
+            crc = (crc >> 1) ^ mask;
         }
     }
-
-    return ~crc;
+    return crc ^ 0xFFFFFFFFU;
 }
 
-/**
- * @brief Linear interpolation
- * @param x Input value
- * @param x1 First reference point x
- * @param y1 First reference point y
- * @param x2 Second reference point x
- * @param y2 Second reference point y
- * @return Interpolated y value
- */
-float linear_interpolate(float x, float x1, float y1, float x2, float y2)
-{
-    if (x2 == x1) return y1;
-    return y1 + (y2 - y1) * (x - x1) / (x2 - x1);
-}
+/*============================================================================
+ *  4. Band display strings (for GUI)
+ *============================================================================*/
 
-/* Band frequency range strings for GUI display */
-const char* strFreqRanges[] = {
-    "1.800-2.100 MHz",   /* 160m */
-    "3.500-3.900 MHz",   /* 80m */
+const char *strFreqRanges[] = {
+    "1.800-2.100 MHz",   /* 160m   */
+    "3.500-3.900 MHz",   /* 80m    */
     "7.000-10.150 MHz",  /* 40-30m */
     "14.000-18.168 MHz", /* 20-17m */
-    "21.000-29.700 MHz"  /* 15-10m */
+    "21.000-29.700 MHz", /* 15-10m */
 };
 
-/* Band name strings */
-const char* strBands[] = {
+const char *strBands[] = {
     "160m",
     "80m",
     "40-30m",
     "20-17m",
-    "15-10m"
+    "15-10m",
 };
 
-/**
- * @brief Convert frequency to band
- * @param frequency_hz Frequency in Hz
- * @return Band type
- */
-BandType frequency_to_band(uint32_t frequency_hz)
+/*============================================================================
+ *  5. Initialisation
+ *============================================================================*/
+
+void opa2000_init(void)
 {
-    if (frequency_hz < 1800000) {
-        return BAND_FAULT;
-    } else if (frequency_hz < 2100000) {
-        return BAND_160M;
-    } else if (frequency_hz < 3900000) {
-        return BAND_80M;
-    } else if (frequency_hz < 10150000) {
-        return BAND_40M_30M;
-    } else if (frequency_hz < 18168000) {
-        return BAND_20M_17M;
-    } else if (frequency_hz < 29700000) {
-        return BAND_15M_10M;
-    } else {
-        return BAND_FAULT;
-    }
-}
+    /* Zero ADC data buffer */
+    for (int i = 0; i < ADC1_RANK_COUNT; i++) g_adc_data.adc1_raw[i] = 0U;
+    g_adc_data.adc2_if_pa_raw       = 0U;
+    g_adc_data.adc2_if_radio_raw    = 0U;
+    g_adc_data.adc2_inj_ntc_core_raw = 0U;
+    g_adc_data.adc2_inj_ntc_aux_raw  = 0U;
+    g_adc_data.adc2_inj_tsense_raw    = 0U;
+    g_adc_data.im_mA = 0;
+    g_adc_data.vm_mV = 0;
+    g_adc_data.fwd1_mW = g_adc_data.fwd2_mW = 0;
+    g_adc_data.rev1_mW = g_adc_data.rev2_mW = 0;
+    g_adc_data.rf_in_mW = 0;
+    g_adc_data.vbias_mV = 0;
+    g_adc_data.ntc_core_tenth_c = 250;   /* 25.0 C default */
+    g_adc_data.ntc_aux_tenth_c = 250;
+    g_adc_data.mcu_int_tenth_c = 250;
+    g_adc_data.swr_x100 = 100;
+    g_adc_data.seq = 0U;
 
-/**
- * @brief Get band selection mask
- * @param band Band type
- * @return Band selection mask for GPIO outputs
- */
-uint16_t band_to_selection_mask(BandType band)
-{
-    switch (band) {
-        case BAND_160M:     return BAND_SEL_160M;
-        case BAND_80M:      return BAND_SEL_80M;
-        case BAND_40M_30M:  return BAND_SEL_40M_30M;
-        case BAND_20M_17M:  return BAND_SEL_20M_17M;
-        case BAND_15M_10M:  return BAND_SEL_15M_10M;
-        default:            return BAND_SEL_15M_10M;  /* Default to 15-10M */
-    }
-}
+    /* Default config (Networking agent may overwrite from SD card) */
+    g_config.pc_baud_rate          = DEFAULT_PC_BAUD_RATE;
+    g_config.radio_type            = RADIO_TYPE_UNKNOWN;
+    g_config.radio_baud_rate       = 19200U;
+    for (int i = 0; i < 6; i++) g_config.band_rf_in_max_w[i] = 20U;
+    g_config.band_rev1_max_w       = 600U;
+    g_config.band_rev2_max_w       = 400U;
+    g_config.band_rev2_swr_w       = 200U;
+    g_config.band_swr_max_x100     = (uint16_t)DEFAULT_PROTECT_SWR_THRESHOLD_X100;
+    g_config.band_ntc_max_tenth_c  = (uint16_t)(MAX_NTC_TEMP_C * 10U);
+    g_config.band_fwd1_max_w       = (uint16_t)MAX_TX_POWER1_W;
+    g_config.band_fwd2_max_w       = (uint16_t)MAX_TX_POWER2_W;
+    g_config.band_im_max_a         = (uint16_t)MAX_MAIN_CURRENT_A;
+    g_config.band_vbias_max_mV     = 5000U;
+    g_config.fwd1.a_q16 = 65536; g_config.fwd1.b_mW = 0;
+    g_config.fwd2.a_q16 = 65536; g_config.fwd2.b_mW = 0;
+    g_config.rev1.a_q16 = 65536; g_config.rev1.b_mW = 0;
+    g_config.rev2.a_q16 = 65536; g_config.rev2.b_mW = 0;
+    g_config.im_zero_offset_adc    = 43253U;  /* 1.65 V / 2.5 V * 65535 */
+    g_config.im_calibrated         = 0U;
+    g_config.language              = MULTILANG_CHINESE;
+    g_config.buzzer_enable         = 1U;
 
-/**
- * @brief Apply calibration to raw ADC value
- * @param raw_adc Raw ADC value
- * @param cal Calibration data
- * @return Calibrated value
- */
-float apply_calibration(uint16_t raw_adc, const CalDataType *cal, bool is_reflect)
-{
-    float adc_float = (float)raw_adc;
-    if (is_reflect) {
-        return adc_float * cal->reflect_slope + cal->reflect_offset;
-    } else {
-        return adc_float * cal->forward_slope + cal->forward_offset;
-    }
-}
-
-/**
- * @brief Calculate SWR from forward and reflected power
- * @param forward_power Forward power in watts
- * @param reflect_power Reflected power in watts
- * @return SWR value
- */
-float calculate_swr(float forward_power, float reflect_power)
-{
-    if (forward_power < 1.0f) {
-        return 1.0f;
-    }
-
-    float gamma = reflect_power / forward_power;
-    if (gamma > 0.99f) gamma = 0.99f;
-
-    return (1.0f + gamma) / (1.0f - gamma);
+    g_power_state = POWER_STATE_OFF;
+    g_current_band = BAND_NONE;
+    g_ptt_active = false;
+    g_allow_rf = false;
+    g_alert_active = ALERT_NONE;
+    g_alert_flag = false;
+    g_fan_speed = FAN_SPEED_LOW;
+    g_radio_freq_hz = 0U;
 }

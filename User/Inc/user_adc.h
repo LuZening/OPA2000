@@ -1,6 +1,22 @@
 /**
  * @file user_adc.h
- * @brief ADC Data Acquisition Header
+ * @brief ADC data acquisition, filtering and engineering-unit conversion.
+ *
+ * @details Three pipelines:
+ *   1. ADC1 DMA circular (DMA1_Stream6) fills adc1_dma_buf[ADC1_RANK_COUNT].
+ *   2. ADC2 DMA circular (DMA1_Stream7) fills adc2_dma_buf[ADC2_RANK_REG].
+ *   3. ADC2 injected end-of-sequence IRQ fills adc2_inj_buf.
+ *
+ * user_adc_process() (called from HAL_ADC_ConvCpltCallback via task
+ * notification, or periodically from the Control task) reads the latest
+ * DMA snapshot, computes average / max / most-recent for each rank,
+ * applies calibration, and stores the engineering-unit values into
+ * g_adc_data (defined in opa2000.c).
+ *
+ * The IM zero-offset state machine (CC6920BSO-50A calibration) lives
+ * in this file: on startup it averages ~500 ms of IM samples while
+ * RF_BIAS / PWR_ON are off, validates the result, and writes
+ * g_config.im_zero_offset_adc + sets g_allow_rf = true.
  */
 
 #ifndef USER_ADC_H
@@ -11,97 +27,47 @@ extern "C" {
 #endif
 
 #include "opa2000.h"
+#include "adc_calibration.h"
 #include "main.h"
-
-/*============================================================================
- * External Variables
- *============================================================================*/
 
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
 extern DMA_HandleTypeDef hdma_adc1;
+extern DMA_HandleTypeDef hdma_adc2;
+
+/* DMA buffer size = 16-sample rolling average. */
+#define ADC_DMA_BUFFER_SIZE    16U
 
 /*============================================================================
- * ADC Configuration
+ *  Public API
  *============================================================================*/
 
-/* DMA buffer size - enough for multiple samples */
-#define ADC_DMA_BUFFER_SIZE    32
-
-/* ADC values */
-#define ADC_MAX_VALUE          4095    /* 12-bit ADC */
-#define ADC_VREF               3.3f    /* Reference voltage */
-
-/* Current measurement: 75A/75mV shunt = 1000:1 ratio */
-/* Operational amplifier 3.3x gain */
-/* ADC: V = I * 0.075 / 1000 * 3.3 / 3.3 = I * 0.000075 */
-/* Actually: Vshunt * gain = ADC * Vref / 4095 */
-/* I = ADC * Vref / 4095 / (gain * Rshunt) */
-
-/* Voltage measurement: 50:1 divider */
-/* ADC: V = ADC * Vref / 4095 * 50 */
-
-/*============================================================================
- * Function Prototypes
- *============================================================================*/
-
-/**
- * @brief Initialize ADC and DMA
- */
+/* Start ADC1 + ADC2 circular DMA + injected conversion. */
+void adc_start(void);
+/* Stop ADC1 + ADC2 circular DMA. */
+void adc_stop(void);
+/* Process the latest DMA snapshot into g_adc_data.  Called from the
+ * Control task periodically (e.g. 100 ms tick) and from the IM
+ * zero-offset state machine during calibration. */
+void adc_process(void);
+/* ADC1 + ADC2 start + DMA enable.  Idempotent. */
 void adc_init(void);
 
-/**
- * @brief Start continuous ADC conversion
- */
-void adc_start(void);
+/* IM zero-offset state machine.  Run from a task at >= 10 ms tick.
+ * Returns true once calibration has succeeded (g_allow_rf set). */
+bool adc_im_zero_offset_tick(void);
 
-/**
- * @brief Stop ADC conversion
- */
-void adc_stop(void);
-
-/**
- * @brief Process DMA buffer and update ADC data
- */
-void adc_process_data(void);
-
-/**
- * @brief Get filtered ADC value for a channel
- * @param channel Channel index
- * @return Filtered value
- */
-uint16_t adc_get_filtered_value(uint8_t channel);
-
-/**
- * @brief Convert raw ADC to voltage
- * @param adc_value Raw ADC value
- * @return Voltage in volts
- */
-float adc_to_voltage(uint16_t adc_value);
-
-/**
- * @brief Convert ADC to main voltage
- * @param adc_value Raw ADC value
- * @return Voltage in volts (50:1 divider compensation)
- */
-float adc_to_main_voltage(uint16_t adc_value);
-
-/**
- * @brief Convert ADC to main current
- * @param adc_value Raw ADC value
- * @return Current in amperes
- */
-float adc_to_main_current(uint16_t adc_value);
-
-/**
- * @brief Convert ADC to temperature (NTC thermistor)
- * @param adc_value Raw ADC value
- * @return Temperature in celsius
- */
-float adc_to_temperature(uint16_t adc_value);
+/* Place the DMA buffers in a dedicated linker section so the linker
+ * script can locate them in DTCMRAM (zero-func) for cache-coherent
+ * DMA access.  See STM32H7B0XX_FLASH.ld. */
+extern uint16_t adc1_dma_buf[ADC_DMA_BUFFER_SIZE * ADC1_RANK_COUNT];
+extern uint16_t adc2_dma_buf[ADC_DMA_BUFFER_SIZE * 2U];
+extern volatile uint16_t adc2_inj_ntc_core_raw;
+extern volatile uint16_t adc2_inj_ntc_aux_raw;
+extern volatile uint16_t adc2_inj_tsense_raw;
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* ADC_H */
+#endif /* USER_ADC_H */

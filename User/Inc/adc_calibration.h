@@ -68,21 +68,19 @@ int16_t adc2_inj_raw_to_mcu_internal_tenth_c(uint16_t raw); /*!< InjRank 3 TEMPS
 
 /* ===========================================================================
  *  4. Main current chip (CC6920BSO-50A) zero-offset calibration
+ *
+ *    The state machine and g_allow_rf gating live in user_adc.c.
+ *    Persistent zero-offset code is stored in config_t
+ *    (g_config.im_zero_offset_adc, g_config.im_calibrated, see opa2000.h).
+ *
+ *    The RF-permission gate that protects PWR_ON_SIG (PG7) and
+ *    RF_BIAS_ON (PG2) is the volatile global g_allow_rf defined in
+ *    opa2000.c.  Set true by user_adc.c when calibration succeeds,
+ *    cleared by protection.c on any fault.
  * ===========================================================================*/
-typedef struct {
-    uint16_t zero_offset_adc;          /*!< ADC code at I = 0 A       */
-    uint8_t  valid;                    /*!< 1 = calibrated, 0 = pending */
-    uint8_t  reserved;
-} im_zero_offset_t;
 
-extern volatile im_zero_offset_t g_im_zero_offset;
-
-/*! Returns true once main current zero-offset has been measured. */
-static inline uint8_t im_is_calibrated(void) { return g_im_zero_offset.valid; }
-
-/*! Set/clear the global RF-permission flag (RF_BIAS + PWR_ON gated). */
-void     im_set_rf_status(uint8_t allow);
-uint8_t  im_get_rf_status(void);
+/* (no additional prototypes required - g_allow_rf / g_config live in
+ * opa2000.h) */
 
 /* ===========================================================================
  *  5. ADC watchdog threshold setters (called from band/config update)

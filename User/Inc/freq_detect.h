@@ -1,6 +1,19 @@
 /**
  * @file freq_detect.h
- * @brief Frequency Detector Header
+ * @brief Frequency counter (TIM1 ETR) and band-mismatch detector.
+ *
+ * @details TIM1 is configured in External Clock Mode 2 (ETR as clock
+ *          source, prescaler = 31 from hw_pinmap.h).  The 16-bit
+ *          counter increments on every rising edge of PE7
+ *          (FREQDET_TIM7_PRESCALER divider skipped -- TIM1 clocked
+ *          directly from APB2).
+ *
+ *          TIM7 update ISR fires every 100 us and reads the counter.
+ *          Frequency (Hz) = count * 10000 (1 s / 100 us).
+ *
+ *          When the measured band differs from g_current_band and the
+ *          signal is above 1 MHz, protection_trigger_locked() is
+ *          called immediately (ISR-safe; no FreeRTOS API).
  */
 
 #ifndef FREQ_DETECT_H
@@ -11,57 +24,34 @@ extern "C" {
 #endif
 
 #include "opa2000.h"
-#include "main.h"
+#include "hw_pinmap.h"
+
+/* HAL timer handles (defined in main.c) */
+extern TIM_HandleTypeDef htim1;   /*!< TIM1 ETR counter (PE7)  */
+extern TIM_HandleTypeDef htim7;   /*!< TIM7 100 us tick         */
 
 /*============================================================================
- * External Variables
+ *  Public API
  *============================================================================*/
 
-extern TIM_HandleTypeDef htim4;  /* TIM4 for frequency counting (ETR) */
-extern TIM_HandleTypeDef htim7;  /* TIM7 for 100us check interval */
-
-/*============================================================================
- * Function Prototypes
- *============================================================================*/
-
-/**
- * @brief Initialize frequency detector
- */
+/* Initialise TIM7 100 us period + arm TIM1 ETR counter. */
 void freq_detect_init(void);
-
-/**
- * @brief Start frequency detection (TIM4 ETR counter + TIM7 100us timer)
- */
+/* Start the 100 us sampling (TIM7 interrupt). */
 void freq_detect_start(void);
-
-/**
- * @brief Stop frequency detection
- */
+/* Stop the sampling. */
 void freq_detect_stop(void);
 
-/**
- * @brief Frequency detection ISR - called from TIM7 IRQ every 100us
- * @note Runs in ISR context - no FreeRTOS APIs, direct GPIO only
- */
+/* TIM7 update ISR - reads TIM1 counter, updates g_radio_freq_hz and
+ * calls protection_trigger_locked() on band mismatch.  ISR context,
+ * no FreeRTOS API. */
 void freq_detect_isr(void);
 
-/**
- * @brief Task-level frequency check (updates band, handles alert state)
- * @note Called from protect task
- */
+/* Task-side wrapper: updates LPF band selection from the latest
+ * measurement and clears the alert once bands re-align. */
 void freq_detect_check(void);
 
-/**
- * @brief Get last measured frequency
- * @return Frequency in Hz
- */
+/* Latest measured frequency in Hz.  May be 0 if no signal. */
 uint32_t freq_detect_get_frequency(void);
-
-/**
- * @brief Get current detected band
- * @return Band type
- */
-BandType freq_detect_get_band(void);
 
 #ifdef __cplusplus
 }

@@ -6,7 +6,7 @@
 **
 **  Author		: STM32CubeMX
 **
-**  Abstract    : Linker script for STM32H7B0VBTx series
+**  Abstract    : Linker script for STM32H7B0ZBTx series
 **                128Kbytes FLASH and 1216Kbytes RAM
 **
 **                Set heap size, stack size and stack location according
@@ -56,40 +56,33 @@ ENTRY(Reset_Handler)
 MEMORY
 {
 DTCMRAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
-RAM (xrw)          : ORIGIN = 0x24000000, LENGTH = 960K
-SRAM_CACHED (xrw)  : ORIGIN = 0x240F0000, LENGTH = 64K
+RAM (xrw)      : ORIGIN = 0x24000000, LENGTH = 1024K
 ITCMRAM (xrw)      : ORIGIN = 0x00000000, LENGTH = 64K
-FLASH (rx)         : ORIGIN = 0x8000000,  LENGTH = 128K
-EXT_FLASH (rx)     : ORIGIN = 0x90000000, LENGTH = 16M
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 128K
 }
 
 /* Highest address of the user mode stack */
 _estack = ORIGIN(DTCMRAM) + LENGTH(DTCMRAM);    /* end of RAM */
 _sstack = _estack - _Min_Stack_Size;
 /* Generate a link error if heap and stack don't fit into RAM */
-_Min_Heap_Size = 0x1000;      /* required amount of heap  */
+_Min_Heap_Size = 0x200;      /* required amount of heap  */
 _Min_Stack_Size = 0x1000; /* required amount of stack */
 
 /* Define output sections */
 SECTIONS
 {
-
-
-  /* Vector table copy in ITCMRAM for fast interrupt response */
-  .isr_vector_ram : ALIGN(4)
+  /* The startup code goes first into FLASH */
+  .isr_vector :
   {
     . = ALIGN(4);
-    _isr_vector_ram_start = .;
-    KEEP(*(.isr_vector_ram))
+    KEEP(*(.isr_vector)) /* Startup code */
     . = ALIGN(4);
-    _isr_vector_ram_end = .;
-  } >ITCMRAM AT> EXT_FLASH
+  } >FLASH
 
-  /* The program code goes to external FLASH */
+  /* The program code and other data goes into FLASH */
   .text :
   {
     . = ALIGN(4);
-    _stext = .;
     *(.text)           /* .text sections (code) */
     *(.text*)          /* .text* sections (code) */
     *(.glue_7)         /* glue arm to thumb code */
@@ -101,23 +94,23 @@ SECTIONS
 
     . = ALIGN(4);
     _etext = .;        /* define a global symbols at end of code */
-  } >EXT_FLASH
+  } >FLASH
 
-  /* Constant data goes into EXT_FLASH */
+  /* Constant data goes into FLASH */
   .rodata :
   {
     . = ALIGN(4);
     *(.rodata)         /* .rodata sections (constants, strings, etc.) */
     *(.rodata*)        /* .rodata* sections (constants, strings, etc.) */
     . = ALIGN(4);
-  } >EXT_FLASH
+  } >FLASH
 
   .ARM.extab (READONLY) : /* The "READONLY" keyword is only supported in GCC11 and later, remove it if using GCC10 or earlier. */
   {
     . = ALIGN(4);
     *(.ARM.extab* .gnu.linkonce.armextab.*)
     . = ALIGN(4);
-  } >EXT_FLASH
+  } >FLASH
 
   .ARM (READONLY) : /* The "READONLY" keyword is only supported in GCC11 and later, remove it if using GCC10 or earlier. */
   {
@@ -126,7 +119,7 @@ SECTIONS
     *(.ARM.exidx*)
     __exidx_end = .;
     . = ALIGN(4);
-  } >EXT_FLASH
+  } >FLASH
 
   .preinit_array (READONLY) : /* The "READONLY" keyword is only supported in GCC11 and later, remove it if using GCC10 or earlier. */
   {
@@ -135,7 +128,7 @@ SECTIONS
     KEEP (*(.preinit_array*))
     PROVIDE_HIDDEN (__preinit_array_end = .);
     . = ALIGN(4);
-  } >EXT_FLASH
+  } >FLASH
 
   .init_array (READONLY) : /* The "READONLY" keyword is only supported in GCC11 and later, remove it if using GCC10 or earlier. */
   {
@@ -145,7 +138,7 @@ SECTIONS
     KEEP (*(.init_array*))
     PROVIDE_HIDDEN (__init_array_end = .);
     . = ALIGN(4);
-  } >EXT_FLASH
+  } >FLASH
 
   .fini_array (READONLY) : /* The "READONLY" keyword is only supported in GCC11 and later, remove it if using GCC10 or earlier. */
   {
@@ -155,7 +148,7 @@ SECTIONS
     KEEP (*(.fini_array*))
     PROVIDE_HIDDEN (__fini_array_end = .);
     . = ALIGN(4);
-  } >EXT_FLASH
+  } >FLASH
 
   /* used by the startup to initialize data */
   _sidata = LOADADDR(.data);
@@ -171,7 +164,7 @@ SECTIONS
     *(.RamFunc*)       /* .RamFunc* sections */
 
     . = ALIGN(4);
-  } >DTCMRAM AT> EXT_FLASH
+  } >DTCMRAM AT> FLASH
 
  /* Initialized TLS data section */
   .tdata : ALIGN(4)
@@ -181,7 +174,7 @@ SECTIONS
     _edata = .;        /* define a global symbol at data end */
     PROVIDE(__data_end = .);
     PROVIDE(__tdata_end = .);
-  } >DTCMRAM AT> EXT_FLASH
+  } >DTCMRAM AT> FLASH
 
   PROVIDE( __tdata_start = ADDR(.tdata) );
   PROVIDE( __tdata_size = __tdata_end - __tdata_start );
@@ -234,95 +227,6 @@ SECTIONS
 
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
-
-  /*==========================================================================
-   * LVGL heap - cached DTCMRAM for low latency
-   *==========================================================================*/
-  .CCMRAM_heap (NOLOAD) : ALIGN(32)
-  {
-    . = ALIGN(32);
-    _CCMRAM_heap_start = .;
-    *(.CCMRAM_heap)
-    . = ALIGN(32);
-    _CCMRAM_heap_end = .;
-  } >DTCMRAM
-
-  /*==========================================================================
-   * FreeRTOS heap - cached DTCMRAM for low latency (15KB)
-   *==========================================================================*/
-  .freertos_heap (NOLOAD) : ALIGN(32)
-  {
-    . = ALIGN(32);
-    _freertos_heap_start = .;
-    *(.freertos_heap)
-    *(.HeapSection*)
-    . = ALIGN(32);
-    _freertos_heap_end = .;
-  } >DTCMRAM
-
-  /*==========================================================================
-   * Non-cached DMA buffers (AXI SRAM - CPU and DMA can access without cache)
-   *==========================================================================*/
-  /* LTDC Full Framebuffer - 480 x 800 x 2 bytes (RGB565) = 768,000 bytes (~750KB)
-     This is the display buffer that LTDC reads from */
-  .framebuffer (NOLOAD) : ALIGN(32)
-  {
-    . = ALIGN(32);
-    _framebuffer_start = .;
-    *(.framebuffer)
-    . = ALIGN(32);
-    _framebuffer_end = .;
-  } >RAM
-
-  /* LVGL Drawing Buffer - partial buffer for LVGL rendering (~1/5 screen height)
-     480 x 160 x 2 bytes = 153,600 bytes */
-  .lvgl_buffer (NOLOAD) : ALIGN(32)
-  {
-    . = ALIGN(32);
-    _lvgl_buffer_start = .;
-    *(.lvgl_buffer)
-    . = ALIGN(32);
-    _lvgl_buffer_end = .;
-  } >RAM
-
-  /* ADC DMA buffer - 8 channels x 32 samples x 2 bytes = 512 bytes */
-  .dma_buffer (NOLOAD) : ALIGN(32)
-  {
-    . = ALIGN(32);
-    _dma_buffer_start = .;
-    *(.dma_buffer)
-    . = ALIGN(32);
-    _dma_buffer_end = .;
-  } >RAM
-  /*==========================================================================
-   * SRAM_CACHED region - last 64KB of AXI SRAM (cached)
-   * Use this for data that needs cache (CPU reads frequently)
-   *==========================================================================*/
-  .sram_cached (NOLOAD) : ALIGN(32)
-  {
-    . = ALIGN(32);
-    _sram_cached_start = .;
-    *(.sram_cached)
-    . = ALIGN(32);
-    _sram_cached_end = .;
-  } >SRAM_CACHED
-
-  /*==========================================================================
-   * End of non-cached regions
-   *==========================================================================*/
-
-  /*==========================================================================
-   * External FLASH - OSPI1 memory mapped flash (16MB)
-   * Large code and data go here
-   *==========================================================================*/
-  .extflash :
-  {
-    . = ALIGN(4);
-    _extflash_start = .;
-    *(.extflash*)
-    . = ALIGN(4);
-    _extflash_end = .;
-  } >EXT_FLASH
 
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack (NOLOAD) :

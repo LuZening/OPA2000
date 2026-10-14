@@ -18,17 +18,22 @@
  * Private Variables
  *============================================================================*/
 
-/* Screen dimensions — 800x480 landscape */
-#define HOR_RES  800
-#define VER_RES  480
+/* Screen dimensions — 480x272 landscape, RGB565 via LTDC */
+#define HOR_RES  480
+#define VER_RES  272
 
-/* Layout heights */
-#define BANNER_H    (VER_RES / 10)
-#define FWD_PWR_H   (VER_RES / 4)
-#define MID_ROW_H   (VER_RES / 6)
-#define INFO_H      (VER_RES / 8 * 3)
-#define STATUS_H    (VER_RES / 8)
-/* Total = 48 + 120 + 80 + 180 + 52 = 480 */
+/* Vertical gap between stacked sections and the horizontal page margin */
+#define GAP_Y       3
+#define MARGIN_X    8
+
+/* Layout heights.  INFO_H absorbs whatever is left so the five sections
+ * plus the three gaps always sum to exactly VER_RES (272):
+ *   30 + 56 + 44 + 3*3 + 36 + 97 = 272 */
+#define STATUS_H    36
+#define BANNER_H    30
+#define FWD_PWR_H   56
+#define MID_ROW_H   44
+#define INFO_H      (VER_RES - STATUS_H - BANNER_H - FWD_PWR_H - MID_ROW_H - 3 * GAP_Y)
 
 /* Progress bar ranges */
 #define BAR_MAX_FWD    1000
@@ -77,10 +82,24 @@ enum {
     STR_SENSOR_INSPECT,
     STR_AUTO,
     STR_SAVE,
+    /* --- added for the 480x272 main screen --- */
+    STR_FORWARD,        /* FWD 发射功率 */
+    STR_REFLECTED,      /* REV 反射功率 */
+    STR_PROTOCOL,       /* 电台协议 */
+    STR_NO_SIGNAL,      /* 未连接 */
+    STR_LINKED,         /* 已连接 */
+    STR_BAND_LABEL,     /* 波段 */
+    STR_TEMP_UNIT,      /* 温度单位 */
+    STR_CELSIUS,        /* 摄氏度 */
+    STR_FAHRENHEIT,     /* 华氏度 */
 };
 
-/* Multi-language strings */
-static const char* gui_strings[2][40] = {
+/* Number of entries in gui_strings[][].  STR_COUNT must stay last. */
+#define STR_COUNT (STR_FAHRENHEIT + 1)
+
+/* Multi-language strings.  Row 0 = Chinese, row 1 = English.
+ * Index order must match the enum above. */
+static const char* gui_strings[2][STR_COUNT] = {
     /* Chinese */
     {
         "待机", "预备", "发射",
@@ -92,6 +111,7 @@ static const char* gui_strings[2][40] = {
         "屏幕", "触屏校准",
         "校准传感器", "耦合器1", "耦合器2", "开始测量",
         "传感器检查", "自动", "保存",
+        "发射", "反射", "协议", "未连接", "已连接", "波段", "温度单位", "摄氏度 °C", "华氏度 °F",
     },
     /* English */
     {
@@ -104,6 +124,7 @@ static const char* gui_strings[2][40] = {
         "Screen", "Touch Calibrate",
         "Calibrate Sensors", "Coupler 1", "Coupler 2", "Start",
         "Sensor Inspect", "Auto", "Save",
+        "FWD", "REV", "Protocol", "No link", "Linked", "Band", "Temp Unit", "Celsius \u00B0C", "Fahrenheit \u00B0F",
     }
 };
 
@@ -156,6 +177,13 @@ static lv_obj_t *cal_screen;
 static uint8_t current_screen = 0;
 static bool alert_active = false;
 static bool calibrating = false;
+
+/* Temperature unit selectable from the language menu:
+ * false = Celsius (\u00B0C), true = Fahrenheit (\u00B0F) */
+static bool temp_fahrenheit = false;
+
+/* Band / radio-link line in the info area */
+static lv_obj_t *lbl_protocol;
 
 /* Calibration state */
 #define CAL_POINT_COUNT 5
@@ -223,6 +251,32 @@ static lv_obj_t* make_label(lv_obj_t *parent, const char *text,
     lv_obj_t *l = lv_label_create(parent, NULL);
     lv_label_set_text(l, text);
     lv_obj_set_pos(l, x, y);
+    lv_obj_set_style_local_text_color(l, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, color);
+    if (font) lv_obj_set_style_local_text_font(l, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, font);
+    return l;
+}
+
+/**
+ * @brief Create a full-width label whose text is horizontally centred.
+ *
+ * lv_obj_align(l, NULL, LV_ALIGN_CENTER, ...) is unreliable here because a
+ * bare lv_label has no width until it has been laid out.  Giving the label
+ * the full width of its cell fixes the box.
+ *
+ * The default long mode is LV_LABEL_LONG_EXPAND, and lv_label_refr_text()
+ * then calls lv_obj_set_size() to shrink the label back to the text width,
+ * silently discarding that fix.  LV_LABEL_LONG_CROP keeps the width.
+ */
+static lv_obj_t* make_centered_label(lv_obj_t *parent, const char *text,
+                                     lv_coord_t y, lv_coord_t w, lv_coord_t h,
+                                     lv_color_t color, const lv_font_t *font)
+{
+    lv_obj_t *l = lv_label_create(parent, NULL);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_CROP);   /* keep the width/height set below */
+    lv_label_set_text(l, text);
+    lv_obj_set_size(l, w, h);
+    lv_obj_set_pos(l, 0, y);
+    lv_label_set_align(l, LV_LABEL_ALIGN_CENTER);
     lv_obj_set_style_local_text_color(l, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, color);
     if (font) lv_obj_set_style_local_text_font(l, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, font);
     return l;
@@ -301,7 +355,7 @@ static void show_band_selector(void)
     lv_msgbox_set_text(band_selector_msgbox, gui_get_string(STR_BAND));
     lv_msgbox_add_btns(band_selector_msgbox, band_btns);
 
-    lv_obj_set_size(band_selector_msgbox, HOR_RES * 5 / 6, 180);
+    lv_obj_set_size(band_selector_msgbox, HOR_RES * 5 / 6, 160);
 
     /* === Title: white text, CJK font, blue bg === */
     lv_obj_set_style_local_text_color(band_selector_msgbox, LV_MSGBOX_PART_BG,
@@ -348,7 +402,9 @@ static lv_obj_t* make_status_seg(lv_obj_t *parent, lv_coord_t x,
     lv_obj_set_style_local_pad_bottom(seg, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
     lv_obj_set_style_local_pad_left(seg, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
     lv_obj_set_style_local_pad_right(seg, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
-    *cap_ref = make_label(seg, caption, 4, 4, LV_COLOR_WHITE, &MyCJK_16);
+    /* Caption is centred inside the segment, matching the value below it. */
+    *cap_ref = make_centered_label(seg, caption, 2, HOR_RES / 5, 18,
+                                    LV_COLOR_WHITE, &MyCJK_12);
     return seg;
 }
 
@@ -362,13 +418,13 @@ static void gui_create_main_screen(void)
     lv_obj_set_style_local_bg_color(main_screen, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BG);
 
     /*=============================================
-     * 1 — Top Banner (48px) — centered status button
+     * 1 — Top Banner — centered status button
      *=============================================*/
     banner = make_cont(main_screen, 0, 0, HOR_RES, BANNER_H, COLOR_BANNER);
 
     /* Centered clickable button — transparent bg, visible border */
     pwr_btn = lv_btn_create(banner, NULL);
-    lv_obj_set_size(pwr_btn, 240, 36);
+    lv_obj_set_size(pwr_btn, 150, 24);
     lv_obj_set_style_local_bg_opa(pwr_btn, LV_BTN_PART_MAIN, LV_STATE_DEFAULT, LV_OPA_TRANSP);
     lv_obj_set_style_local_border_width(pwr_btn, LV_BTN_PART_MAIN, LV_STATE_DEFAULT, 2);
     lv_obj_set_style_local_border_color(pwr_btn, LV_BTN_PART_MAIN, LV_STATE_DEFAULT, LV_COLOR_WHITE);
@@ -385,84 +441,85 @@ static void gui_create_main_screen(void)
     lv_obj_align(status_label, NULL, LV_ALIGN_CENTER, 0, 0);
 
     /*=============================================
-     * 2 — Forward Power (120px) — title + bar
+     * 2 — Forward Power — title + bar
      *=============================================*/
-    lv_obj_t *c_fwd = make_cont(main_screen, 20, BANNER_H + 6,
-                                 HOR_RES - 40, FWD_PWR_H, COLOR_BG);
+    lv_obj_t *c_fwd = make_cont(main_screen, MARGIN_X, BANNER_H + GAP_Y,
+                                 HOR_RES - 2 * MARGIN_X, FWD_PWR_H, COLOR_BG);
     lv_obj_set_style_local_border_width(c_fwd, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 1);
     lv_obj_set_style_local_border_color(c_fwd, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BORDER);
 
     lbl_tx_title = make_label(c_fwd, gui_get_string(STR_TX_POWER),
-                              0, 4, LV_COLOR_WHITE, &MyCJK_16);
+                              6, 4, LV_COLOR_WHITE, &MyCJK_16);
 
-    val_fwd = make_label(c_fwd, "0W",
-                         0, 4, LV_COLOR_WHITE, &lv_font_montserrat_24);
+    /* Power value uses the same size as the band text so the numeric column
+     * does not overpower the title. */
+    val_fwd = make_label(c_fwd, "0W", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_24);
     lv_obj_align(val_fwd, NULL, LV_ALIGN_IN_TOP_RIGHT, -8, 0);
 
-    bar_fwd = make_bar(c_fwd, 0, 36, HOR_RES - 40, 28, BAR_MAX_FWD);
+    bar_fwd = make_bar(c_fwd, 6, 30, HOR_RES - 2 * MARGIN_X - 12, 20, BAR_MAX_FWD);
 
     /*=============================================
-     * 3 — Middle Row (80px) — Reflected | SWR
+     * 3 — Middle Row — Reflected | SWR
      *=============================================*/
-    lv_coord_t mid_y = BANNER_H + FWD_PWR_H + 8;
-    lv_coord_t half_w = (HOR_RES - 40) / 2 - 5;
+    lv_coord_t mid_y = BANNER_H + GAP_Y + FWD_PWR_H + GAP_Y;
+    lv_coord_t half_w = (HOR_RES - 2 * MARGIN_X - GAP_Y) / 2;
+    const lv_coord_t cell_pad = 6;   /* inner padding, keeps text off the border */
 
-    lv_obj_t *c_ref = make_cont(main_screen, 20, mid_y,
+    lv_obj_t *c_ref = make_cont(main_screen, MARGIN_X, mid_y,
                                   half_w, MID_ROW_H, COLOR_BG);
     lv_obj_set_style_local_border_width(c_ref, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 1);
     lv_obj_set_style_local_border_color(c_ref, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BORDER);
-    lv_obj_t *c_swr = make_cont(main_screen, 30 + half_w, mid_y,
+    lv_obj_t *c_swr = make_cont(main_screen, MARGIN_X + half_w + GAP_Y, mid_y,
                                   half_w, MID_ROW_H, COLOR_BG);
     lv_obj_set_style_local_border_width(c_swr, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 1);
     lv_obj_set_style_local_border_color(c_swr, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BORDER);
 
-    lbl_ref_title = make_label(c_ref, gui_get_string(STR_REF_POWER), 0, 2, LV_COLOR_WHITE, &MyCJK_16);
-    val_ref = make_label(c_ref, "0W", 0, 2, LV_COLOR_WHITE, &lv_font_montserrat_24);
-    lv_obj_align(val_ref, NULL, LV_ALIGN_IN_TOP_RIGHT, -8, 0);
-    bar_ref = make_bar(c_ref, 0, 30, half_w - 10, 22, BAR_MAX_REF);
+    lbl_ref_title = make_label(c_ref, gui_get_string(STR_REF_POWER),
+                               cell_pad, 2, LV_COLOR_WHITE, &MyCJK_16);
+    val_ref = make_label(c_ref, "0W", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_24);
+    lv_obj_align(val_ref, NULL, LV_ALIGN_IN_TOP_RIGHT, -cell_pad, 0);
+    bar_ref = make_bar(c_ref, cell_pad, 22, half_w - 2 * cell_pad - 2, 18, BAR_MAX_REF);
 
-    lbl_swr_title = make_label(c_swr, gui_get_string(STR_SWR), 0, 2, LV_COLOR_WHITE, &MyCJK_16);
-    val_swr = make_label(c_swr, "1.0", 0, 2, LV_COLOR_WHITE, &lv_font_montserrat_24);
-    lv_obj_align(val_swr, NULL, LV_ALIGN_IN_TOP_RIGHT, -8, 0);
-    bar_swr = make_bar(c_swr, 0, 30, half_w - 10, 22, BAR_MAX_SWR);
+    lbl_swr_title = make_label(c_swr, gui_get_string(STR_SWR),
+                               cell_pad, 2, LV_COLOR_WHITE, &MyCJK_16);
+    val_swr = make_label(c_swr, "1.0", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_24);
+    lv_obj_align(val_swr, NULL, LV_ALIGN_IN_TOP_RIGHT, -cell_pad, 0);
+    bar_swr = make_bar(c_swr, cell_pad, 22, half_w - 2 * cell_pad - 2, 18, BAR_MAX_SWR);
 
     /*=============================================
      * 4 — Info Area (180px) — band + frequency
      *=============================================*/
-    lv_coord_t info_y = mid_y + MID_ROW_H + 6;
-    lv_obj_t *c_info = make_cont(main_screen, 20, info_y,
-                                   HOR_RES - 40, INFO_H, COLOR_BG);
+    lv_coord_t info_y = mid_y + MID_ROW_H + GAP_Y;
+    lv_obj_t *c_info = make_cont(main_screen, MARGIN_X, info_y,
+                                   HOR_RES - 2 * MARGIN_X, INFO_H, COLOR_BG);
     lv_obj_set_style_local_border_width(c_info, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 1);
     lv_obj_set_style_local_border_color(c_info, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BORDER);
     /* Thin red border when focused (keyboard/encoder navigation) */
     lv_obj_set_style_local_border_width(c_info, LV_OBJ_PART_MAIN, LV_STATE_FOCUSED, 1);
     lv_obj_set_style_local_border_color(c_info, LV_OBJ_PART_MAIN, LV_STATE_FOCUSED, LV_COLOR_RED);
 
-    /* Frequency range — large yellow text (OPA1000-style) */
-    band_label = lv_label_create(c_info, NULL);
-    lv_label_set_text(band_label, "---");
-    lv_label_set_align(band_label, LV_LABEL_ALIGN_CENTER);
-    lv_obj_set_style_local_text_color(band_label, LV_LABEL_PART_MAIN,
-                                       LV_STATE_DEFAULT, LV_COLOR_YELLOW);
-    lv_obj_set_style_local_text_font(band_label, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &lv_font_montserrat_48);
-    lv_obj_align(band_label, NULL, LV_ALIGN_CENTER, 0, -20);
+    /* Frequency range — yellow, centred (OPA1000-style).  All three lines
+     * use make_centered_label so they stay centred after a language switch
+     * changes the string length. */
+    lv_coord_t info_w = HOR_RES - 2 * MARGIN_X;
 
-    /* Radio/band decoder mode — shown below the frequency */
-    lbl_radio_mode = lv_label_create(c_info, NULL);
-    lv_label_set_text(lbl_radio_mode, "");
-    lv_label_set_align(lbl_radio_mode, LV_LABEL_ALIGN_CENTER);
-    lv_obj_set_style_local_text_color(lbl_radio_mode, LV_LABEL_PART_MAIN,
-                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
-    lv_obj_set_style_local_text_font(lbl_radio_mode, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &lv_font_montserrat_24);
-    lv_obj_align(lbl_radio_mode, NULL, LV_ALIGN_CENTER, 0, 40);
+    band_label = make_centered_label(c_info, "---", 4, info_w, 32,
+                                      LV_COLOR_YELLOW, &lv_font_montserrat_24);
+
+    /* Band name, e.g. "20-17m" */
+    lbl_radio_mode = make_centered_label(c_info, "", 36, info_w, 20,
+                                          LV_COLOR_WHITE, &lv_font_montserrat_16);
+
+    /* Radio link status — protocol name + connection state.  Kept separate
+     * from the band name so a language switch can relabel it independently. */
+    lbl_protocol = make_centered_label(c_info, "", 58, info_w, 16,
+                                        LV_COLOR_GRAY, &lv_font_montserrat_12);
 
     /* Tap to open band selector */
     lv_obj_set_event_cb(c_info, info_area_event_handle);
 
     /*=============================================
-     * 5 — Bottom Status Bar (52px) — Voltage / Current / Temp / Fan / Menu
+     * 5 — Bottom Status Bar — Voltage / Current / Temp / Fan / Menu
      *=============================================*/
     lv_coord_t status_y = VER_RES - STATUS_H;
     bottom_bar = make_cont(main_screen, 0, status_y,
@@ -470,8 +527,10 @@ static void gui_create_main_screen(void)
 
     lv_coord_t seg_w = HOR_RES / 5;
 
+/* Value is centred inside the segment so it lines up with its caption. */
 #define MAKE_STATUS_VAL(var) \
-    var = make_label(seg, "-", 4, 26, LV_COLOR_WHITE, &lv_font_montserrat_16);
+    var = make_centered_label(seg, "-", 20, HOR_RES / 5, 14, \
+                              LV_COLOR_WHITE, &lv_font_montserrat_12);
 
     lv_obj_t *seg;
 
@@ -493,15 +552,47 @@ static void gui_create_main_screen(void)
         lv_obj_set_style_local_border_width(seg, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
 
         lv_obj_t *btn = lv_btn_create(seg, NULL);
-        lv_obj_set_size(btn, seg_w - 16, 36);
+        lv_obj_set_size(btn, seg_w - 12, 24);
         lv_obj_align(btn, NULL, LV_ALIGN_CENTER, 0, 0);
-        lbl_settings_btn = lv_label_create(btn, NULL);
-        lv_label_set_text(lbl_settings_btn, gui_get_string(STR_SETTINGS));
-        lv_obj_set_style_local_text_font(lbl_settings_btn, LV_LABEL_PART_MAIN,
-                                          LV_STATE_DEFAULT, &MyCJK_16);
+        lbl_settings_btn = make_centered_label(btn, gui_get_string(STR_SETTINGS),
+                                                5, seg_w - 12, 16,
+                                                LV_COLOR_WHITE, &MyCJK_12);
         lv_obj_set_event_cb(btn, settings_btn_cb);
     }
 #undef MAKE_STATUS_VAL
+}
+
+/* Radio link caption: protocol name plus connect state.  The protocol comes
+ * from the comm layer's detector; "No link" when nothing has been detected. */
+static void gui_update_protocol_label(void)
+{
+    char buf[48];
+    RadioType rt;
+#ifndef LVGL_SIM
+    rt = comm_get_radio_type();
+#else
+    rt = RADIO_TYPE_ICOM_CIV;   /* simulator shows a connected link */
+#endif
+
+    const char *proto;
+    switch (rt) {
+        case RADIO_TYPE_ICOM_CIV: proto = "ICOM";   break;
+        case RADIO_TYPE_YAESU:    proto = "YAESU";  break;
+        case RADIO_TYPE_KENWOOD:  proto = "KENWOOD"; break;
+        default:                  proto = NULL;     break;
+    }
+
+    if (proto) {
+        snprintf(buf, sizeof(buf), "%s: %s", gui_get_string(STR_PROTOCOL), proto);
+        lv_obj_set_style_local_text_color(lbl_protocol, LV_LABEL_PART_MAIN,
+                                           LV_STATE_DEFAULT, LV_COLOR_GREEN);
+    } else {
+        snprintf(buf, sizeof(buf), "%s: %s", gui_get_string(STR_PROTOCOL),
+                 gui_get_string(STR_NO_SIGNAL));
+        lv_obj_set_style_local_text_color(lbl_protocol, LV_LABEL_PART_MAIN,
+                                           LV_STATE_DEFAULT, LV_COLOR_GRAY);
+    }
+    lv_label_set_text(lbl_protocol, buf);
 }
 
 /**
@@ -514,10 +605,10 @@ static void gui_update_main_values(void)
 #ifndef LVGL_SIM
     /* Status */
     lv_color_t banner_color;
-    if (g_tx_active) {
+    if (g_power_state == POWER_STATE_TX) {
         lv_label_set_text(status_label, gui_get_string(STR_TRANSMIT));
         banner_color = LV_COLOR_MAKE(0xdf, 0x01, 0x01);  /* OPA1000 dark red */
-    } else if (g_psu_on) {
+    } else if (g_power_state == POWER_STATE_STANDBY) {
         lv_label_set_text(status_label, gui_get_string(STR_STANDBY));
         banner_color = LV_COLOR_MAKE(0xea, 0xb9, 0x06);  /* OPA1000 dark yellow */
     } else {
@@ -530,20 +621,27 @@ static void gui_update_main_values(void)
     lv_obj_set_style_local_text_color(status_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
 
-    /* Forward power */
-    float fwd = g_adc_data.tx_power2;
+    /* Peak hold with slow release (tau = 500 ms) is produced by the Control
+     * agent in adc_peak_hold_tick(), driven from the ADC task - deliberately
+     * not from the DMA ISR, because the release needs expf().  The GUI is a
+     * pure consumer: it never writes these two fields. */
+    float fwd_peak_mW = (float)g_adc_data.fwd2_peak_mW;
+    float rev_peak_mW = (float)g_adc_data.rev2_peak_mW;
+/* Forward power, in Watts */
+    float fwd = fwd_peak_mW / 1000.0f;
     snprintf(buf, sizeof(buf), "%.0fW", fwd);
     lv_label_set_text(val_fwd, buf);
     lv_bar_set_value(bar_fwd, (int16_t)(fwd * BAR_MAX_FWD / 1000.0f), LV_ANIM_OFF);
 
-    /* Reflected power */
-    float refp = g_adc_data.ref_power2;
+    /* Reflected power, in Watts */
+    float refp = rev_peak_mW / 1000.0f;
     snprintf(buf, sizeof(buf), "%.0fW", refp);
     lv_label_set_text(val_ref, buf);
     lv_bar_set_value(bar_ref, (int16_t)(refp * BAR_MAX_REF / 300.0f), LV_ANIM_OFF);
 
-    /* SWR */
-    float swr = g_adc_data.swr;
+    /* SWR derived from the same peak values so the three bars agree */
+    float swr = calculate_swr_x100((int32_t)fwd_peak_mW,
+                                   (int32_t)rev_peak_mW) / 100.0f;
     snprintf(buf, sizeof(buf), "%.1f", swr);
     lv_label_set_text(val_swr, buf);
     lv_bar_set_value(bar_swr, (int16_t)((swr - 1.0f) * BAR_MAX_SWR / 3.0f), LV_ANIM_OFF);
@@ -556,16 +654,20 @@ static void gui_update_main_values(void)
     }
 
     /* Voltage */
-    snprintf(buf, sizeof(buf), "%.1fV", g_adc_data.voltage);
+    snprintf(buf, sizeof(buf), "%.1fV", (float)g_adc_data.vm_mV / 1000.0f);
     lv_label_set_text(lbl_voltage, buf);
 
     /* Current */
-    snprintf(buf, sizeof(buf), "%.1fA", g_adc_data.current);
+    snprintf(buf, sizeof(buf), "%.1fA", (float)g_adc_data.im_mA / 1000.0f);
     lv_label_set_text(lbl_current, buf);
 
-    /* Temperature — Celsius + Fahrenheit */
-    float tc = g_adc_data.ntc_temp;
-    snprintf(buf, sizeof(buf), "%.0fC/%.0fF", tc, tc * 9.0f / 5.0f + 32.0f);
+    /* Temperature — unit follows the setting chosen in the language menu */
+    float tc = (float)g_adc_data.ntc_core_tenth_c / 10.0f;
+    if (temp_fahrenheit) {
+        snprintf(buf, sizeof(buf), "%.0f°F", tc * 9.0f / 5.0f + 32.0f);
+    } else {
+        snprintf(buf, sizeof(buf), "%.0f°C", tc);
+    }
     lv_label_set_text(lbl_temp, buf);
 
     /* Fan speed */
@@ -581,37 +683,84 @@ static void gui_update_main_values(void)
     /* Band / Frequency range — indexed from BandType (BAND_160M=1, etc.) */
     if (g_current_band > BAND_NONE && g_current_band <= BAND_15M_10M) {
         lv_label_set_text(band_label, strFreqRanges[g_current_band - 1]);
+        /* Band name under the range, e.g. "20-17m" */
+        lv_label_set_text(lbl_radio_mode, strBands[g_current_band - 1]);
     } else {
         lv_label_set_text(band_label, "---");
+        lv_label_set_text(lbl_radio_mode, "");
     }
 
-    /* Radio type (band decoder mode) */
-    {
-        const char *radio_str;
-        switch (g_config.radio_type) {
-            case RADIO_TYPE_ICOM_CIV: radio_str = "ICOM";   break;
-            case RADIO_TYPE_YAESU:    radio_str = "YAESU";   break;
-            case RADIO_TYPE_KENWOOD:  radio_str = "KENWOOD"; break;
-            default:                  radio_str = "";        break;
-        }
-        lv_label_set_text(lbl_radio_mode, radio_str);
-    }
+    /* Radio protocol link status (from the comm protocol detector) */
+    gui_update_protocol_label();
 
-#else /* LVGL_SIM placeholder */
+#else /* LVGL_SIM: synthesise plausible readings so the layout can be judged */
     (void)buf;
-    lv_label_set_text(status_label, "Simulator");
+
+    /* Banner cycles Idle -> Standby -> Transmit so all three states and
+     * their colours can be checked in the simulator. */
+    static int sim_phase = 0;
+    static lv_color_t sim_banner_color;
+    sim_phase = (sim_phase + 1) % 30;
+    if (sim_phase == 0) {
+        lv_label_set_text(status_label, gui_get_string(STR_TRANSMIT));
+        sim_banner_color = LV_COLOR_MAKE(0xdf, 0x01, 0x01);
+    } else if (sim_phase == 10) {
+        lv_label_set_text(status_label, gui_get_string(STR_STANDBY));
+        sim_banner_color = LV_COLOR_MAKE(0xea, 0xb9, 0x06);
+    } else if (sim_phase == 20) {
+        lv_label_set_text(status_label, gui_get_string(STR_IDLE));
+        sim_banner_color = COLOR_BANNER;
+    }
     lv_obj_set_style_local_text_color(status_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
-    lv_obj_set_style_local_bg_color(banner, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BANNER);
-    lv_obj_set_style_local_bg_color(bottom_bar, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BANNER);
-    lv_label_set_text(val_fwd, "0W");
-    lv_label_set_text(val_ref, "0W");
-    lv_label_set_text(val_swr, "1.0");
-    lv_label_set_text(lbl_voltage, "13.8V");
-    lv_label_set_text(lbl_current, "0A");
-    lv_label_set_text(lbl_temp, "25C/77F");
-    lv_label_set_text(lbl_fan, "-");
-    lv_label_set_text(band_label, "Band: ---");
+    lv_obj_set_style_local_bg_color(banner, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, sim_banner_color);
+    lv_obj_set_style_local_bg_color(bottom_bar, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, sim_banner_color);
+
+    /* Stand in for the Control agent's peak detector so the bars can be
+     * judged without the target firmware.  On hardware these two fields are
+     * written by user_adc.c and the GUI only reads them.  Here we feed a
+     * triangular sweep straight into the peak fields. */
+    static int sim_sweep = 0;
+    sim_sweep = (sim_sweep + 4) % 240;
+    float sim_fwd_w = (sim_sweep < 120) ? (sim_sweep * 1000.0f / 120.0f)
+                                        : ((240 - sim_sweep) * 1000.0f / 120.0f);
+    float sim_rev_w = sim_fwd_w * 0.06f;
+    g_adc_data.fwd2_peak_mW = (int32_t)(sim_fwd_w * 1000.0f);
+    g_adc_data.rev2_peak_mW = (int32_t)(sim_rev_w * 1000.0f);
+
+    float fwd_peak_mW = (float)g_adc_data.fwd2_peak_mW;
+    float rev_peak_mW = (float)g_adc_data.rev2_peak_mW;
+
+    snprintf(buf, sizeof(buf), "%.0fW", fwd_peak_mW / 1000.0f);
+    lv_label_set_text(val_fwd, buf);
+    lv_bar_set_value(bar_fwd, (int16_t)(fwd_peak_mW / 1000.0f), LV_ANIM_OFF);
+
+    snprintf(buf, sizeof(buf), "%.0fW", rev_peak_mW / 1000.0f);
+    lv_label_set_text(val_ref, buf);
+    lv_bar_set_value(bar_ref, (int16_t)(rev_peak_mW / 3000.0f), LV_ANIM_OFF);
+
+    float sim_swr = calculate_swr_x100((int32_t)fwd_peak_mW,
+                                       (int32_t)rev_peak_mW) / 100.0f;
+    snprintf(buf, sizeof(buf), "%.1f", sim_swr);
+    lv_label_set_text(val_swr, buf);
+    lv_bar_set_value(bar_swr, (int16_t)((sim_swr - 1.0f) * BAR_MAX_SWR / 3.0f), LV_ANIM_OFF);
+
+    snprintf(buf, sizeof(buf), "13.8V");
+    lv_label_set_text(lbl_voltage, buf);
+    snprintf(buf, sizeof(buf), "%.1fA", 2.0f + sim_fwd_w / 400.0f);
+    lv_label_set_text(lbl_current, buf);
+
+    if (temp_fahrenheit) {
+        snprintf(buf, sizeof(buf), "%.0f°F", 45.0f * 9.0f / 5.0f + 32.0f);
+    } else {
+        snprintf(buf, sizeof(buf), "%.0f°C", 45.0f);
+    }
+    lv_label_set_text(lbl_temp, buf);
+
+    lv_label_set_text(lbl_fan, "Med");
+    lv_label_set_text(band_label, strFreqRanges[3]);
+    lv_label_set_text(lbl_radio_mode, strBands[3]);
+    gui_update_protocol_label();
 #endif
 }
 
@@ -753,8 +902,8 @@ static void cal_build_point_ui(uint8_t idx)
 
     /* Cancel button — bottom center, away from corner calibration points */
     lv_obj_t *cancel_btn = lv_btn_create(cal_container, NULL);
-    lv_obj_set_pos(cancel_btn, HOR_RES / 2 - 60, VER_RES - 50);
-    lv_obj_set_size(cancel_btn, 120, 36);
+    lv_obj_set_pos(cancel_btn, HOR_RES / 2 - 50, VER_RES - 38);
+    lv_obj_set_size(cancel_btn, 100, 30);
     lv_obj_set_style_local_text_font(cancel_btn, LV_BTN_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn, NULL);
@@ -765,8 +914,8 @@ static void cal_build_point_ui(uint8_t idx)
     lv_coord_t tx = cal_targets[idx].x;
     lv_coord_t ty = cal_targets[idx].y;
     lv_obj_t *dot = lv_obj_create(cal_container, NULL);
-    lv_obj_set_size(dot, 44, 44);
-    lv_obj_set_pos(dot, tx - 22, ty - 22);
+    lv_obj_set_size(dot, 34, 34);
+    lv_obj_set_pos(dot, tx - 17, ty - 17);
     lv_obj_set_style_local_bg_color(dot, LV_OBJ_PART_MAIN,
                                     LV_STATE_DEFAULT, LV_COLOR_RED);
     lv_obj_set_style_local_border_width(dot, LV_OBJ_PART_MAIN,
@@ -778,15 +927,15 @@ static void cal_build_point_ui(uint8_t idx)
 
     /* Crosshair lines */
     lv_obj_t *hl = lv_obj_create(cal_container, NULL);
-    lv_obj_set_size(hl, 60, 2);
-    lv_obj_set_pos(hl, tx - 30, ty - 1);
+    lv_obj_set_size(hl, 48, 2);
+    lv_obj_set_pos(hl, tx - 24, ty - 1);
     lv_obj_set_style_local_bg_color(hl, LV_OBJ_PART_MAIN,
                                     LV_STATE_DEFAULT, LV_COLOR_RED);
     lv_obj_set_style_local_border_width(hl, LV_OBJ_PART_MAIN,
                                         LV_STATE_DEFAULT, 0);
     lv_obj_t *vl = lv_obj_create(cal_container, NULL);
-    lv_obj_set_size(vl, 2, 60);
-    lv_obj_set_pos(vl, tx - 1, ty - 30);
+    lv_obj_set_size(vl, 2, 48);
+    lv_obj_set_pos(vl, tx - 1, ty - 24);
     lv_obj_set_style_local_bg_color(vl, LV_OBJ_PART_MAIN,
                                     LV_STATE_DEFAULT, LV_COLOR_RED);
     lv_obj_set_style_local_border_width(vl, LV_OBJ_PART_MAIN,
@@ -854,11 +1003,12 @@ static void cal_build_results_ui(void)
 
 #ifndef LVGL_SIM
     if (passed) {
-        g_config.touch_cal.x_slope  = x_slope;
-        g_config.touch_cal.x_offset = x_off;
-        g_config.touch_cal.y_slope  = y_slope;
-        g_config.touch_cal.y_offset = y_off;
-        g_config.touch_cal.valid    = true;
+        /* Straight float fit: screen = raw * gain + offset */
+        g_config.touch.x_gain     = x_slope;
+        g_config.touch.x_offset   = x_off;
+        g_config.touch.y_gain     = y_slope;
+        g_config.touch.y_offset   = y_off;
+        g_config.touch.calibrated = 1;
     }
 #endif
 
@@ -889,8 +1039,8 @@ static void cal_build_results_ui(void)
 
     if (passed) {
         lv_obj_t *accept_btn = lv_btn_create(cal_container, NULL);
-        lv_obj_set_pos(accept_btn, HOR_RES / 2 - 130, VER_RES - 70);
-        lv_obj_set_size(accept_btn, 120, 40);
+        lv_obj_set_pos(accept_btn, HOR_RES / 2 - 105, VER_RES - 44);
+        lv_obj_set_size(accept_btn, 100, 32);
         lv_obj_set_style_local_text_font(accept_btn, LV_BTN_PART_MAIN,
                                          LV_STATE_DEFAULT, &MyCJK_16);
         lv_obj_t *accept_lbl = lv_label_create(accept_btn, NULL);
@@ -899,8 +1049,8 @@ static void cal_build_results_ui(void)
     }
 
     lv_obj_t *retry_btn = lv_btn_create(cal_container, NULL);
-    lv_obj_set_pos(retry_btn, HOR_RES / 2 + 10, VER_RES - 70);
-    lv_obj_set_size(retry_btn, 120, 40);
+    lv_obj_set_pos(retry_btn, HOR_RES / 2 + 5, VER_RES - 44);
+    lv_obj_set_size(retry_btn, 100, 32);
     lv_obj_set_style_local_text_font(retry_btn, LV_BTN_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
     lv_obj_t *retry_lbl = lv_label_create(retry_btn, NULL);
@@ -939,7 +1089,8 @@ void gui_init(void)
 
 #ifndef LVGL_SIM
     lv_port_disp_init();
-    current_language = g_config.language;
+    current_language   = g_config.language;
+    temp_fahrenheit    = (g_config.temp_fahrenheit != 0U);
 #else
     current_language = MULTILANG_ENGLISH;
 #endif
@@ -980,7 +1131,7 @@ void gui_show_alert(AlertType alert_type)
     lv_msgbox_set_text(alert_msgbox, alert_text);
     static const char *btn_txts[] = {"Dismiss", ""};
     lv_msgbox_add_btns(alert_msgbox, btn_txts);
-    lv_obj_set_size(alert_msgbox, 300, 150);
+    lv_obj_set_size(alert_msgbox, 280, 110);
     lv_obj_align(alert_msgbox, main_screen, LV_ALIGN_CENTER, 0, 0);
     alert_active = true;
 }
@@ -998,7 +1149,7 @@ bool gui_is_alert_active(void) { return alert_active; }
 
 const char* gui_get_string(uint16_t str_id)
 {
-    if (str_id >= 40) return "";
+    if (str_id >= STR_COUNT) return "";
     return gui_strings[gui_get_lang_index()][str_id];
 }
 
@@ -1085,8 +1236,8 @@ void gui_process_calibration(void)
 void gui_power_button_pressed(void)
 {
 #ifndef LVGL_SIM
-    if (g_psu_on) power_off();
-    else power_on();
+    if (g_power_state == POWER_STATE_OFF) power_on();
+    else power_off();
 #else
     static bool sim_active = false;
     sim_active = !sim_active;
@@ -1166,7 +1317,12 @@ static void settings_menu_cb(lv_obj_t *obj, lv_event_t e)
  * Language Selector Popup
  *============================================================================*/
 
-static const char *lang_btns[] = {"English", "中文", "\n", NULL, ""};
+/* Language + temperature unit.
+ * Row 1: interface language.  Row 2: temperature unit (C / F).
+ * Static so the pointers lv_btnmatrix_set_map() stores stay valid. */
+static const char *lang_btns[] = {"English", "中文", "\n",
+                                  "\u00B0C", "\u00B0F",
+                                  "\n", NULL, ""};
 
 static void language_sel_cb(lv_obj_t *obj, lv_event_t e)
 {
@@ -1176,6 +1332,18 @@ static void language_sel_cb(lv_obj_t *obj, lv_event_t e)
             gui_set_language(MULTILANG_ENGLISH);
         } else if (id == 1) {
             gui_set_language(MULTILANG_CHINESE);
+        } else if (id == 2) {
+            temp_fahrenheit = false;
+#ifndef LVGL_SIM
+            g_config.temp_fahrenheit = 0U;
+            config_save();
+#endif
+        } else if (id == 3) {
+            temp_fahrenheit = true;
+#ifndef LVGL_SIM
+            g_config.temp_fahrenheit = 1U;
+            config_save();
+#endif
         }
         lv_obj_del_async(obj);
     }
@@ -1183,19 +1351,22 @@ static void language_sel_cb(lv_obj_t *obj, lv_event_t e)
 
 static void show_language_selector(void)
 {
-    lang_btns[3] = gui_get_string(STR_CANCEL);
+    /* Row 1: English / 中文     Row 2: °C / °F     Row 3: Cancel.
+     * The Cancel label is language dependent, so it is filled in before the
+     * map is handed to LVGL (index 6, not 3 — index 3 is the °F button). */
+    lang_btns[6] = gui_get_string(STR_CANCEL);
 
     lv_obj_t *scr = lv_scr_act();
     lv_obj_t *mbox = lv_msgbox_create(scr, NULL);
     lv_msgbox_set_text(mbox, gui_get_string(STR_LANGUAGE));
     lv_msgbox_add_btns(mbox, lang_btns);
-    lv_obj_set_size(mbox, 320, 180);
+    lv_obj_set_size(mbox, 300, 165);
     lv_obj_align(mbox, scr, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_set_style_local_text_color(mbox, LV_MSGBOX_PART_BG,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(mbox, LV_MSGBOX_PART_BG,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_style_local_bg_color(mbox, LV_MSGBOX_PART_BG,
                                      LV_STATE_DEFAULT, LV_COLOR_BLUE);
 
@@ -1203,7 +1374,7 @@ static void show_language_selector(void)
     lv_obj_set_style_local_text_color(btnm, LV_BTNMATRIX_PART_BTN,
                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(btnm, LV_BTNMATRIX_PART_BTN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_style_local_bg_color(btnm, LV_BTNMATRIX_PART_BTN,
                                      LV_STATE_DEFAULT, LV_COLOR_MAKE(0, 160, 225));
     lv_obj_set_style_local_border_color(btnm, LV_BTNMATRIX_PART_BTN,
@@ -1241,7 +1412,7 @@ static void show_screen_settings(void)
     lv_obj_t *mbox = lv_msgbox_create(scr, NULL);
     lv_msgbox_set_text(mbox, gui_get_string(STR_SCREEN));
     lv_msgbox_add_btns(mbox, screen_btns);
-    lv_obj_set_size(mbox, 320, 160);
+    lv_obj_set_size(mbox, 300, 110);
     lv_obj_align(mbox, scr, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_set_style_local_text_color(mbox, LV_MSGBOX_PART_BG,
@@ -1292,7 +1463,7 @@ static void show_coupler_selector(void)
     lv_obj_t *mbox = lv_msgbox_create(scr, NULL);
     lv_msgbox_set_text(mbox, gui_get_string(STR_CAL_SENSORS));
     lv_msgbox_add_btns(mbox, coupler_btns);
-    lv_obj_set_size(mbox, 320, 180);
+    lv_obj_set_size(mbox, 300, 130);
     lv_obj_align(mbox, scr, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_set_style_local_text_color(mbox, LV_MSGBOX_PART_BG,
@@ -1322,6 +1493,7 @@ static void show_coupler_selector(void)
 
 /* Forward declarations */
 static void cc_build_ui(uint8_t step);
+static void cc_refresh_ui(uint8_t step);
 static void cc_build_results(void);
 static void cc_start_cb(lv_obj_t *obj, lv_event_t e);
 static void cc_cancel_cb(lv_obj_t *obj, lv_event_t e);
@@ -1335,8 +1507,25 @@ static uint8_t cc_step = 0;
 static uint8_t cc_state = 0;     /* 0=idle, 1=showing, 2=results */
 static lv_obj_t *cc_screen = NULL;
 static lv_obj_t *cc_container = NULL;
+static lv_obj_t *cc_result_container = NULL;
 static lv_obj_t *cc_adc_val_label = NULL;
+static lv_obj_t *cc_raw_val_label = NULL;
+static lv_obj_t *cc_step_label = NULL;
+static lv_obj_t *cc_instr_label = NULL;
+static lv_obj_t *cc_ch_label = NULL;
 static uint16_t cc_meas[CC_STEPS];
+static char cc_buf[48];
+/* The step UI must not be rebuilt from inside the button's own event
+ * callback: lv_obj_del() would free the container that LVGL is still
+ * walking.  The callback only records the measurement and flags the
+ * rebuild, which gui_process_coupler_cal() performs from the main loop. */
+static bool cc_rebuild_pending = false;
+
+static const char *cc_coupler_name(void)
+{
+    return (cc_coupler_id == 1) ? gui_get_string(STR_DIR_COUPLER_1)
+                                : gui_get_string(STR_DIR_COUPLER_2);
+}
 
 /* Step descriptions (built from template + existing strings) */
 static void cc_step_desc(uint8_t step, char *buf, size_t len)
@@ -1350,12 +1539,13 @@ static void cc_step_desc(uint8_t step, char *buf, size_t len)
 static uint16_t cc_read_adc(void)
 {
 #ifndef LVGL_SIM
-    uint8_t ch;
+    /* Steps 0/1 = forward, 2/3 = reflected; coupler 1 = PA→LPF, 2 = LPF→ANT */
+    uint8_t rank;
     if (cc_coupler_id == 1)
-        ch = (cc_step < 2) ? ADC_CHANNEL_TX_POWER1 : ADC_CHANNEL_REF_POWER1;
+        rank = (cc_step < 2) ? ADC1_RANK_FWD1 : ADC1_RANK_REV1;
     else
-        ch = (cc_step < 2) ? ADC_CHANNEL_TX_POWER2 : ADC_CHANNEL_REF_POWER2;
-    return g_adc_data.raw[ch];
+        rank = (cc_step < 2) ? ADC1_RANK_FWD2 : ADC1_RANK_REV2;
+    return g_adc_data.adc1_raw[rank];
 #else
     /* Simulate ADC readings */
     switch (cc_step) {
@@ -1374,6 +1564,7 @@ static void cc_cancel_cb(lv_obj_t *obj, lv_event_t e)
     if (e == LV_EVENT_CLICKED) {
         cc_active = false;
         cc_state = 0;
+        cc_rebuild_pending = false;
         lv_scr_load(main_screen);
     }
 }
@@ -1387,6 +1578,7 @@ static void cc_accept_cb(lv_obj_t *obj, lv_event_t e)
 #endif
         cc_active = false;
         cc_state = 0;
+        cc_rebuild_pending = false;
         lv_scr_load(main_screen);
     }
 }
@@ -1395,12 +1587,15 @@ static void cc_accept_cb(lv_obj_t *obj, lv_event_t e)
 static void cc_retry_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
+        if (cc_result_container) {
+            lv_obj_del(cc_result_container);
+            cc_result_container = NULL;
+        }
+        if (cc_container) lv_obj_set_hidden(cc_container, false);
         cc_step = 0;
         cc_state = 1;
         memset(cc_meas, 0, sizeof(cc_meas));
-        lv_obj_clean(cc_screen);
-        cc_container = NULL;
-        cc_build_ui(0);
+        cc_rebuild_pending = true;
     }
 }
 
@@ -1410,24 +1605,23 @@ static void cc_start_cb(lv_obj_t *obj, lv_event_t e)
     if (e == LV_EVENT_PRESSED && cc_active && cc_state == 1) {
         cc_meas[cc_step] = cc_read_adc();
         cc_step++;
-        if (cc_step >= CC_STEPS) {
-            cc_state = 2;
-            cc_build_results();
-        } else {
-            cc_state = 1;
-            cc_build_ui(cc_step);
-        }
+        cc_rebuild_pending = true;
     }
 }
 
-/* Build the step UI */
+/* Build the step UI.
+ *
+ * The container is created once and kept alive; only three labels change from
+ * step to step.  Deleting and recreating the tree on every step both churns the
+ * object list and is unsafe when triggered from an event callback (LVGL is
+ * still walking the deleted object), so cc_refresh_ui() updates the text in
+ * place and the results page is shown by hiding this container. */
 static void cc_build_ui(uint8_t step)
 {
-    if (cc_container) {
-        lv_obj_del(cc_container);
-        cc_container = NULL;
+    if (cc_container) {          /* already built — just refresh the text */
+        cc_refresh_ui(step);
+        return;
     }
-    cc_adc_val_label = NULL;
 
     cc_container = lv_obj_create(cc_screen, NULL);
     lv_obj_set_size(cc_container, HOR_RES, VER_RES);
@@ -1437,78 +1631,61 @@ static void cc_build_ui(uint8_t step)
     lv_obj_set_style_local_border_width(cc_container, LV_OBJ_PART_MAIN,
                                         LV_STATE_DEFAULT, 0);
 
-    /* Title: "Coupler X Calibration" */
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s %d %s",
-             gui_get_string(STR_DIR_COUPLER_1)[0] ? gui_get_string(STR_DIR_COUPLER_1) : "",
-             cc_coupler_id,
-             gui_get_string(STR_CALIBRATION));
-    lv_obj_t *title = lv_label_create(cc_container, NULL);
-    lv_label_set_text(title, buf);
-    lv_obj_align(title, cc_container, LV_ALIGN_IN_TOP_MID, 0, 16);
-    lv_obj_set_style_local_text_color(title, LV_LABEL_PART_MAIN,
+    /* Title: "Coupler X Calibration" — depends on cc_coupler_id, so refreshed */
+    cc_title_label = lv_label_create(cc_container, NULL);
+    lv_obj_align(cc_title_label, cc_container, LV_ALIGN_IN_TOP_MID, 0, 16);
+    lv_obj_set_style_local_text_color(cc_title_label, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, LV_COLOR_BLACK);
-    lv_obj_set_style_local_text_font(title, LV_LABEL_PART_MAIN,
+    lv_obj_set_style_local_text_font(cc_title_label, LV_LABEL_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
 
-    /* Step + direction */
-    char step_str[32];
-    cc_step_desc(step, step_str, sizeof(step_str));
-    snprintf(buf, sizeof(buf), "%d/%d  %s", step + 1, CC_STEPS, step_str);
-    lv_obj_t *step_lbl = lv_label_create(cc_container, NULL);
-    lv_label_set_text(step_lbl, buf);
-    lv_obj_align(step_lbl, cc_container, LV_ALIGN_IN_TOP_MID, 0, 46);
-    lv_obj_set_style_local_text_color(step_lbl, LV_LABEL_PART_MAIN,
+    /* Step + direction — text is refreshed by cc_refresh_ui() */
+    cc_step_label = lv_label_create(cc_container, NULL);
+    lv_obj_align(cc_step_label, cc_container, LV_ALIGN_IN_TOP_MID, 0, 46);
+    lv_obj_set_style_local_text_color(cc_step_label, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, LV_COLOR_BLACK);
-    lv_obj_set_style_local_text_font(step_lbl, LV_LABEL_PART_MAIN,
+    lv_obj_set_style_local_text_font(cc_step_label, LV_LABEL_PART_MAIN,
                                      LV_STATE_DEFAULT, &lv_font_montserrat_24);
 
     /* Instruction */
-    lv_obj_t *instr = lv_label_create(cc_container, NULL);
-    snprintf(buf, sizeof(buf), "%s %.0fW AM  |  %s",
-             gui_get_string(STR_CAL_POINT),
-             (step == 0 || step == 2) ? 5.0f : 20.0f,
-             gui_get_string(STR_START_MEAS));
-    lv_label_set_text(instr, buf);
-    lv_obj_align(instr, cc_container, LV_ALIGN_IN_TOP_MID, 0, 84);
-    lv_obj_set_style_local_text_color(instr, LV_LABEL_PART_MAIN,
+    cc_instr_label = lv_label_create(cc_container, NULL);
+    lv_obj_align(cc_instr_label, cc_container, LV_ALIGN_IN_TOP_MID, 0, 84);
+    lv_obj_set_style_local_text_color(cc_instr_label, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, LV_COLOR_BLACK);
-    lv_obj_set_style_local_text_font(instr, LV_LABEL_PART_MAIN,
+    lv_obj_set_style_local_text_font(cc_instr_label, LV_LABEL_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
 
     /* ADC real-time value box */
     lv_obj_t *adc_box = lv_obj_create(cc_container, NULL);
     lv_obj_set_size(adc_box, HOR_RES - 80, 100);
     lv_obj_set_pos(adc_box, HOR_RES / 20, VER_RES / 4 + 10);
+    lv_obj_set_style_local_bg_color(adc_box, LV_OBJ_PART_MAIN,
+                                     LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_border_color(adc_box, LV_OBJ_PART_MAIN,
                                          LV_STATE_DEFAULT, COLOR_BORDER);
     lv_obj_set_style_local_radius(adc_box, LV_OBJ_PART_MAIN,
                                    LV_STATE_DEFAULT, 4);
 
     /* Channel name */
-    lv_obj_t *ch_label = lv_label_create(adc_box, NULL);
-    snprintf(buf, sizeof(buf), "%s: %s",
-             (step < 2) ? "TX Power" : "REF Power",
-             (cc_coupler_id == 1) ? "CH1" : "CH2");
-    lv_label_set_text(ch_label, buf);
-    lv_obj_align(ch_label, adc_box, LV_ALIGN_IN_TOP_LEFT, 10, 8);
-    lv_obj_set_style_local_text_color(ch_label, LV_LABEL_PART_MAIN,
+    cc_ch_label = lv_label_create(adc_box, NULL);
+    lv_obj_align(cc_ch_label, adc_box, LV_ALIGN_IN_TOP_LEFT, 10, 8);
+    lv_obj_set_style_local_text_color(cc_ch_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_BLACK);
-    lv_obj_set_style_local_text_font(ch_label, LV_LABEL_PART_MAIN,
+    lv_obj_set_style_local_text_font(cc_ch_label, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, &MyCJK_16);
 
     /* ADC raw value */
-    lv_obj_t *raw_label = lv_label_create(adc_box, NULL);
-    lv_label_set_text(raw_label, "ADC: ---");
-    lv_obj_align(raw_label, adc_box, LV_ALIGN_IN_LEFT_MID, 10, 0);
-    lv_obj_set_style_local_text_color(raw_label, LV_LABEL_PART_MAIN,
-                                       LV_STATE_DEFAULT, LV_COLOR_BLACK);
-    lv_obj_set_style_local_text_font(raw_label, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &lv_font_montserrat_24);
+    cc_raw_val_label = lv_label_create(adc_box, NULL);
+    lv_label_set_text(cc_raw_val_label, "ADC: ---");
+    lv_obj_align(cc_raw_val_label, adc_box, LV_ALIGN_IN_LEFT_MID, 10, 0);
+    lv_obj_set_style_local_text_color(cc_raw_val_label, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_BLACK);
+    lv_obj_set_style_local_text_font(cc_raw_val_label, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &lv_font_montserrat_24);
 
     /* Calculated power */
     cc_adc_val_label = lv_label_create(adc_box, NULL);
-    lv_label_set_text(cc_adc_val_label, "Power: ---");
+    lv_label_set_text(cc_adc_val_label, "--- W");
     lv_obj_align(cc_adc_val_label, adc_box, LV_ALIGN_IN_RIGHT_MID, -10, 0);
     lv_obj_set_style_local_text_color(cc_adc_val_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_BLACK);
@@ -1517,8 +1694,8 @@ static void cc_build_ui(uint8_t step)
 
     /* Start button */
     lv_obj_t *start_btn = lv_btn_create(cc_container, NULL);
-    lv_obj_set_pos(start_btn, HOR_RES / 2 - 130, VER_RES - 70);
-    lv_obj_set_size(start_btn, 120, 40);
+    lv_obj_set_pos(start_btn, HOR_RES / 2 - 105, VER_RES - 44);
+    lv_obj_set_size(start_btn, 100, 32);
     lv_obj_set_style_local_text_font(start_btn, LV_BTN_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
     lv_obj_t *start_lbl = lv_label_create(start_btn, NULL);
@@ -1527,13 +1704,37 @@ static void cc_build_ui(uint8_t step)
 
     /* Cancel button */
     lv_obj_t *cancel_btn = lv_btn_create(cc_container, NULL);
-    lv_obj_set_pos(cancel_btn, HOR_RES / 2 + 10, VER_RES - 70);
+    lv_obj_set_pos(cancel_btn, HOR_RES / 2 + 5, VER_RES - 44);
     lv_obj_set_size(cancel_btn, 120, 40);
     lv_obj_set_style_local_text_font(cancel_btn, LV_BTN_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn, NULL);
     lv_label_set_text(cancel_lbl, gui_get_string(STR_CANCEL));
     lv_obj_set_event_cb(cancel_btn, cc_cancel_cb);
+
+    cc_refresh_ui(step);
+}
+
+/* Update only the labels whose text depends on the step number. */
+static void cc_refresh_ui(uint8_t step)
+{
+    char buf[64];
+    char step_str[32];
+
+    cc_step_desc(step, step_str, sizeof(step_str));
+    snprintf(buf, sizeof(buf), "%d/%d  %s", step + 1, CC_STEPS, step_str);
+    lv_label_set_text(cc_step_label, buf);
+
+    snprintf(buf, sizeof(buf), "%s %.0fW AM  |  %s",
+             gui_get_string(STR_CAL_POINT),
+             (step == 0 || step == 2) ? 5.0f : 20.0f,
+             gui_get_string(STR_START_MEAS));
+    lv_label_set_text(cc_instr_label, buf);
+
+    snprintf(buf, sizeof(buf), "%s: %s",
+             (step < 2) ? "TX Power" : "REF Power",
+             (cc_coupler_id == 1) ? "CH1" : "CH2");
+    lv_label_set_text(cc_ch_label, buf);
 }
 
 /* Calculate calibration from 2-point data */
@@ -1556,70 +1757,69 @@ static void cc_calculate(float *fwd_slope, float *fwd_off,
     }
 }
 
-/* Results screen */
+/* Results screen — the step container is hidden rather than deleted, and the
+ * results container is built once and reused when Retry is pressed. */
 static void cc_build_results(void)
 {
-    if (cc_container) {
-        lv_obj_del(cc_container);
-        cc_container = NULL;
-    }
+    if (cc_container) lv_obj_set_hidden(cc_container, true);
 
     /* Calculate */
     float fwd_slope, fwd_off, ref_slope, ref_off;
     cc_calculate(&fwd_slope, &fwd_off, &ref_slope, &ref_off);
 
 #ifndef LVGL_SIM
-    if (cc_coupler_id == 1) {
-        g_config.cal_tx_power1.forward_slope   = fwd_slope;
-        g_config.cal_tx_power1.forward_offset  = fwd_off;
-        g_config.cal_ref_power1.reflect_slope  = ref_slope;
-        g_config.cal_ref_power1.reflect_offset = ref_off;
-    } else {
-        g_config.cal_tx_power2.forward_slope   = fwd_slope;
-        g_config.cal_tx_power2.forward_offset  = fwd_off;
-        g_config.cal_ref_power2.reflect_slope  = ref_slope;
-        g_config.cal_ref_power2.reflect_offset = ref_off;
-    }
+    /* cc_calculate() returns Watts per raw code.  Store the slope as
+     * micro-Watt per ADC code so it stays an exact integer, and the
+     * intercept in milli-Watt. */
+    coupler_t *fwd_c = (cc_coupler_id == 1) ? &g_config.fwd1 : &g_config.fwd2;
+    coupler_t *ref_c = (cc_coupler_id == 1) ? &g_config.rev1 : &g_config.rev2;
+    fwd_c->gain_uW_per_code = (int32_t)(fwd_slope * 1000000.0f);  /* W -> uW */
+    fwd_c->offset_mW        = (int32_t)(fwd_off * 1000.0f);
+    ref_c->gain_uW_per_code = (int32_t)(ref_slope * 1000000.0f);
+    ref_c->offset_mW        = (int32_t)(ref_off * 1000.0f);
 #endif
 
-    cc_container = lv_obj_create(cc_screen, NULL);
-    lv_obj_set_size(cc_container, HOR_RES, VER_RES);
-    lv_obj_set_pos(cc_container, 0, 0);
-    lv_obj_set_style_local_bg_opa(cc_container, LV_OBJ_PART_MAIN,
+    if (cc_result_container) lv_obj_del(cc_result_container);
+
+    cc_result_container = lv_obj_create(cc_screen, NULL);
+    lv_obj_t *ro = cc_result_container;
+    lv_obj_set_size(ro, HOR_RES, VER_RES);
+    lv_obj_set_pos(ro, 0, 0);
+    lv_obj_set_style_local_bg_opa(ro, LV_OBJ_PART_MAIN,
                                    LV_STATE_DEFAULT, LV_OPA_TRANSP);
-    lv_obj_set_style_local_border_width(cc_container, LV_OBJ_PART_MAIN,
+    lv_obj_set_style_local_border_width(ro, LV_OBJ_PART_MAIN,
                                         LV_STATE_DEFAULT, 0);
 
     char buf[200];
-    snprintf(buf, sizeof(buf), "%s %d %s",
-             gui_get_string(STR_DIR_COUPLER_1)[0] ? gui_get_string(STR_DIR_COUPLER_1) : "",
-             cc_coupler_id,
-             gui_get_string(STR_CAL_SUCCESS));
-    lv_obj_t *result_lbl = lv_label_create(cc_container, NULL);
+    snprintf(buf, sizeof(buf), "%s %s",
+             cc_coupler_name(), gui_get_string(STR_CAL_SUCCESS));
+    lv_obj_t *result_lbl = lv_label_create(ro, NULL);
     lv_label_set_text(result_lbl, buf);
-    lv_obj_align(result_lbl, cc_container, LV_ALIGN_IN_TOP_MID, 0, 20);
+    lv_obj_align(result_lbl, ro, LV_ALIGN_IN_TOP_MID, 0, 20);
     lv_obj_set_style_local_text_color(result_lbl, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, LV_COLOR_GREEN);
     lv_obj_set_style_local_text_font(result_lbl, LV_LABEL_PART_MAIN,
-                                     LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_16);
 
-    /* Parameters */
-    lv_obj_t *params_lbl = lv_label_create(cc_container, NULL);
+    /* Parameters — shown in the same units that are stored in ConfigType:
+     * gain in micro-Watt per ADC code, offset in milli-Watt. */
+    lv_obj_t *params_lbl = lv_label_create(ro, NULL);
     snprintf(buf, sizeof(buf),
-        "FWD: slope=%.6f  offset=%.4f\n"
-        "REF: slope=%.6f  offset=%.4f",
-        fwd_slope, fwd_off, ref_slope, ref_off);
+        "FWD: %ld uW/code   %ld mW\n"
+        "REF: %ld uW/code   %ld mW",
+        (long)(fwd_slope * 1000000.0f), (long)(fwd_off * 1000.0f),
+        (long)(ref_slope * 1000000.0f), (long)(ref_off * 1000.0f));
     lv_label_set_text(params_lbl, buf);
-    lv_obj_align(params_lbl, cc_container, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_align(params_lbl, ro, LV_ALIGN_CENTER, 0, -20);
     lv_obj_set_style_local_text_color(params_lbl, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, LV_COLOR_BLACK);
     lv_obj_set_style_local_text_font(params_lbl, LV_LABEL_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
 
     /* Accept */
-    lv_obj_t *accept_btn = lv_btn_create(cc_container, NULL);
-    lv_obj_set_pos(accept_btn, HOR_RES / 2 - 130, VER_RES - 70);
-    lv_obj_set_size(accept_btn, 120, 40);
+    lv_obj_t *accept_btn = lv_btn_create(ro, NULL);
+    lv_obj_set_pos(accept_btn, HOR_RES / 2 - 105, VER_RES - 44);
+    lv_obj_set_size(accept_btn, 100, 32);
     lv_obj_set_style_local_text_font(accept_btn, LV_BTN_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
     lv_obj_t *accept_lbl = lv_label_create(accept_btn, NULL);
@@ -1627,9 +1827,9 @@ static void cc_build_results(void)
     lv_obj_set_event_cb(accept_btn, cc_accept_cb);
 
     /* Retry */
-    lv_obj_t *retry_btn = lv_btn_create(cc_container, NULL);
-    lv_obj_set_pos(retry_btn, HOR_RES / 2 + 10, VER_RES - 70);
-    lv_obj_set_size(retry_btn, 120, 40);
+    lv_obj_t *retry_btn = lv_btn_create(ro, NULL);
+    lv_obj_set_pos(retry_btn, HOR_RES / 2 + 5, VER_RES - 44);
+    lv_obj_set_size(retry_btn, 100, 32);
     lv_obj_set_style_local_text_font(retry_btn, LV_BTN_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
     lv_obj_t *retry_lbl = lv_label_create(retry_btn, NULL);
@@ -1640,29 +1840,45 @@ static void cc_build_results(void)
 /* Update real-time ADC display — called from main loop */
 void gui_process_coupler_cal(void)
 {
-    if (!cc_active || cc_state != 1 || cc_adc_val_label == NULL) return;
+    if (!cc_active) return;
+
+    if (cc_rebuild_pending) {
+        cc_rebuild_pending = false;
+        if (cc_step >= CC_STEPS) {
+            cc_state = 2;
+            cc_build_results();
+        } else {
+            cc_state = 1;
+            cc_build_ui(cc_step);
+        }
+        return;
+    }
+
+    if (cc_state != 1 || cc_adc_val_label == NULL) return;
 
     uint16_t adc = cc_read_adc();
-    char buf[64];
+
+    snprintf(cc_buf, sizeof(cc_buf), "ADC: %u", adc);
+    lv_label_set_text(cc_raw_val_label, cc_buf);
 
 #ifndef LVGL_SIM
-    float power;
-    float slope = 0.0f, offset = 0.0f;
-    if (cc_step < 2) {
-        CalDataType *cal = (cc_coupler_id == 1) ? &g_config.cal_tx_power1 : &g_config.cal_tx_power2;
-        slope = cal->forward_slope;
-        offset = cal->forward_offset;
-    } else {
-        CalDataType *cal = (cc_coupler_id == 1) ? &g_config.cal_ref_power1 : &g_config.cal_ref_power2;
-        slope = cal->reflect_slope;
-        offset = cal->reflect_offset;
-    }
-    power = (float)adc * slope + offset;
-    snprintf(buf, sizeof(buf), "ADC: %u    %.2fW", adc, power);
+    /* Apply the stored coupler fit:
+     *   power_mW = raw * gain_uW_per_code / 1000 + offset_mW */
+    const coupler_t *cal;
+    if (cc_step < 2)
+        cal = (cc_coupler_id == 1) ? &g_config.fwd1 : &g_config.fwd2;
+    else
+        cal = (cc_coupler_id == 1) ? &g_config.rev1 : &g_config.rev2;
+    int32_t power_mW = (int32_t)((int64_t)adc * cal->gain_uW_per_code / 1000)
+                     + cal->offset_mW;
+    snprintf(cc_buf, sizeof(cc_buf), "%.2f W", (float)power_mW / 1000.0f);
 #else
-    snprintf(buf, sizeof(buf), "ADC: %u", adc);
+    /* Simulator: show the nominal power of the current step so the layout
+     * can be verified without a calibrated coupler in the config. */
+    snprintf(cc_buf, sizeof(cc_buf), "%.0f W",
+             (cc_step == 0 || cc_step == 2) ? 5.0f : 20.0f);
 #endif
-    lv_label_set_text(cc_adc_val_label, buf);
+    lv_label_set_text(cc_adc_val_label, cc_buf);
 }
 
 /* Public: show coupler calibration screen */
@@ -1675,10 +1891,17 @@ void gui_show_coupler_cal(uint8_t coupler_id)
                                          LV_STATE_DEFAULT, LV_COLOR_WHITE);
     }
 
+    if (cc_result_container) {
+        lv_obj_del(cc_result_container);
+        cc_result_container = NULL;
+    }
+    if (cc_container) lv_obj_set_hidden(cc_container, false);
+
     cc_active = true;
     cc_coupler_id = coupler_id;
     cc_step = 0;
     cc_state = 1;
+    cc_rebuild_pending = false;
     memset(cc_meas, 0, sizeof(cc_meas));
     lv_scr_load(cc_screen);
     cc_build_ui(0);
@@ -1689,7 +1912,12 @@ void gui_show_coupler_cal(uint8_t coupler_id)
  *============================================================================*/
 
 static lv_obj_t *si_overlay = NULL;
-static lv_obj_t *si_val_labels[ADC_CHANNEL_COUNT * 2]; /* each row: raw + value */
+
+/* Sensor-inspect rows follow the ADC1 rank layout from opa2000.h so the
+ * table stays in sync with user_adc.c without a second enum to maintain. */
+#define SI_ROW_COUNT  ADC1_RANK_COUNT
+static lv_obj_t *si_raw_labels[SI_ROW_COUNT];
+static lv_obj_t *si_val_labels[SI_ROW_COUNT];
 
 static void si_close_cb(lv_obj_t *obj, lv_event_t e)
 {
@@ -1699,14 +1927,14 @@ static void si_close_cb(lv_obj_t *obj, lv_event_t e)
     }
 }
 
-/* Build one column in the sensor-inspect table — all text centered */
-static void si_build_col(lv_obj_t *parent, lv_coord_t x, int start_ch, int count,
-                         const char *title, lv_obj_t **raw_labels, lv_obj_t **val_labels)
+/* Build the sensor-inspect table — all text centered.
+ * Rows are indexed by ADC1_RANK_* (see opa2000.h). */
+static void si_build_table(lv_obj_t *parent, lv_coord_t x, int count)
 {
-    lv_coord_t hdr_y = 44;
-    lv_coord_t row_h = 34;
+    lv_coord_t hdr_y = 26;
+    lv_coord_t row_h = 20;
     /* Column widths for centering */
-    const lv_coord_t cw_name = 85, cw_adc = 60, cw_raw = 60, cw_val = 95;
+    const lv_coord_t cw_name = 84, cw_adc = 46, cw_raw = 62, cw_val = 78;
     lv_coord_t name_cx = x + cw_name / 2;
     lv_coord_t adc_cx  = x + cw_name + cw_adc / 2;
     lv_coord_t raw_cx  = x + cw_name + cw_adc + cw_raw / 2;
@@ -1725,50 +1953,58 @@ static void si_build_col(lv_obj_t *parent, lv_coord_t x, int start_ch, int count
     } while(0)
 
     /* Column title */
-    SI_LABEL(parent, title, x + 150, 10, 300, LV_COLOR_YELLOW, &MyCJK_16);
+    SI_LABEL(parent, "ADC1", x + 135, 4, 270, LV_COLOR_YELLOW, &MyCJK_12);
 
     /* Header row */
     static const char *hdr[] = {"Name", "ADC", "Raw", "Value"};
     lv_coord_t hcxs[] = {name_cx, adc_cx, raw_cx, val_cx};
     lv_coord_t hws[]  = {cw_name, cw_adc, cw_raw, cw_val};
     for (int c = 0; c < 4; c++)
-        SI_LABEL(parent, hdr[c], hcxs[c], hdr_y, hws[c], LV_COLOR_GRAY, &MyCJK_16);
+        SI_LABEL(parent, hdr[c], hcxs[c], hdr_y, hws[c], LV_COLOR_GRAY, &MyCJK_12);
 
-    /* ADC unit info per channel */
-    static const char *adc_info[] = {
-        "ADC1.1","ADC1.2","ADC1.3","ADC1.4","ADC1.5",
-        "ADC2.1","ADC2.2","ADC2.3","ADC2.4"
+    /* Short channel names, ordered by ADC1_RANK_* */
+    static const char *ch_short[SI_ROW_COUNT] = {
+        "RF In",    /* ADC1_RANK_RF_IN    */
+        "Current",  /* ADC1_RANK_IM       */
+        "REF Pwr1", /* ADC1_RANK_REV1     */
+        "TX Pwr1",  /* ADC1_RANK_FWD1     */
+        "REF Pwr2", /* ADC1_RANK_REV2     */
+        "VBIAS",    /* ADC1_RANK_VBIAS    */
+        "TX Pwr2",  /* ADC1_RANK_FWD2     */
+        "Voltage",  /* ADC1_RANK_VM       */
+        "Key ADC",  /* ADC1_RANK_KEY_ADC  */
     };
-    static const char *ch_short[] = {
-        "TX Pwr1","REF Pwr1","TX Pwr2","REF Pwr2",
-        "RF In","Current","Voltage","Temp","Detector"
-    };
+
+    /* ADC1 positive input number per rank, per OPA2000_H7 固件设计要求.txt */
+    static const uint8_t si_adc1_inp[SI_ROW_COUNT] = {4, 5, 6, 8, 9, 14, 15, 16, 17};
 
     for (int i = 0; i < count; i++) {
-        int ch = start_ch + i;
-        lv_coord_t y = hdr_y + 22 + i * row_h;
+        lv_coord_t y = hdr_y + 16 + i * row_h;
 
-        SI_LABEL(parent, ch_short[ch],  name_cx, y, cw_name, LV_COLOR_WHITE, &lv_font_montserrat_16);
-        SI_LABEL(parent, adc_info[ch],  adc_cx,  y, cw_adc,  LV_COLOR_WHITE, &lv_font_montserrat_16);
+        char adc_txt[8];
+        snprintf(adc_txt, sizeof(adc_txt), "INP%d", si_adc1_inp[i]);
 
-        raw_labels[ch] = lv_label_create(parent, NULL);
-        lv_label_set_text(raw_labels[ch], "---");
-        lv_obj_set_width(raw_labels[ch], cw_raw);
-        lv_obj_set_pos(raw_labels[ch], raw_cx - cw_raw / 2, y);
-        lv_label_set_align(raw_labels[ch], LV_LABEL_ALIGN_CENTER);
-        lv_obj_set_style_local_text_color(raw_labels[ch], LV_LABEL_PART_MAIN,
+        SI_LABEL(parent, ch_short[i],  name_cx, y, cw_name, LV_COLOR_WHITE, &lv_font_montserrat_12);
+        SI_LABEL(parent, adc_txt,      adc_cx,  y, cw_adc,  LV_COLOR_WHITE, &lv_font_montserrat_12);
+
+        si_raw_labels[i] = lv_label_create(parent, NULL);
+        lv_label_set_text(si_raw_labels[i], "---");
+        lv_obj_set_width(si_raw_labels[i], cw_raw);
+        lv_obj_set_pos(si_raw_labels[i], raw_cx - cw_raw / 2, y);
+        lv_label_set_align(si_raw_labels[i], LV_LABEL_ALIGN_CENTER);
+        lv_obj_set_style_local_text_color(si_raw_labels[i], LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_WHITE);
-        lv_obj_set_style_local_text_font(raw_labels[ch], LV_LABEL_PART_MAIN,
+        lv_obj_set_style_local_text_font(si_raw_labels[i], LV_LABEL_PART_MAIN,
                                           LV_STATE_DEFAULT, &lv_font_montserrat_16);
 
-        val_labels[ch] = lv_label_create(parent, NULL);
-        lv_label_set_text(val_labels[ch], "---");
-        lv_obj_set_width(val_labels[ch], cw_val);
-        lv_obj_set_pos(val_labels[ch], val_cx - cw_val / 2, y);
-        lv_label_set_align(val_labels[ch], LV_LABEL_ALIGN_CENTER);
-        lv_obj_set_style_local_text_color(val_labels[ch], LV_LABEL_PART_MAIN,
+        si_val_labels[i] = lv_label_create(parent, NULL);
+        lv_label_set_text(si_val_labels[i], "---");
+        lv_obj_set_width(si_val_labels[i], cw_val);
+        lv_obj_set_pos(si_val_labels[i], val_cx - cw_val / 2, y);
+        lv_label_set_align(si_val_labels[i], LV_LABEL_ALIGN_CENTER);
+        lv_obj_set_style_local_text_color(si_val_labels[i], LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_YELLOW);
-        lv_obj_set_style_local_text_font(val_labels[ch], LV_LABEL_PART_MAIN,
+        lv_obj_set_style_local_text_font(si_val_labels[i], LV_LABEL_PART_MAIN,
                                           LV_STATE_DEFAULT, &lv_font_montserrat_16);
     }
 #undef SI_LABEL
@@ -1778,8 +2014,8 @@ static void show_sensor_inspect(void)
 {
     if (si_overlay) { lv_obj_del(si_overlay); si_overlay = NULL; }
 
-    lv_coord_t o_w = HOR_RES * 4 / 5;
-    lv_coord_t o_h = VER_RES * 4 / 5;
+    lv_coord_t o_w = HOR_RES - 2 * MARGIN_X;
+    lv_coord_t o_h = VER_RES - 2 * MARGIN_X;
     si_overlay = lv_obj_create(lv_scr_act(), NULL);
     lv_obj_set_size(si_overlay, o_w, o_h);
     lv_obj_align(si_overlay, NULL, LV_ALIGN_CENTER, 0, 0);
@@ -1790,72 +2026,82 @@ static void show_sensor_inspect(void)
 
     lv_obj_t *title = lv_label_create(si_overlay, NULL);
     lv_label_set_text(title, gui_get_string(STR_SENSOR_INSPECT));
-    lv_obj_align(title, si_overlay, LV_ALIGN_IN_TOP_MID, 0, 8);
+    lv_obj_align(title, si_overlay, LV_ALIGN_IN_TOP_MID, 0, 2);
     lv_obj_set_style_local_text_color(title, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(title, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
 
-    /* Two panels: ADC1 (ch 0-4) left, ADC2 (ch 5-8) right */
-    si_build_col(si_overlay, 10, 0, 5, "ADC1", &si_val_labels[0], &si_val_labels[ADC_CHANNEL_COUNT]);
-    si_build_col(si_overlay, o_w / 2 + 10, 5, 4, "ADC2",
-                 &si_val_labels[0], &si_val_labels[ADC_CHANNEL_COUNT]);
+    /* Single ADC1 table — rows follow ADC1_RANK_* order */
+    si_build_table(si_overlay, 6, SI_ROW_COUNT);
 
     lv_obj_t *close_btn = lv_btn_create(si_overlay, NULL);
-    lv_obj_set_size(close_btn, 120, 36);
-    lv_obj_align(close_btn, si_overlay, LV_ALIGN_IN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(close_btn, 90, 26);
+    lv_obj_align(close_btn, si_overlay, LV_ALIGN_IN_BOTTOM_MID, 0, -3);
     lv_obj_t *cl = lv_label_create(close_btn, NULL);
     lv_label_set_text(cl, gui_get_string(STR_CANCEL));
     lv_obj_set_style_local_text_font(cl, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_event_cb(close_btn, si_close_cb);
 }
 
-/* Update sensor inspect values — called from main loop */
+/* Update sensor inspect values — called from main loop.
+ * Engineering values are integers in SI-ish units (mA, mV, mW, 0.1 C)
+ * per opa2000.h; scale them down here for display only. */
 void gui_update_sensor_inspect(void)
 {
     if (!si_overlay) return;
     char buf[48];
-    for (int i = 0; i < ADC_CHANNEL_COUNT; i++) {
+    for (int i = 0; i < SI_ROW_COUNT; i++) {
 #ifndef LVGL_SIM
-        uint16_t raw = g_adc_data.raw[i];
-        float val;
-        const char *unit = "";
-        switch (i) {
-            case ADC_CHANNEL_TX_POWER1:    val = g_adc_data.tx_power1; unit = "W";  break;
-            case ADC_CHANNEL_REF_POWER1:   val = g_adc_data.ref_power1; unit = "W";  break;
-            case ADC_CHANNEL_TX_POWER2:    val = g_adc_data.tx_power2; unit = "W";  break;
-            case ADC_CHANNEL_REF_POWER2:   val = g_adc_data.ref_power2; unit = "W";  break;
-            case ADC_CHANNEL_RF_INPUT:     val = g_adc_data.rf_input;   unit = "W";  break;
-            case ADC_CHANNEL_MAIN_CURRENT: val = g_adc_data.current;    unit = "A";  break;
-            case ADC_CHANNEL_MAIN_VOLTAGE: val = g_adc_data.voltage;    unit = "V";  break;
-            case ADC_CHANNEL_NTC_TEMP:     val = g_adc_data.ntc_temp;   unit = "C";  break;
-            case ADC_CHANNEL_DETECTOR:     val = g_adc_data.detector;   unit = "V";  break;
-            default: val = 0; break;
-        }
+        uint16_t raw = g_adc_data.adc1_raw[i];
         snprintf(buf, sizeof(buf), "%u", raw);
-        if (si_val_labels[i]) lv_label_set_text(si_val_labels[i], buf);
+        if (si_raw_labels[i]) lv_label_set_text(si_raw_labels[i], buf);
 
-        if (i == ADC_CHANNEL_NTC_TEMP) {
-            float f = val * 9.0f / 5.0f + 32.0f;
-            snprintf(buf, sizeof(buf), "%.0f%s/%.0fF", val, unit, f);
-        } else {
-            snprintf(buf, sizeof(buf), "%.1f%s", val, unit);
+        switch (i) {
+            case ADC1_RANK_RF_IN:
+                snprintf(buf, sizeof(buf), "%.2fW", (float)g_adc_data.rf_in_mW / 1000.0f);
+                break;
+            case ADC1_RANK_IM:
+                snprintf(buf, sizeof(buf), "%.2fA", (float)g_adc_data.im_mA / 1000.0f);
+                break;
+            case ADC1_RANK_REV1:
+                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.rev1_mW / 1000.0f);
+                break;
+            case ADC1_RANK_FWD1:
+                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.fwd1_mW / 1000.0f);
+                break;
+            case ADC1_RANK_REV2:
+                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.rev2_mW / 1000.0f);
+                break;
+            case ADC1_RANK_VBIAS:
+                snprintf(buf, sizeof(buf), "%.0fmV", (int)g_adc_data.vbias_mV);
+                break;
+            case ADC1_RANK_FWD2:
+                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.fwd2_mW / 1000.0f);
+                break;
+            case ADC1_RANK_VM:
+                snprintf(buf, sizeof(buf), "%.2fV", (float)g_adc_data.vm_mV / 1000.0f);
+                break;
+            default:
+                snprintf(buf, sizeof(buf), "code");
+                break;
         }
-        if (si_val_labels[i + ADC_CHANNEL_COUNT])
-            lv_label_set_text(si_val_labels[i + ADC_CHANNEL_COUNT], buf);
 #else
-        uint16_t sim = 500 + (uint16_t)(rand() % 2001);
-        snprintf(buf, sizeof(buf), "%u", sim);
-        if (si_val_labels[i]) lv_label_set_text(si_val_labels[i], buf);
-        if (i == ADC_CHANNEL_NTC_TEMP) {
-            snprintf(buf, sizeof(buf), "45C/113F");
-        } else {
-            snprintf(buf, sizeof(buf), "%.1fW", sim * 0.01f);
-        }
-        if (si_val_labels[i + ADC_CHANNEL_COUNT])
-            lv_label_set_text(si_val_labels[i + ADC_CHANNEL_COUNT], buf);
+        /* Simulator: synthesise plausible raw codes */
+        static const uint16_t sim_raw[SI_ROW_COUNT] = {
+            1200, 43300, 800, 21000, 640, 5100, 20800, 36400, 8000
+        };
+        snprintf(buf, sizeof(buf), "%u", sim_raw[i]);
+        if (si_raw_labels[i]) lv_label_set_text(si_raw_labels[i], buf);
+
+        static const char *sim_val[SI_ROW_COUNT] = {
+            "3.50W", "0.15A", "12.0W", "210.0W", "9.5W",
+            "195mV", "205.0W", "13.80V", "code"
+        };
+        snprintf(buf, sizeof(buf), "%s", sim_val[i]);
 #endif
+        if (si_val_labels[i]) lv_label_set_text(si_val_labels[i], buf);
     }
 }
 
@@ -1888,7 +2134,7 @@ static void show_fan_settings(void)
     lv_obj_t *mbox = lv_msgbox_create(scr, NULL);
     lv_msgbox_set_text(mbox, gui_get_string(STR_FAN));
     lv_msgbox_add_btns(mbox, fan_btns);
-    lv_obj_set_size(mbox, 320, 220);
+    lv_obj_set_size(mbox, 300, 150);
     lv_obj_align(mbox, scr, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_set_style_local_text_color(mbox, LV_MSGBOX_PART_BG,
@@ -1939,7 +2185,7 @@ static void show_band_comm_settings(void)
     lv_obj_t *mbox = lv_msgbox_create(scr, NULL);
     lv_msgbox_set_text(mbox, gui_get_string(STR_BAND));
     lv_msgbox_add_btns(mbox, band_comm_btns);
-    lv_obj_set_size(mbox, 320, 180);
+    lv_obj_set_size(mbox, 300, 130);
     lv_obj_align(mbox, scr, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_set_style_local_text_color(mbox, LV_MSGBOX_PART_BG,
@@ -1971,62 +2217,86 @@ static lv_obj_t *prot_container = NULL;
 static lv_obj_t *prot_sliders[8];
 static lv_obj_t *prot_val_labels[8];
 
-#ifdef LVGL_SIM
-/* Simulator local storage */
-static float sim_prot_vals[8] = {400, 200, 2.0f, 600, 40, 90, 1100, 1050};
-static float sim_prot_backup[8];
-#else
-static ConfigType prot_backup;
-#endif
+/* Editable protection thresholds, held as plain floats for readability.
+ * prot_from_config() / prot_to_config() translate to the integer units
+ * actually stored in ConfigType (SWR is x100, temperature is 0.1 C). */
+static float prot_val[8]       = {400, 200, 2.0f, 600, 30, 90, 1100, 1050};
+static float prot_val_backup[8];
 
 typedef struct {
     const char *name;
-    float *ptr;
-    float vmin, vmax;
+    float vmin, vmax;      /* slider range in display units */
     const char *unit;
-    int scale;
+    int decimals;
 } ProtField;
 
 static const ProtField prot_fields[] = {
-#ifndef LVGL_SIM
-    {"REF Pwr2",    &g_config.protect_reflect_power2_w,     100, 600, "W",  1},
-    {"REF Pwr2+SWR",&g_config.protect_reflect_power2_swr,    50, 400, "W",  1},
-    {"SWR",         &g_config.protect_swr_threshold,          1,   5, "",  10},
-    {"REF Pwr1",    &g_config.protect_reflect_power1_w,     100,1000, "W",  1},
-    {"Main I",      &g_config.protect_main_current_a,        10,  80, "A",  1},
-    {"Temp",        &g_config.protect_ntc_temp_c,            60, 120, "C",  1},
-    {"TX Pwr1",     &g_config.protect_tx_power1_w,          500,1500, "W",  1},
-    {"TX Pwr2",     &g_config.protect_tx_power2_w,          500,1500, "W",  1},
-#else
-    {"REF Pwr2",    &sim_prot_vals[0], 100, 600, "W",  1},
-    {"REF Pwr2+SWR",&sim_prot_vals[1],  50, 400, "W",  1},
-    {"SWR",         &sim_prot_vals[2],   1,   5, "",  10},
-    {"REF Pwr1",    &sim_prot_vals[3], 100,1000, "W",  1},
-    {"Main I",      &sim_prot_vals[4],  10,  80, "A",  1},
-    {"Temp",        &sim_prot_vals[5],  60, 120, "C",  1},
-    {"TX Pwr1",     &sim_prot_vals[6], 500,1500, "W",  1},
-    {"TX Pwr2",     &sim_prot_vals[7], 500,1500, "W",  1},
-#endif
+    {"REV2",     100,  600, "W", 0},
+    {"REV2+SWR",  50,  400, "W", 0},
+    {"SWR",         1,    5, "",  1},
+    {"REV1",     100, 1000, "W", 0},
+    {"Main I",    10,   30, "A", 0},
+    {"Temp",      60,  120, "C", 0},
+    {"FWD1",     500, 1500, "W", 0},
+    {"FWD2",     500, 1500, "W", 0},
 };
 #define PROT_COUNT (sizeof(prot_fields) / sizeof(prot_fields[0]))
+
+/* Load the eight thresholds from g_config (float display units). */
+static void prot_from_config(void)
+{
+#ifndef LVGL_SIM
+    prot_val[0] = (float)g_config.band_rev2_max_w;
+    prot_val[1] = (float)g_config.band_rev2_swr_w;
+    prot_val[2] = (float)g_config.band_swr_max_x100     / 100.0f;
+    prot_val[3] = (float)g_config.band_rev1_max_w;
+    prot_val[4] = (float)g_config.band_im_max_a;
+    prot_val[5] = (float)g_config.band_ntc_max_tenth_c / 10.0f;
+    prot_val[6] = (float)g_config.band_fwd1_max_w;
+    prot_val[7] = (float)g_config.band_fwd2_max_w;
+#endif
+}
+
+/* Write the eight thresholds back into g_config. */
+static void prot_to_config(void)
+{
+#ifndef LVGL_SIM
+    g_config.band_rev2_max_w      = (uint16_t)prot_val[0];
+    g_config.band_rev2_swr_w       = (uint16_t)prot_val[1];
+    g_config.band_swr_max_x100    = (uint16_t)(prot_val[2] * 100.0f);
+    g_config.band_rev1_max_w      = (uint16_t)prot_val[3];
+    g_config.band_im_max_mA       = (uint16_t)(prot_val[4] * 1000.0f);  /* A -> mA */
+    g_config.band_ntc_max_tenth_c = (uint16_t)(prot_val[5] * 10.0f);
+    g_config.band_fwd1_max_w      = (uint16_t)prot_val[6];
+    g_config.band_fwd2_max_w      = (uint16_t)prot_val[7];
+#endif
+}
+
+/* Format a threshold value for display, adding Fahrenheit for Celsius. */
+static void prot_format(const ProtField *pf, float val, char *buf, size_t len)
+{
+    if (pf->unit[0] == 'C') {
+        float f = val * 9.0f / 5.0f + 32.0f;
+        snprintf(buf, len, "%.0f%s / %.0fF", val, pf->unit, f);
+    } else {
+        snprintf(buf, len, "%.*f%s", pf->decimals, val, pf->unit);
+    }
+}
 
 static void prot_slider_cb(lv_obj_t *slider, lv_event_t e)
 {
     if (e == LV_EVENT_VALUE_CHANGED) {
         int idx = -1;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < (int)PROT_COUNT; i++) {
             if (prot_sliders[i] == slider) { idx = i; break; }
         }
         if (idx < 0 || !prot_val_labels[idx]) return;
-        int16_t sv = lv_slider_get_value(slider);
-        float val = (float)sv / (float)prot_fields[idx].scale;
+
+        /* lv_slider works in integers, so use a 0.1x scale internally
+         * (SWR 1.0..5.0 -> 10..50) and keep everything else in float. */
+        prot_val[idx] = (float)lv_slider_get_value(slider) / 10.0f;
         char buf[48];
-        if (prot_fields[idx].unit[0] == 'C') {
-            float f = val * 9.0f / 5.0f + 32.0f;
-            snprintf(buf, sizeof(buf), "%.0f%s / %.0fF", val, prot_fields[idx].unit, f);
-        } else {
-            snprintf(buf, sizeof(buf), "%.1f%s", val, prot_fields[idx].unit);
-        }
+        prot_format(&prot_fields[idx], prot_val[idx], buf, sizeof(buf));
         lv_label_set_text(prot_val_labels[idx], buf);
     }
 }
@@ -2034,12 +2304,7 @@ static void prot_slider_cb(lv_obj_t *slider, lv_event_t e)
 static void prot_cancel_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
-#ifndef LVGL_SIM
-        *(ConfigType*)&g_config = prot_backup;
-#else
-        for (int i = 0; i < 8; i++)
-            *prot_fields[i].ptr = sim_prot_backup[i];
-#endif
+        memcpy(prot_val, prot_val_backup, sizeof(prot_val));
         prot_screen = NULL; lv_scr_load(main_screen);
     }
 }
@@ -2047,6 +2312,7 @@ static void prot_cancel_cb(lv_obj_t *obj, lv_event_t e)
 static void prot_save_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
+        prot_to_config();
 #ifndef LVGL_SIM
         config_save();
 #endif
@@ -2054,41 +2320,44 @@ static void prot_save_cb(lv_obj_t *obj, lv_event_t e)
     }
 }
 
-static void prot_slider_create(lv_obj_t *parent, int idx, lv_coord_t y)
+/* One threshold row: name (left) + value (right) above a full-width slider.
+ * Eight of these are laid out in two columns to fit the 272 px screen. */
+static void prot_slider_create(lv_obj_t *parent, int idx, lv_coord_t x,
+                               lv_coord_t y, lv_coord_t w)
 {
     const ProtField *pf = &prot_fields[idx];
     char buf[64];
 
     lv_obj_t *name_lbl = lv_label_create(parent, NULL);
-    snprintf(buf, sizeof(buf), "%s (%s)", pf->name, pf->unit);
+    snprintf(buf, sizeof(buf), "%s", pf->name);
     lv_label_set_text(name_lbl, buf);
-    lv_obj_set_pos(name_lbl, HOR_RES / 20, y);
+    lv_obj_set_pos(name_lbl, x, y);
     lv_obj_set_style_local_text_color(name_lbl, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(name_lbl, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
 
     lv_obj_t *val_lbl = lv_label_create(parent, NULL);
-    float init_val = *pf->ptr;
-    if (pf->unit[0] == 'C') {
-        float f = init_val * 9.0f / 5.0f + 32.0f;
-        snprintf(buf, sizeof(buf), "%.0f%s / %.0fF", init_val, pf->unit, f);
-    } else {
-        snprintf(buf, sizeof(buf), "%.1f%s", init_val, pf->unit);
-    }
+    float init_val = prot_val[idx];
+    prot_format(pf, init_val, buf, sizeof(buf));
     lv_label_set_text(val_lbl, buf);
-    lv_obj_set_pos(val_lbl, HOR_RES * 7 / 10, y);
+    /* Park the value in the right half of the cell.  Explicit positioning is
+     * used rather than right-alignment because a bare label ignores
+     * LV_LABEL_ALIGN_RIGHT until it has a fixed width applied first. */
+    lv_obj_set_pos(val_lbl, x + w * 3 / 5, y);
     lv_obj_set_style_local_text_color(val_lbl, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_YELLOW);
     lv_obj_set_style_local_text_font(val_lbl, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
 
     lv_obj_t *slider = lv_slider_create(parent, NULL);
-    lv_obj_set_size(slider, HOR_RES * 6 / 10, 20);
-    lv_obj_set_pos(slider, HOR_RES / 20, y + 22);
-    lv_slider_set_range(slider, (int16_t)(pf->vmin * pf->scale),
-                                 (int16_t)(pf->vmax * pf->scale));
-    lv_slider_set_value(slider, (int16_t)(init_val * pf->scale), LV_ANIM_OFF);
+    lv_obj_set_size(slider, w, 14);
+    lv_obj_set_pos(slider, x, y + 17);
+    /* Slider uses a 0.1x integer scale so SWR 1.0..5.0 fits lv_slider's
+     * integer range with usable resolution. */
+    lv_slider_set_range(slider, (int16_t)(pf->vmin * 10.0f),
+                               (int16_t)(pf->vmax * 10.0f));
+    lv_slider_set_value(slider, (int16_t)(init_val * 10.0f), LV_ANIM_OFF);
 
     prot_sliders[idx] = slider;
     prot_val_labels[idx] = val_lbl;
@@ -2099,12 +2368,8 @@ static void show_protection_settings(void)
 {
     if (prot_screen) { lv_obj_del(prot_screen); prot_screen = NULL; }
 
-#ifndef LVGL_SIM
-    prot_backup = g_config;
-#else
-    for (int i = 0; i < 8; i++)
-        sim_prot_backup[i] = *prot_fields[i].ptr;
-#endif
+    prot_from_config();
+    memcpy(prot_val_backup, prot_val, sizeof(prot_val));
 
     prot_screen = lv_obj_create(NULL, NULL);
     lv_obj_set_size(prot_screen, HOR_RES, VER_RES);
@@ -2121,33 +2386,44 @@ static void show_protection_settings(void)
                                         LV_STATE_DEFAULT, 0);
 
     lv_obj_t *title = lv_label_create(prot_container, NULL);
-    lv_label_set_text(title, "Protection Settings");
-    lv_obj_align(title, prot_container, LV_ALIGN_IN_TOP_MID, 0, 10);
+    lv_label_set_text(title, gui_get_string(STR_SETTINGS));
+    lv_obj_align(title, prot_container, LV_ALIGN_IN_TOP_MID, 0, 2);
     lv_obj_set_style_local_text_color(title, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(title, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
 
+    /* Two columns x four rows — eight thresholds in 480x272 */
+    const lv_coord_t col_w = (HOR_RES - 3 * MARGIN_X) / 2;
+    const lv_coord_t col_x0 = MARGIN_X;
+    const lv_coord_t col_x1 = MARGIN_X * 2 + col_w;
+    const lv_coord_t row_y0 = 22;
+    const lv_coord_t row_pitch = 44;
     for (int i = 0; i < (int)PROT_COUNT; i++) {
-        prot_slider_create(prot_container, i, 40 + i * 50);
+        int col = i / ((int)PROT_COUNT / 2);
+        int row = i % ((int)PROT_COUNT / 2);
+        prot_slider_create(prot_container, i,
+                           col ? col_x1 : col_x0,
+                           row_y0 + row * row_pitch,
+                           col_w);
     }
 
     lv_obj_t *save_btn = lv_btn_create(prot_container, NULL);
-    lv_obj_set_pos(save_btn, HOR_RES / 2 - 130, VER_RES - 60);
-    lv_obj_set_size(save_btn, 120, 40);
+    lv_obj_set_pos(save_btn, HOR_RES / 2 - 105, VER_RES - 40);
+    lv_obj_set_size(save_btn, 100, 32);
     lv_obj_t *save_lbl = lv_label_create(save_btn, NULL);
     lv_label_set_text(save_lbl, gui_get_string(STR_SAVE));
     lv_obj_set_style_local_text_font(save_lbl, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_event_cb(save_btn, prot_save_cb);
 
     lv_obj_t *cancel_btn = lv_btn_create(prot_container, NULL);
-    lv_obj_set_pos(cancel_btn, HOR_RES / 2 + 10, VER_RES - 60);
-    lv_obj_set_size(cancel_btn, 120, 40);
+    lv_obj_set_pos(cancel_btn, HOR_RES / 2 + 5, VER_RES - 40);
+    lv_obj_set_size(cancel_btn, 100, 32);
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn, NULL);
     lv_label_set_text(cancel_lbl, gui_get_string(STR_CANCEL));
     lv_obj_set_style_local_text_font(cancel_lbl, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_event_cb(cancel_btn, prot_cancel_cb);
 }
 
@@ -2178,7 +2454,7 @@ void gui_toggle_menu(void)
     const char **btns = (gui_get_lang_index() == 0) ? settings_zh : settings_en;
 
     lv_obj_t *overlay = lv_obj_create(lv_scr_act(), NULL);
-    lv_obj_set_size(overlay, HOR_RES * 3 / 4, VER_RES * 7 / 8);
+    lv_obj_set_size(overlay, HOR_RES - 4 * MARGIN_X, VER_RES - 4 * MARGIN_X);
     lv_obj_align(overlay, NULL, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_local_bg_color(overlay, LV_OBJ_PART_MAIN,
                                      LV_STATE_DEFAULT, COLOR_BG);
@@ -2186,20 +2462,20 @@ void gui_toggle_menu(void)
 
     lv_obj_t *btnm = lv_btnmatrix_create(overlay, NULL);
     lv_btnmatrix_set_map(btnm, btns);
-    lv_obj_set_size(btnm, HOR_RES * 3 / 4 - 20, VER_RES * 7 / 8 - 20);
+    lv_obj_set_size(btnm, HOR_RES - 4 * MARGIN_X - 8, VER_RES - 4 * MARGIN_X - 8);
     lv_obj_align(btnm, NULL, LV_ALIGN_CENTER, 0, 0);
 
     /* Button matrix background */
     lv_obj_set_style_local_bg_color(btnm, LV_BTNMATRIX_PART_BG,
                                      LV_STATE_DEFAULT, COLOR_BG);
     lv_obj_set_style_local_pad_inner(btnm, LV_BTNMATRIX_PART_BG,
-                                      LV_STATE_DEFAULT, 16);
+                                      LV_STATE_DEFAULT, 6);
 
     /* Button style (matching OPA1000 and band selector) */
     lv_obj_set_style_local_text_color(btnm, LV_BTNMATRIX_PART_BTN,
                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(btnm, LV_BTNMATRIX_PART_BTN,
-                                      LV_STATE_DEFAULT, &MyCJK_16);
+                                      LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_style_local_bg_color(btnm, LV_BTNMATRIX_PART_BTN,
                                      LV_STATE_DEFAULT, LV_COLOR_MAKE(0, 160, 225));
     lv_obj_set_style_local_border_color(btnm, LV_BTNMATRIX_PART_BTN,

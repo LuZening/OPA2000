@@ -23,6 +23,12 @@ extern "C" {
 #define PRIORITY_MONITOR_TASK    5
 #define PRIORITY_PROTECT_TASK    6
 
+/* Lowest in the system on purpose.  This task performs the internal-flash
+ * erase + program, during which the CPU cannot fetch instructions, so
+ * every other task must be able to preempt it.  It must sit strictly below
+ * the protection task (priority 6) or a save could delay a shutdown. */
+#define PRIORITY_CONFIG_TASK     1
+
 /*============================================================================
  * Task Stack Sizes (in words)
  *============================================================================*/
@@ -32,6 +38,7 @@ extern "C" {
 #define STACK_SIZE_COMM_TASK     1024
 #define STACK_SIZE_MONITOR_TASK  512
 #define STACK_SIZE_PROTECT_TASK  512
+#define STACK_SIZE_CONFIG_TASK   512
 
 /*============================================================================
  * Function Prototypes
@@ -71,6 +78,12 @@ void app_monitor_task(void *argument);
  * @param argument Task argument
  */
 void app_protect_task(void *argument);
+
+/**
+ * @brief Config Save Task - writes g_config to flash when marked dirty
+ * @param argument Task argument
+ */
+void app_config_task(void *argument);
 
 #ifdef __cplusplus
 }

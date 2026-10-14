@@ -73,14 +73,17 @@ add_executable(host_tests
     ${USER_SRC}/protection.c
     ${USER_SRC}/buzzer.c
     ${USER_SRC}/radio_band.c
+    ${USER_SRC}/flash_eeprom.c
 
     # test cases
     ${CMAKE_CURRENT_SOURCE_DIR}/test_opa2000.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_config_layout.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_adc_calibration.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_user_adc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_power_control.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_protection.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_radio_band.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_flash_eeprom.c
 )
 
 # Math library: only the test reference implementation uses log() to

@@ -1,11 +1,11 @@
 /**
  * @file config.c
- * @brief Configuration Management Implementation using FatFS
+ * @brief Configuration storage on the internal flash.
  */
 
 #include "config.h"
-#include "ff.h"
-#include "sdcard_storage.h"
+#include "flash_eeprom.h"
+
 #include <string.h>
 #include <strings.h>
 
@@ -20,88 +20,17 @@ static const char * const radio_type_strings[] = {
     "Kenwood"
 };
 
-static FATFS fs;
-static bool fs_mounted = false;
+/* Raised by config_mark_dirty(), consumed by app_config_task().
+ *
+ * volatile because it is written from the GUI task and read from the config
+ * task.  A lost update here only means the change is persisted a second
+ * later, so no critical section is warranted - and taking one from an LVGL
+ * callback would be the wrong trade. */
+static volatile bool s_dirty;
 
 /*============================================================================
  * Private Functions
  *============================================================================*/
-
-/**
- * @brief Mount FatFS if not already mounted
- */
-static bool config_mount_fs(void)
-{
-    if (fs_mounted) {
-        return true;
-    }
-
-    if (!sdcard_storage_take_mutex(5000)) {
-        return false;
-    }
-
-    FRESULT res = f_mount(&fs, "", 1);
-    if (res != FR_OK) {
-        sdcard_storage_give_mutex();
-        return false;
-    }
-
-    fs_mounted = true;
-    sdcard_storage_give_mutex();
-    return true;
-}
-
-/**
- * @brief Write config to file
- */
-static bool config_write_file(const char *filename, const void *data, uint32_t len)
-{
-    FIL fp;
-    UINT bw;
-    FRESULT res;
-
-    if (!sdcard_storage_take_mutex(5000)) {
-        return false;
-    }
-
-    res = f_open(&fp, filename, FA_CREATE_ALWAYS | FA_WRITE);
-    if (res != FR_OK) {
-        sdcard_storage_give_mutex();
-        return false;
-    }
-
-    res = f_write(&fp, data, len, &bw);
-    f_close(&fp);
-
-    sdcard_storage_give_mutex();
-    return (res == FR_OK && bw == len);
-}
-
-/**
- * @brief Read config from file
- */
-static bool config_read_file(const char *filename, void *data, uint32_t len)
-{
-    FIL fp;
-    UINT br;
-    FRESULT res;
-
-    if (!sdcard_storage_take_mutex(5000)) {
-        return false;
-    }
-
-    res = f_open(&fp, filename, FA_READ);
-    if (res != FR_OK) {
-        sdcard_storage_give_mutex();
-        return false;
-    }
-
-    res = f_read(&fp, data, len, &br);
-    f_close(&fp);
-
-    sdcard_storage_give_mutex();
-    return (res == FR_OK && br == len);
-}
 
 /**
  * @brief Recompute the CRC over everything ahead of the crc32 field
@@ -121,86 +50,72 @@ static void config_update_crc(void)
  *============================================================================*/
 
 /**
- * @brief Check if SD card is ready
+ * @brief Whether a previously saved config was found on flash
+ *
+ * Still meaningful even though nothing is mounted any more: it tells the
+ * caller whether the defaults it is about to fall back on are coming from
+ * an empty store or from a store whose contents could not be trusted.
  */
 bool config_sdcard_ready(void)
 {
-    return fs_mounted;
+    return eeprom_current_id() != 0U;
 }
 
 /**
- * @brief Initialize configuration from FatFS
+ * @brief Load the newest config record
+ *
+ * A CRC mismatch on the stored record is caught inside the EEPROM layer,
+ * which only ever hands back a record whose payload CRC checks out.
  */
 bool config_init(void)
 {
     ConfigType stored;
 
-    /* Mount FatFS */
-    if (!config_mount_fs()) {
+    if (!eeprom_load(&stored, sizeof(stored))) {
+        /* Empty store or nothing readable.  Start from the defaults; they
+         * get written out by config_reset_default(). */
         config_reset_default();
         return false;
     }
 
-    /* Read the blob as-is and validate magic / version / CRC before it is
-     * allowed anywhere near g_config - a partially written file would
-     * otherwise be interpreted as real settings. */
-    if (!config_read_file(CONFIG_FILENAME, &stored, sizeof(ConfigType))) {
-        /* Config file not accessible or not programmed */
-        config_reset_default();
-        return false;
-    }
-
+    /* One more gate before the data is allowed near g_config: the record
+     * also carries a magic and a layout version, so a store written by an
+     * older firmware is rejected rather than reinterpreted. */
     if (stored.magic != CONFIG_MAGIC || stored.version != CONFIG_VERSION) {
-        /* Invalid or old layout, use defaults */
         config_reset_default();
         return false;
-    }
-
-    {
-        uint32_t want = stored.crc32;
-        stored.crc32 = 0U;
-        if (crc32_calculate((const uint8_t *)&stored,
-                            sizeof(ConfigType) - sizeof(uint32_t)) != want) {
-            config_reset_default();
-            return false;
-        }
     }
 
     g_config = stored;
+    s_dirty = false;
     return true;
 }
 
 /**
- * @brief Save configuration to FatFS file
+ * @brief Append the current g_config to the flash ring
+ *
+ * Callers must not use this from a UI callback - see config_mark_dirty().
  */
 bool config_save(void)
 {
-    if (!config_mount_fs()) {
-        return false;
-    }
+    ConfigType out = g_config;
 
     /* Stamp magic / version / CRC into a copy so g_config itself keeps the
      * caller's values (a save must not mutate live settings). */
-    ConfigType out = g_config;
     out.magic   = CONFIG_MAGIC;
     out.version = (uint8_t)CONFIG_VERSION;
     out.crc32   = 0U;
     out.crc32   = crc32_calculate((const uint8_t *)&out,
                                   sizeof(ConfigType) - sizeof(uint32_t));
 
-    if (!config_write_file(CONFIG_FILENAME, &out, sizeof(ConfigType))) {
-        return false;
-    }
-
-    /* Backup copy: if power is lost mid-write of the main file the loader
-     * can still fall back to this one. */
-    (void)config_write_file(CONFIG_BACKUP_FILENAME, &out, sizeof(ConfigType));
-
-    return true;
+    return eeprom_save(&out, sizeof(out));
 }
 
 /**
- * @brief Reset configuration to defaults
+ * @brief Reset configuration to defaults and persist them immediately
+ *
+ * Unlike an ordinary edit this one is written straight through: it runs at
+ * boot, before the save task exists, and the operator is waiting on it.
  */
 void config_reset_default(void)
 {
@@ -245,15 +160,17 @@ void config_reset_default(void)
     g_config.rev1 = (coupler_t){0, 0};
     g_config.rev2 = (coupler_t){0, 0};
 
-    g_config.language      = MULTILANG_CHINESE;
-    g_config.buzzer_enable = 1U;
+    g_config.language        = MULTILANG_CHINESE;
+    g_config.buzzer_enable   = 1U;
     g_config.temp_fahrenheit = 0U;
 
     config_update_crc();
 
-    /* Persist so the defaults survive a reboot even with no SD write from
-     * the GUI. Failure is not fatal - config_init() will just re-default. */
-    (void)config_save();
+    /* Written straight through, and the flag cleared only if it worked, so
+     * a failed write is retried by the save task on its next tick. */
+    if (config_save()) {
+        s_dirty = false;
+    }
 }
 
 /**
@@ -269,6 +186,25 @@ bool config_validate(void)
     g_config.crc32 = stored_crc;
 
     return (stored_crc == calculated_crc);
+}
+
+/*============================================================================
+ *  Deferred saving
+ *==========================================================================*/
+
+void config_mark_dirty(void)
+{
+    s_dirty = true;
+}
+
+void config_clear_dirty(void)
+{
+    s_dirty = false;
+}
+
+bool config_is_dirty(void)
+{
+    return s_dirty;
 }
 
 /**

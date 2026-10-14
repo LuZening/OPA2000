@@ -93,19 +93,24 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${LVGL_FONT_SOURCES}
     ${LVGL_THEME_SOURCES}
     ${LVGL_GPU_SOURCES}
+    User/Src/alc_pwm.c
     User/Src/app_tasks.c
+    User/Src/buzzer.c
     User/Src/comm.c
     User/Src/config.c
-    User/Src/eeprom.c
+    User/Src/fan_tach.c
+    User/Src/flash_eeprom.c
     User/Src/freq_detect.c
     User/Src/gui.c
     User/Src/lv_port_disp.c
     User/Src/key.c
     User/Src/language.c
     User/Src/opa2000.c
-    User/Src/pca9539.c
+    User/Src/adc_calibration.c
     User/Src/power_control.c
     User/Src/protection.c
+    User/Src/radio_band.c
+    User/Src/radio_uart.c
     User/Src/sdcard_storage.c
     User/Src/touch.c
     User/Src/user_adc.c

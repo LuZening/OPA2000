@@ -58,7 +58,15 @@ MEMORY
 DTCMRAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
 RAM (xrw)      : ORIGIN = 0x24000000, LENGTH = 1024K
 ITCMRAM (xrw)      : ORIGIN = 0x00000000, LENGTH = 64K
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 128K
+
+/* Only the first 12 of the 16 sectors are available to the linker.
+ * SECTOR_12..15 (the last 32 KB) are reserved for the configuration
+ * EEPROM ring in User/Src/flash_eeprom.c.  Shrinking FLASH here is what
+ * guarantees the compiler cannot place code or const data on top of the
+ * EEPROM - without it the linker is free to grow .text into those sectors
+ * and the first save would overwrite part of the program.
+ * Keep in sync with EEPROM_FIRST_SECTOR in User/Inc/flash_eeprom.h. */
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 96K
 }
 
 /* Highest address of the user mode stack */

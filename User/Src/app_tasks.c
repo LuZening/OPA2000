@@ -26,6 +26,7 @@ static TaskHandle_t adc_task_handle = NULL;
 static TaskHandle_t comm_task_handle = NULL;
 static TaskHandle_t monitor_task_handle = NULL;
 static TaskHandle_t protect_task_handle = NULL;
+static TaskHandle_t config_task_handle = NULL;
 
 /*============================================================================
  * Public Functions
@@ -98,6 +99,19 @@ void app_tasks_create(void)
         NULL,
         PRIORITY_PROTECT_TASK,
         &protect_task_handle
+    );
+    if (result != pdPASS) {
+        /* Error handling */
+    }
+
+    /* Config Save Task - lowest priority, see app_config_task() */
+    result = xTaskCreate(
+        app_config_task,
+        "Config Task",
+        STACK_SIZE_CONFIG_TASK,
+        NULL,
+        PRIORITY_CONFIG_TASK,
+        &config_task_handle
     );
     if (result != pdPASS) {
         /* Error handling */
@@ -342,5 +356,44 @@ void app_protect_task(void *argument)
 
         /* 20ms tick - 50Hz protection check */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(20));
+    }
+}
+
+/**
+ * @brief Config Save Task
+ *
+ * The only place in the firmware that writes the internal flash.
+ *
+ * Programming a flash word stalls instruction fetch for the duration, and
+ * erasing a sector stalls it much longer - tens of milliseconds.  Nothing
+ * in the GUI or the CAT link may be held up by that, so the actual write
+ * happens here at the lowest priority in the system: every other task,
+ * including the protection task, preempts it freely.
+ *
+ * The 1 s period is a coalescing window.  Dragging a protection-threshold
+ * slider raises the dirty flag on every LVGL value-changed event; without
+ * this delay a single gesture would append dozens of records and burn
+ * through the ring for nothing.  One write per second is fast enough that
+ * a power cut loses at most one second of tuning.
+ */
+void app_config_task(void *argument)
+{
+    TickType_t last_wake_time;
+
+    (void)argument;
+
+    last_wake_time = xTaskGetTickCount();
+
+    while (1) {
+        if (config_is_dirty()) {
+            /* Clear first, then write.  If an edit lands between the clear
+             * and the write, config_save() stores the newer values and the
+             * flag is still set for the next pass - the edit is not lost.
+             * Clearing afterwards instead would swallow it. */
+            config_clear_dirty();
+            (void)config_save();
+        }
+
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(1000));
     }
 }

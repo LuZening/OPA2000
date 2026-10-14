@@ -801,7 +801,7 @@ static void cal_accept_cb(lv_obj_t *obj, lv_event_t e)
         calibrating = false;
         cal_state = 0;
 #ifndef LVGL_SIM
-        config_save();
+        config_mark_dirty();
 #endif
         lv_scr_load(main_screen);
     }
@@ -1180,7 +1180,7 @@ void gui_set_language(LanguageType lang)
     current_language = lang;
 #ifndef LVGL_SIM
     g_config.language = lang;
-    config_save();
+    config_mark_dirty();
 #endif
 
     for (size_t i = 0; i < sizeof(lang_refresh) / sizeof(lang_refresh[0]); i++) {
@@ -1275,6 +1275,21 @@ static void settings_menu_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
         uint16_t btn_id = lv_btnmatrix_get_active_btn(obj);
+
+        /* Leaving the main menu is the point where a whole batch of edits is
+         * finished, so this is the natural place to ask for a save.  Each
+         * individual sub-page already raised the flag as its values
+         * changed; doing it here as well covers anything edited without
+         * going through a sub-page callback.
+         *
+         * It is only a request - app_config_task() does the flash write a
+         * second later, at the lowest priority, because programming flash
+         * stalls instruction fetch and must not happen inside an LVGL
+         * callback. */
+#ifndef LVGL_SIM
+        config_mark_dirty();
+#endif
+
         if (btn_id == 0) {
             lv_obj_del_async(lv_obj_get_parent(obj));
             show_coupler_selector();
@@ -1337,13 +1352,13 @@ static void language_sel_cb(lv_obj_t *obj, lv_event_t e)
             temp_fahrenheit = false;
 #ifndef LVGL_SIM
             g_config.temp_fahrenheit = 0U;
-            config_save();
+            config_mark_dirty();
 #endif
         } else if (id == 3) {
             temp_fahrenheit = true;
 #ifndef LVGL_SIM
             g_config.temp_fahrenheit = 1U;
-            config_save();
+            config_mark_dirty();
 #endif
         }
         lv_obj_del_async(obj);
@@ -1576,7 +1591,7 @@ static void cc_accept_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
 #ifndef LVGL_SIM
-        config_save();
+        config_mark_dirty();
 #endif
         cc_active = false;
         cc_state = 0;
@@ -2177,7 +2192,7 @@ static void band_comm_cb(lv_obj_t *obj, lv_event_t e)
 #ifndef LVGL_SIM
         if (btn_id <= 2) {
             g_config.radio_type = (RadioType)(btn_id + 1);
-            config_save();
+            config_mark_dirty();
         }
 #endif
     }
@@ -2320,7 +2335,7 @@ static void prot_save_cb(lv_obj_t *obj, lv_event_t e)
     if (e == LV_EVENT_CLICKED) {
         prot_to_config();
 #ifndef LVGL_SIM
-        config_save();
+        config_mark_dirty();
 #endif
         prot_screen = NULL; lv_scr_load(main_screen);
     }

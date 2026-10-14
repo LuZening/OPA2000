@@ -514,10 +514,10 @@ static void gui_update_main_values(void)
 #ifndef LVGL_SIM
     /* Status */
     lv_color_t banner_color;
-    if (g_power_state == POWER_STATE_TX) {
+    if (g_tx_active) {
         lv_label_set_text(status_label, gui_get_string(STR_TRANSMIT));
         banner_color = LV_COLOR_MAKE(0xdf, 0x01, 0x01);  /* OPA1000 dark red */
-    } else if (g_power_state == POWER_STATE_STANDBY) {
+    } else if (g_psu_on) {
         lv_label_set_text(status_label, gui_get_string(STR_STANDBY));
         banner_color = LV_COLOR_MAKE(0xea, 0xb9, 0x06);  /* OPA1000 dark yellow */
     } else {
@@ -1085,8 +1085,8 @@ void gui_process_calibration(void)
 void gui_power_button_pressed(void)
 {
 #ifndef LVGL_SIM
-    if (g_power_state == POWER_STATE_OFF) power_on();
-    else power_off();
+    if (g_psu_on) power_off();
+    else power_on();
 #else
     static bool sim_active = false;
     sim_active = !sim_active;

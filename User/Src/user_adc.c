@@ -16,6 +16,12 @@
  *   adc*_raw_to_*_mW / _mV / _mA functions from adc_calibration.h,
  *   stores results in g_adc_data.
  *
+ *   It also publishes the coupler-2 instantaneous values that the peak
+ *   holds (fwd2_peak_mW / rev2_peak_mW) are derived from.  The holds
+ *   themselves are advanced by adc_peak_hold_tick() from the ADC task,
+ *   never from here: this function runs in the ADC1 DMA interrupt at main
+ *   priority 0 and the release step needs expf().
+ *
  *   adc_im_zero_offset_tick() implements the CC6920BSO-50A
  *   zero-offset state machine described in OPA2000_H7_固件设计要求
  *   section [main current zero-offset calibration].  Called from the
@@ -26,14 +32,20 @@
 #include "user_adc.h"
 #include "stm32h7xx_hal.h"
 #include <string.h>
+#include <math.h>
 
 /*============================================================================
  *  DMA buffer placement
  *============================================================================*/
 
 /* Place DMA buffers in DTCMRAM (non-cacheable) for cache-coherent DMA.
- * See STM32H7B0XX_FLASH.ld to ensure .dma_buffer section is in DTCMR. */
+ * See STM32H7B0XX_FLASH.ld to ensure .dma_buffer section is in DTCMR.
+ * The attribute is GCC-only; host builds ignore it. */
+#if defined(__GNUC__)
 #define DMA_BUFFER_SECTION  __attribute__((section(".dma_buffer"), aligned(4)))
+#else
+#define DMA_BUFFER_SECTION
+#endif
 
 uint16_t adc1_dma_buf[ADC_DMA_BUFFER_SIZE * ADC1_RANK_COUNT] DMA_BUFFER_SECTION;
 uint16_t adc2_dma_buf[ADC_DMA_BUFFER_SIZE * 2U]              DMA_BUFFER_SECTION;
@@ -72,6 +84,97 @@ static im_cal_state_t s_im_cal = { .phase = 1U, .retry = 0U,
 #define IM_ZERO_TOLERANCE    1048
 
 /*============================================================================
+ *  Peak-hold (peak detector with exponential release)
+ *
+ *  The GUI shows three bar graphs - forward power, reflected power and SWR -
+ *  and derives all three from the same two held values, so they always agree.
+ *  A plain instantaneous reading is unreadable on a bar graph: between two
+ *  syllables of speech the forward power collapses and the bar drops to zero.
+ *  The classic fix is a peak detector: attack instantly, release slowly.
+ *
+ *      out[n] = max(sample[n], out[n-1] * exp(-dt / tau))
+ *
+ *  tau is 500 ms as specified: after the input falls below the held value,
+ *  the hold decays to 1/e (36.8 %) of its amplitude in 500 ms, to 5 % in
+ *  1.5 s and to ~0.7 % in 5 s.  Fast enough to look responsive, slow enough
+ *  that a short spike is still readable.
+ *
+ *  Two properties this deliberately does NOT have:
+ *
+ *  - No dependence on PTT / g_tx_active.  A peak meter is an instrument; it
+ *    reports what the coupler actually sees.  If the reading is zero when
+ *    idle, the hold decays to zero by itself; if it is non-zero (noise, a
+ *    stuck front end, RF leaking in from elsewhere) that is exactly what the
+ *    operator needs to see, so it is shown rather than hidden.  Gating on
+ *    key-down would also make the bar jump at a moment unrelated to the RF.
+ *
+ *  - No FPU in interrupt context.  adc_process() also runs from the ADC1 DMA
+ *    completion interrupt at main priority 0, so the peak-hold step is
+ *    deliberately kept out of that path: adc_process() publishes the
+ *    instantaneous values only, and adc_peak_hold_tick() - which does the
+ *    expf() - is called from the ADC task.  That keeps the highest priority
+ *    interrupt free of both library calls and wasted arithmetic.
+ *==========================================================================*/
+
+/*!< Release time constant, seconds (spec: 500 ms). */
+#define PEAK_TAU_S             0.5f
+
+/*!< Upper bound on one decay step.  Past ~10 tau the curve is visually zero
+ *   anyway, and clamping keeps a long task stall from turning into one giant
+ *   jump that would look like a glitch on screen. */
+#define PEAK_MAX_STEP_MS       10000U
+
+/* Time of the previous peak-hold step, in ticks.  Read by the ADC task
+ * only, so no volatile and no atomicity concerns. */
+static uint32_t s_peak_last_tick = 0U;
+
+/* One peak-hold step for a single channel. */
+static float peak_hold_step(float prev, float sample, float dt_s)
+{
+    if (sample >= prev) {
+        return sample;               /* attack: instantaneous */
+    }
+    if (dt_s <= 0.0f) {
+        return prev;                 /* no elapsed time -> no release */
+    }
+    float decayed = prev * expf(-dt_s / PEAK_TAU_S);
+
+    /* Guard the tail: expf() underflows towards 0 and the result is stored
+     * back into an int32_t, so anything below the representable resolution
+     * is snapped to exactly zero rather than left to dither. */
+    if (decayed < 0.5f) {
+        decayed = 0.0f;
+    }
+    /* sample can still be the larger of the two after the decay. */
+    return (sample > decayed) ? sample : decayed;
+}
+
+void adc_peak_hold_tick(void)
+{
+    /* ADC task context (never the DMA interrupt): the FPU and libm are
+     * both fine here. */
+    uint32_t now = HAL_GetTick();
+
+    /* Unsigned subtraction, so the HAL_GetTick() wrap at ~49 days is a
+     * non-issue.  Saturate the step so a long stall (e.g. the debugger
+     * breakpoint or a burst of higher-priority interrupts) cannot produce a
+     * negative interval. */
+    uint32_t dt_ms = now - s_peak_last_tick;
+    s_peak_last_tick = now;
+    if (dt_ms > PEAK_MAX_STEP_MS) {
+        dt_ms = PEAK_MAX_STEP_MS;
+    }
+    float dt_s = (float)dt_ms * 0.001f;
+
+    g_adc_data.fwd2_peak_mW =
+        (int32_t)peak_hold_step((float)g_adc_data.fwd2_peak_mW,
+                                (float)g_adc_data.fwd2_mW, dt_s);
+    g_adc_data.rev2_peak_mW =
+        (int32_t)peak_hold_step((float)g_adc_data.rev2_peak_mW,
+                                (float)g_adc_data.rev2_mW, dt_s);
+}
+
+/*============================================================================
  *  Public API
  *============================================================================*/
 
@@ -90,6 +193,11 @@ void adc_init(void)
     s_im_cal.retry        = 0U;
     s_im_cal.sample_idx   = 0U;
     memset(s_im_cal.accum, 0, sizeof s_im_cal.accum);
+
+    /* Peak holds start empty; the first tick establishes the time base. */
+    s_peak_last_tick      = 0U;
+    g_adc_data.fwd2_peak_mW = 0;
+    g_adc_data.rev2_peak_mW = 0;
 
     /* Allow calibration to re-arm on every boot. */
     g_config.im_calibrated    = 0U;
@@ -148,8 +256,6 @@ static uint16_t adc1_average_rank(uint8_t rank, uint16_t *out_avg)
 
 void adc_process(void)
 {
-    uint16_t avg;
-
     /* ADC1 ranks: average across the rolling DMA buffer. */
     uint16_t raw_rank[ADC1_RANK_COUNT];
     for (uint8_t r = 0; r < ADC1_RANK_COUNT; r++) {
@@ -166,7 +272,7 @@ void adc_process(void)
     g_adc_data.vbias_mV  = adc1_raw_to_vbias_sense_mV(raw_rank[ADC1_RANK_VBIAS]);
     g_adc_data.fwd2_mW   = adc1_raw_to_fwd2_mW(raw_rank[ADC1_RANK_FWD2]);
     g_adc_data.vm_mV    = adc1_raw_to_vm_mV(raw_rank[ADC1_RANK_VM]);
-    g_adc_data.key_adc   = raw_rank[ADC1_RANK_KEY_ADC];     /* raw code, no unit */
+    g_adc_data.key_adc   = adc1_raw_to_key_adc_code(raw_rank[ADC1_RANK_KEY_ADC]);
 
     /* ADC2: keep the latest 455kHz IF samples for the GUI / demod task. */
     g_adc_data.adc2_if_pa_raw    = adc2_dma_buf[(ADC_DMA_BUFFER_SIZE - 1U) * 2U];
@@ -180,9 +286,16 @@ void adc_process(void)
     g_adc_data.ntc_aux_tenth_c   = adc2_inj_raw_to_aux_ntc_tenth_c(adc2_inj_ntc_aux_raw);
     g_adc_data.mcu_int_tenth_c   = adc2_inj_raw_to_mcu_internal_tenth_c(adc2_inj_tsense_raw);
 
-    /* SWR: use fwd2/rev2 milli-Watts, return x100. */
+    /* SWR: use fwd2/rev2 milli-Watts, return x100.  This is the
+     * instantaneous value; the GUI derives its own SWR from the peak holds
+     * so all three of its bar graphs agree with each other. */
     g_adc_data.swr_x100 = calculate_swr_x100(g_adc_data.fwd2_mW,
                                             g_adc_data.rev2_mW);
+
+    /* NOTE: the peak holds are advanced by adc_peak_hold_tick(), not here.
+     * This function also runs from the ADC1 DMA completion interrupt at main
+     * priority 0, and the release step needs expf(); keeping it out of here
+     * keeps libm and the FPU out of the highest priority interrupt. */
 
     g_adc_data.seq++;
 }

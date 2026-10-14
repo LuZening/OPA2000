@@ -55,9 +55,40 @@ static volatile bool  relay_timer_active = false;
 /* Which RELAY does the timer fire on? */
 static volatile bool  relay_timer_close  = false; /* true=close RELAY1 */
 
-/* FAN hysteresis state (read by task, updated by task only). */
+/* FAN hysteresis state (task context only). */
 static FanSpeedType   fan_current_speed  = FAN_SPEED_LOW;
-static bool           fan_speed_increasing = true;
+
+/* g_tx_active is polled by the protection task, the frequency detector
+ * and the GUI, so it has to follow the relay state machine exactly. */
+static void ptt_enter_tx(void)
+{
+    g_tx_active = true;
+}
+
+static void ptt_leave_tx(void)
+{
+    g_tx_active = false;
+}
+
+/*============================================================================
+ *  PTT_OUT (PC15, active high)
+ *
+ *  The feedback to the radio follows the RF path, not the key request:
+ *  it is asserted only once the 15 ms break-before-make has closed RELAY1
+ *  and the PA is genuinely passing RF.  Asserting it earlier would tell
+ *  the radio to key into an amplifier that is not connected yet.
+ *==========================================================================*/
+
+void power_ptt_out_set(bool asserted)
+{
+    if (asserted) PTT_OUT_ON();
+    else         PTT_OUT_OFF();
+}
+
+static void ptt_out_sync(void)
+{
+    power_ptt_out_set(ptt_state == PTT_STATE_TX_RUNNING);
+}
 
 /*============================================================================
  *  HAL timer handles (declared in main.c)
@@ -70,20 +101,22 @@ extern TIM_HandleTypeDef htim5;   /* RELAY delay one-shot */
  *  Private helpers
  *============================================================================*/
 
+/* Arm the TIM5 one-shot that provides the 15 ms break-before-make delay.
+ * The request is re-programmed and the counter restarted on every call:
+ * a new intent must always win, otherwise a PSU-off landing inside the
+ * start-up delay would leave the old "close RELAY1" request pending. */
 static void relay_timer_arm(bool close_relay1)
 {
-    if (!relay_timer_active) {
-        relay_timer_active = true;
-        relay_timer_close  = close_relay1;
+    relay_timer_active = true;
+    relay_timer_close  = close_relay1;
 
-        htim5.Instance->ARR = (htim5.Instance->ARR & 0xFFFF0000U)
-                              | (RELAY_TIM5_PERIOD & 0xFFFFU);
-        htim5.Instance->PSC = (htim5.Instance->PSC & 0xFFFF0000U)
-                              | (RELAY_TIM5_PRESCALER & 0xFFFFU);
-        __HAL_TIM_SET_COUNTER(&htim5, 0);
-        __HAL_TIM_CLEAR_FLAG(&htim5, TIM_FLAG_UPDATE);
-        HAL_TIM_Base_Start_IT(&htim5);
-    }
+    htim5.Instance->ARR = (htim5.Instance->ARR & 0xFFFF0000U)
+                          | (RELAY_TIM5_PERIOD & 0xFFFFU);
+    htim5.Instance->PSC = (htim5.Instance->PSC & 0xFFFF0000U)
+                          | (RELAY_TIM5_PRESCALER & 0xFFFFU);
+    __HAL_TIM_SET_COUNTER(&htim5, 0);
+    __HAL_TIM_CLEAR_FLAG(&htim5, TIM_FLAG_UPDATE);
+    HAL_TIM_Base_Start_IT(&htim5);
 }
 
 static void relay_timer_stop(void)
@@ -142,35 +175,37 @@ void power_set_pump_speed(uint8_t speed_percent)
 
 /**
  * @brief Hysteretic fan speed update.
- *   - speed increasing: thresholds exactly at FAN_TEMP_THRESHOLD_80/100
- *   - speed decreasing: thresholds lowered by FAN_HYSTERESIS (sticky)
+ *
+ * Speed rises at 60 C / 70 C, and falls back only after the temperature has
+ * dropped a full FAN_HYSTERESIS below the rising threshold (i.e. 100 % holds
+ * until <= 60 C, 80 % holds until <= 50 C).  Each level is evaluated in
+ * sequence so a single call can traverse more than one level on a fast
+ * temperature drop.
  */
 void power_update_fan(int16_t temperature_tenth_c)
 {
-    uint8_t new_percent;
-    int16_t thr80 = (int16_t)FAN_TEMP_THRESHOLD_80 * 10;     /* 60.0 C -> 600 */
-    int16_t thr100 = (int16_t)FAN_TEMP_THRESHOLD_100 * 10;    /* 70.0 C -> 700 */
-    int16_t hys = (int16_t)FAN_HYSTERESIS * 10;               /* 10 C -> 100 */
+    const int16_t thr80  = (int16_t)FAN_TEMP_THRESHOLD_80 * 10;   /* 600 */
+    const int16_t thr100 = (int16_t)FAN_TEMP_THRESHOLD_100 * 10;  /* 700 */
+    const int16_t hys    = (int16_t)FAN_HYSTERESIS * 10;         /* 100 */
+    FanSpeedType next = fan_current_speed;
 
-    if (fan_speed_increasing) {
-        if      (temperature_tenth_c >= thr100) new_percent = 100;
-        else if (temperature_tenth_c >= thr80)  new_percent = 80;
-        else                                    new_percent = 50;
-    } else {
-        if      (temperature_tenth_c >= thr100 - hys) new_percent = 100;
-        else if (temperature_tenth_c >= thr80  - hys) new_percent = 80;
-        else                                          new_percent = 50;
+    if (next == FAN_SPEED_HIGH && temperature_tenth_c <= thr100 - hys) {
+        next = FAN_SPEED_MED;
+    }
+    if (next == FAN_SPEED_MED && temperature_tenth_c <= thr80 - hys) {
+        next = FAN_SPEED_LOW;
+    }
+    if (next == FAN_SPEED_LOW && temperature_tenth_c >= thr80) {
+        next = FAN_SPEED_MED;
+    }
+    if (next == FAN_SPEED_MED && temperature_tenth_c >= thr100) {
+        next = FAN_SPEED_HIGH;
     }
 
-    FanSpeedType new_state =
-        (new_percent >= 100) ? FAN_SPEED_HIGH :
-        (new_percent >=  80) ? FAN_SPEED_MED  :
-                                 FAN_SPEED_LOW;
-    if      (new_state > fan_current_speed) fan_speed_increasing = true;
-    else if (new_state < fan_current_speed) fan_speed_increasing = false;
-    fan_current_speed = new_state;
-
-    power_set_fan_speed(new_percent);
+    fan_current_speed = next;
+    power_set_fan_speed((next == FAN_SPEED_HIGH) ? FAN_SPEED_100_PERCENT
+                      : (next == FAN_SPEED_MED)  ? FAN_SPEED_80_PERCENT
+                                                 : FAN_SPEED_50_PERCENT);
 }
 
 /*============================================================================
@@ -190,7 +225,7 @@ void power_init_outputs(void)
     RELAY2_OFF();
     /* Fault output (PB13) = inactive (LOW). */
     RF_IN_PROTECT_CLEAR();
-    /* LPF all 6 (low-active, default = LOW). */
+    /* LPF all 6 idle (LPF is high-active, so LOW = band not selected). */
     HAL_GPIO_WritePin(LPF1_GPIO_Port, LPF1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LPF2_GPIO_Port, LPF2_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LPF3_GPIO_Port, LPF3_Pin, GPIO_PIN_RESET);
@@ -204,8 +239,15 @@ void power_init_outputs(void)
     /* LCD backlight on. */
     power_set_lcd_backlight(true);
 
+    /* Keying feedback to the radio starts released. */
+    power_ptt_out_set(false);
+
     /* Fan default 50% (timer-driven fan_update_fan() may override). */
     power_set_fan_speed(FAN_SPEED_DEFAULT);
+
+    /* Everything is wired to the inactive state above. */
+    g_psu_on    = false;
+    g_tx_active = false;
 }
 
 /*============================================================================
@@ -220,7 +262,7 @@ void power_psu_on(void)
     PWR_ON_ENABLE();
     /* PA bias enable. */
     RF_BIAS_ENABLE();
-    g_power_state = POWER_STATE_STANDBY;
+    g_psu_on = true;
 }
 
 void power_psu_off(void)
@@ -230,7 +272,7 @@ void power_psu_off(void)
     PWR_ON_DISABLE();
     RF_BIAS_DISABLE();
     PSU_ON_PWR_OFF();
-    g_power_state = POWER_STATE_OFF;
+    g_psu_on = false;
 }
 
 void power_relays_tx_on(void)
@@ -239,6 +281,7 @@ void power_relays_tx_on(void)
     RELAY2_ON();   /* connect PA to LPF immediately */
     RELAY1_OFF();  /* hold off RELAY1 for RELAY_DELAY_MS */
     ptt_state = PTT_STATE_TX_STARTING;
+    ptt_enter_tx();
     relay_timer_arm(true);
 }
 
@@ -253,6 +296,7 @@ void power_relays_tx_off(void)
     } else {
         RELAY2_OFF();             /* already idle or stopping */
         ptt_state = PTT_STATE_IDLE;
+        ptt_leave_tx();
     }
 }
 
@@ -273,12 +317,16 @@ void switch_band(BandType band)
     /* Activate only the selected band. */
     GPIO_TypeDef *port = NULL;
     uint16_t pin = 0;
+    /* Band -> LPF.  Lower LPF index == shorter wavelength
+ * (see hw_pinmap.h section 2):
+ *      LPF1 = 15-10 m   LPF2 = 20-17 m   LPF3 = 40-30 m
+ *      LPF4 = 80 m      LPF5 = 160 m     LPF6 = spare                */
     switch (band) {
-        case BAND_160M:    port = LPF5_GPIO_Port; pin = LPF5_Pin; break;
-        case BAND_80M:     port = LPF4_GPIO_Port; pin = LPF4_Pin; break;
-        case BAND_40M_30M: port = LPF3_GPIO_Port; pin = LPF3_Pin; break;
-        case BAND_20M_17M: port = LPF2_GPIO_Port; pin = LPF2_Pin; break;
         case BAND_15M_10M: port = LPF1_GPIO_Port; pin = LPF1_Pin; break;
+        case BAND_20M_17M: port = LPF2_GPIO_Port; pin = LPF2_Pin; break;
+        case BAND_40M_30M: port = LPF3_GPIO_Port; pin = LPF3_Pin; break;
+        case BAND_80M:     port = LPF4_GPIO_Port; pin = LPF4_Pin; break;
+        case BAND_160M:    port = LPF5_GPIO_Port; pin = LPF5_Pin; break;
         case BAND_NONE:
         case BAND_FAULT:
         default:
@@ -306,50 +354,127 @@ void power_set_lcd_backlight(bool enable)
  *  PTT ISR glue (called from EXTI5)
  *============================================================================*/
 
-void power_control_ptt_isr(void)
-{
-    /* PTT_INX active-low. */
-    bool ptt_pressed = (HAL_GPIO_ReadPin(PTT_IN_GPIO_Port, PTT_IN_Pin)
-                        == GPIO_PIN_RESET);
-    ptt_event_flag = ptt_pressed ? 1 : 0;
+/*============================================================================
+ *  PTT keying
+ *
+ *  Every transition lives in its own idempotent helper, and both edge
+ *  sources - the EXTI5 handler and the power_ptt_poll() fallback - call
+ *  the same helpers.  A duplicate edge, or an edge that arrives while the
+ *  state machine already agrees with the pin, is a no-op:
+ *
+ *    repeat press   while TX_STARTING / TX_RUNNING -> no-op
+ *    repeat release while TX_STOPPING / IDLE     -> no-op
+ *
+ *  PTT_INX is ACTIVE LOW: a low level means "transmit requested".
+ *==========================================================================*/
 
-    /* Hard reject during calibration or fault - PTT blocked. */
-    if (!g_allow_rf || g_alert_flag) {
-        /* Force shutdown of any in-flight TX. */
-        if (ptt_state == PTT_STATE_TX_STARTING ||
-            ptt_state == PTT_STATE_TX_RUNNING) {
-            RELAY1_OFF();
-            RELAY2_OFF();
-            relay_timer_stop();
-            ptt_state = PTT_STATE_IDLE;
-        }
+/* Close RELAY2 now, RELAY1 after the 15 ms break-before-make delay. */
+static void ptt_begin_transmit(void)
+{
+    if (ptt_state != PTT_STATE_IDLE) {
+        return;                    /* already keying, or already stopping */
+    }
+    RELAY2_ON();
+    ptt_state = PTT_STATE_TX_STARTING;
+    ptt_enter_tx();
+    relay_timer_arm(true);
+    ptt_out_sync();
+}
+
+/* Open RELAY1 now (RF path broken), RELAY2 after the delay. */
+static void ptt_begin_release(void)
+{
+    if (ptt_state != PTT_STATE_TX_RUNNING &&
+        ptt_state != PTT_STATE_TX_STARTING) {
+        return;                    /* already idle or already stopping */
+    }
+    relay_timer_stop();
+    RELAY1_OFF();
+    ptt_state = PTT_STATE_TX_STOPPING;
+    relay_timer_arm(false);
+    ptt_out_sync();                /* drop the feedback without waiting */
+}
+
+/* Operator re-pressed inside the stop delay: put the RF path straight back. */
+static void ptt_cancel_release(void)
+{
+    if (ptt_state != PTT_STATE_TX_STOPPING) {
         return;
     }
+    relay_timer_stop();
+    RELAY1_ON();
+    ptt_state = PTT_STATE_TX_RUNNING;
+    ptt_out_sync();
+}
 
-    if (ptt_pressed) {
-        /* Start TX */
-        if (ptt_state == PTT_STATE_IDLE) {
-            RELAY2_ON();
-            ptt_state = PTT_STATE_TX_STARTING;
-            relay_timer_arm(true);
-        } else if (ptt_state == PTT_STATE_TX_STOPPING) {
-            /* Cancel stop sequence: re-close RELAY1 immediately. */
-            relay_timer_stop();
-            RELAY1_ON();
-            ptt_state = PTT_STATE_TX_RUNNING;
-        }
-        /* else already TX_RUNNING / TX_STARTING -> ignore */
-    } else {
-        /* Stop TX */
-        if (ptt_state == PTT_STATE_TX_RUNNING ||
-            ptt_state == PTT_STATE_TX_STARTING) {
-            relay_timer_stop();
-            RELAY1_OFF();
-            ptt_state = PTT_STATE_TX_STOPPING;
-            relay_timer_arm(false);
-        }
-        /* else IDLE / TX_STOPPING -> ignore */
+/* Emergency release: both relays now, no delay.  Used when the request is
+ * not allowed (still calibrating, or an alert is latched). */
+static void ptt_force_release(void)
+{
+    if (ptt_state == PTT_STATE_IDLE) {
+        return;
     }
+    RELAY1_OFF();
+    RELAY2_OFF();
+    relay_timer_stop();
+    ptt_state = PTT_STATE_IDLE;
+    ptt_leave_tx();
+    ptt_out_sync();
+}
+
+/* Reconcile the state machine against the live PTT_INX level. */
+static void ptt_apply_level(bool ptt_pressed)
+{
+    if (!g_allow_rf || g_alert_flag) {
+        ptt_force_release();
+        return;
+    }
+    if (ptt_pressed) {
+        if (ptt_state == PTT_STATE_IDLE) {
+            ptt_begin_transmit();
+        } else if (ptt_state == PTT_STATE_TX_STOPPING) {
+            ptt_cancel_release();
+        }
+        /* TX_STARTING / TX_RUNNING -> already there */
+    } else {
+        ptt_begin_release();
+    }
+}
+
+/*============================================================================
+ *  PTT edge sources
+ *==========================================================================*/
+
+void power_control_ptt_isr(void)
+{
+    bool ptt_pressed = power_get_ptt_state();
+
+    ptt_event_flag = ptt_pressed ? 1 : 0;
+    ptt_apply_level(ptt_pressed);
+}
+
+/**
+ * @brief Release-safety fallback for the PTT input.
+ *
+ * The EXTI5 interrupt is the primary path for both edges, but a release
+ * edge that never arrives (IRQ masked, EXTI misrouted, glitch on the line)
+ * would leave the PA keyed indefinitely.  This poll re-reads the pin and
+ * reconciles, so the amplifier comes back within one tick of the operator
+ * letting go.
+ *
+ * Level based and therefore idempotent.  Called from the fast TIM7 tick, so
+ * it must stay interrupt-safe: a GPIO read plus a few comparisons, no
+ * FreeRTOS API and no FPU.  An idle amplifier with the pedal up costs two
+ * comparisons.
+ */
+void power_ptt_poll(void)
+{
+    bool ptt_pressed = power_get_ptt_state();
+
+    if (ptt_state == PTT_STATE_IDLE && ptt_pressed) {
+        return;                    /* nothing keyed and still requested */
+    }
+    ptt_apply_level(ptt_pressed);
 }
 
 int  power_get_ptt_flag(void)        { return ptt_event_flag; }
@@ -371,6 +496,89 @@ void power_relay_timer_callback(void)
     } else if (ptt_state == PTT_STATE_TX_STOPPING && !want_close) {
         RELAY2_OFF();
         ptt_state = PTT_STATE_IDLE;
+        ptt_leave_tx();
     }
     /* any other state: stale timer fire - ignore */
+    ptt_out_sync();
+}
+
+/*============================================================================
+ *  Front-panel power (task context)
+ *==========================================================================*/
+
+void power_init(void)
+{
+    power_init_outputs();
+    power_init_fan_pwm();
+}
+
+void power_on(void)
+{
+    if (g_psu_on) {
+        return;
+    }
+    power_psu_on();
+}
+
+void power_standby(void)
+{
+    if (!g_psu_on) {
+        return;
+    }
+    /* Drop the RF path; the 15 ms delay opens RELAY2. */
+    power_relays_tx_off();
+}
+
+void power_off(void)
+{
+    power_psu_off();          /* opens both relays before dropping HV */
+}
+
+/*============================================================================
+ *  Transmit request from a task source (CAT / serial / front panel)
+ *==========================================================================*/
+
+void power_tx_enable(void)
+{
+    /* Same interlocks the PTT EXTI path applies. */
+    if (!g_psu_on || !g_allow_rf || g_alert_flag) {
+        return;
+    }
+    if (ptt_state == PTT_STATE_IDLE) {
+        power_relays_tx_on();
+        ptt_out_sync();
+    }
+}
+
+void power_tx_disable(void)
+{
+    if (ptt_state == PTT_STATE_TX_RUNNING ||
+        ptt_state == PTT_STATE_TX_STARTING) {
+        power_relays_tx_off();
+        ptt_out_sync();
+    }
+}
+
+bool power_get_ptt_state(void)
+{
+    /* PTT_INX is active low. */
+    return HAL_GPIO_ReadPin(PTT_IN_GPIO_Port, PTT_IN_Pin) == GPIO_PIN_RESET;
+}
+
+/*============================================================================
+ *  Band follow
+ *==========================================================================*/
+
+void power_update_band(uint32_t frequency_hz)
+{
+    BandType band = frequency_to_band(frequency_hz);
+
+    /* BAND_NONE (no signal) and BAND_FAULT (outside every band) both mean
+     * "do not touch the LPF"; moving it would be worse than staying put. */
+    if (band == BAND_NONE || band == BAND_FAULT) {
+        return;
+    }
+    if (band != g_current_band) {
+        switch_band(band);
+    }
 }

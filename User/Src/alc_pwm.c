@@ -59,17 +59,13 @@ void alc_pwm_start(void)
      * TIM2_CH2 triggered DMA streams).  We must therefore use
      * HAL_DMA_Start directly to point to the BSRR register. */
     HAL_DMA_Start(&hdma_tim2_ch1,
-                 (uint32_t *)&alc_bsrr_set,     /* src */
-                 (uint32_t)GPIOG_BSRR_ADDR,     /* dst */
-                 1,                              /* length 1 word */
-                 DMA_PERIPH_TO_MEMORY);          /* actually it's memory-to-periph
-                                                   for ALC PWM. HAL expects
-                                                   TIMx_CHx -> BSRR */
+                 (uint32_t)(uintptr_t)&alc_bsrr_set,   /* src */
+                 (uint32_t)GPIOG_BSRR_ADDR,            /* dst */
+                 1);                                   /* length 1 word */
     HAL_DMA_Start(&hdma_tim2_ch2,
-                 (uint32_t *)&alc_bsrr_reset,
+                 (uint32_t)(uintptr_t)&alc_bsrr_reset,
                  (uint32_t)GPIOG_BSRR_ADDR,
-                 1,
-                 DMA_PERIPH_TO_MEMORY);
+                 1);
 
     HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_1);
     HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_2);

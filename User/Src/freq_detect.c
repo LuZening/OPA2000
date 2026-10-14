@@ -9,7 +9,7 @@
  *            - subtracts the previous count (with 16-bit wrap handling)
  *            - publishes g_radio_freq_hz = delta * 10000
  *            - if freq > 1 MHz and measured band != g_current_band and
- *              g_power_state == TX, calls protection_trigger_locked()
+ *              g_tx_active, calls protection_trigger_locked()
  *              with ALERT_FREQ_MISMATCH.
  *
  *          The task-side wrapper freq_detect_check() runs in the
@@ -111,7 +111,7 @@ void freq_detect_isr(void)
     /* Band-mismatch check only valid when we have a real signal and
      * the amp is currently transmitting. */
     if (freq >= FREQDET_MIN_VALID_FREQ_HZ &&
-        g_power_state == POWER_STATE_TX &&
+        g_tx_active &&
         !s_mismatch_latched) {
         BandType measured = frequency_to_band(freq);
         if (measured != BAND_NONE &&
@@ -135,7 +135,7 @@ void freq_detect_check(void)
     /* Alert state machine: clear the latch once conditions normalise. */
     if (s_mismatch_latched) {
         if (s_measured_freq < FREQDET_MIN_VALID_FREQ_HZ ||
-            g_power_state != POWER_STATE_TX) {
+            !g_tx_active) {
             /* Signal gone or no longer transmitting - clear latch. */
             s_mismatch_latched = false;
             s_mismatch_alerted = false;

@@ -1,11 +1,15 @@
 /**
  * @file key.c
  * @brief Button Input Processing Implementation
- * @note Supports 6 buttons via PCA9539 I/O expander with debounce and short/long press detection
+ * @note 6 buttons: KEY1 on PC13 (PWR_WKUP4) keeps a real GPIO so the
+ *       wake-up path survives; KEY2..KEY6 share one ADC1_INP17 (PA1) node
+ *       through a resistor ladder, so only one of them can be read per scan.
+ *       The old PCA9539 I2C expander is gone from the hardware.
  */
 
 #include "key.h"
-#include "pca9539.h"
+#include "gui.h"
+#include "power_control.h"
 #include <string.h>
 
 /*============================================================================
@@ -16,11 +20,10 @@ static bool key_initialized = false;
 static KeyCallback key_callback = NULL;
 
 /* Key state array - one entry per key */
-static KeyInfoType key_info[6];
+static KeyInfoType key_info[KEY_COUNT];
 
-/* Raw button state from PCA9539 */
-static uint8_t key_raw_state = 0;
-static uint8_t key_last_raw_state = 0;
+/* Which key is down right now, KEY_NONE if none. */
+static uint8_t key_active = KEY_NONE;
 
 /* Timing */
 static uint32_t key_last_scan_tick = 0;
@@ -45,11 +48,41 @@ void key_init(void)
         return;
     }
 
-    /* Initialize key info */
     memset(key_info, 0, sizeof(key_info));
 
+    key_active      = KEY_NONE;
     key_initialized = true;
     key_last_scan_tick = HAL_GetTick();
+}
+
+/**
+ * @brief Decode an ADC1_INP17 code into a key id
+ *
+ * Descending ladder: the highest tap below the idle level is the key that was
+ * pressed.  Anything above KEY_ADC_IDLE_MIN is the pull-up with no key down.
+ */
+uint8_t key_decode_adc(uint16_t code)
+{
+    if (code >= KEY_ADC_IDLE_MIN) {
+        return KEY_NONE;
+    }
+    if (code >= KEY_ADC_TAP_MENU) {
+        return KEY_MENU;
+    }
+    if (code >= KEY_ADC_TAP_BAND) {
+        return KEY_BAND;
+    }
+    if (code >= KEY_ADC_TAP_LEFT) {
+        return KEY_LEFT;
+    }
+    if (code >= KEY_ADC_TAP_RIGHT) {
+        return KEY_RIGHT;
+    }
+    if (code >= KEY_ADC_TAP_ENTER) {
+        return KEY_ENTER;
+    }
+    /* Below the lowest tap: shorted or floating node, not a key. */
+    return KEY_NONE;
 }
 
 /**
@@ -72,50 +105,43 @@ void key_process(void)
     }
     key_last_scan_tick = current_tick;
 
-    /* Read current raw state from PCA9539 */
-    uint8_t port_data;
-    if (pca9539_read_input(PCA9539_PORT0, &port_data)) {
-        /* Buttons are active low (pulled up), invert */
-        key_raw_state = (uint8_t)(~port_data) & 0x3F;  /* Only use bits 0-5 */
+    /* KEY1 is a plain GPIO, active low (pull-up).  It is deliberately not
+     * derived from the ADC: it doubles as the PWR_WKUP4 wake source. */
+    pressed = (HAL_GPIO_ReadPin(KEY1_WKUP_GPIO_Port, KEY1_WKUP_Pin) == GPIO_PIN_RESET);
+
+    if (pressed) {
+        /* Power key wins over the ladder: it can wake the unit from standby,
+         * and a simultaneous ladder reading is almost certainly noise. */
+        key_active = KEY_POWER;
     } else {
-        /* I2C error - keep last state */
-        return;
+        key_active = key_decode_adc(g_adc_data.key_adc);
     }
 
-    /* Check each key */
-    for (i = 0; i < 6; i++) {
-        pressed = (key_raw_state & (1 << i)) ? true : false;
+    for (i = 0; i < KEY_COUNT; i++) {
+        bool now_pressed = (key_active == i);
 
         /* Detect edge */
-        bool last_pressed = (key_last_raw_state & (1 << i)) ? true : false;
+        bool last_pressed = (key_info[i].state != KEY_STATE_IDLE) &&
+                            (key_info[i].state != KEY_STATE_DEBOUNCING);
 
-        if (pressed != last_pressed) {
-            /* State changed */
-            if (pressed) {
-                /* Key pressed - start debounce */
-                key_info[i].state = KEY_STATE_DEBOUNCING;
-                key_info[i].press_start_tick = current_tick;
-                key_info[i].longpress_sent = false;
-                key_info[i].repeat_sent = false;
-            } else {
-                /* Key released */
-                if (key_info[i].state == KEY_STATE_PRESSED) {
-                    /* Short press completed */
-                    key_notify_callback(i, KEY_EVENT_SHORTPRESS);
-                } else if (key_info[i].state == KEY_STATE_LONGPRESS) {
-                    /* Long press released */
-                    key_notify_callback(i, KEY_EVENT_RELEASED);
-                }
-                key_info[i].state = KEY_STATE_IDLE;
+        if (now_pressed && !last_pressed) {
+            key_info[i].state = KEY_STATE_DEBOUNCING;
+            key_info[i].press_start_tick = current_tick;
+            key_info[i].longpress_sent = false;
+            key_info[i].repeat_sent = false;
+        } else if (!now_pressed && last_pressed) {
+            /* Key released */
+            if (key_info[i].state == KEY_STATE_PRESSED) {
+                key_notify_callback(i, KEY_EVENT_SHORTPRESS);
+            } else if (key_info[i].state == KEY_STATE_LONGPRESS) {
+                key_notify_callback(i, KEY_EVENT_RELEASED);
             }
+            key_info[i].state = KEY_STATE_IDLE;
         }
 
         /* Process based on current state */
-        key_process_single(i, pressed);
+        key_process_single(i, now_pressed);
     }
-
-    /* Update last raw state for next cycle */
-    key_last_raw_state = key_raw_state;
 }
 
 /**
@@ -223,10 +249,10 @@ void key_register_callback(KeyCallback callback)
  */
 bool key_is_pressed(uint8_t key)
 {
-    if (key > 5) {
+    if (key >= KEY_COUNT) {
         return false;
     }
-    return (key_raw_state & (1 << key)) ? true : false;
+    return (key_active == key);
 }
 
 /**
@@ -235,8 +261,7 @@ bool key_is_pressed(uint8_t key)
 void key_reset(void)
 {
     memset(key_info, 0, sizeof(key_info));
-    key_last_raw_state = 0;
-    key_raw_state = 0;
+    key_active = KEY_NONE;
 }
 
 /*============================================================================
@@ -250,25 +275,17 @@ void key_reset(void)
  */
 void key_power_action(KeyEventType event)
 {
-    extern void power_standby(void);
-    extern void power_on(void);
-    extern void power_off(void);
-    extern volatile PowerStateType g_power_state;
-
     switch (event) {
         case KEY_EVENT_SHORTPRESS:
-            {
-                PowerStateType state = g_power_state;
-                if (state == POWER_STATE_STANDBY) {
-                    /* Already in standby, power off */
-                    power_off();
-                } else if (state == POWER_STATE_OFF) {
-                    /* Power on to standby */
-                    power_on();
-                } else {
-                    /* In TX state, go to standby */
-                    power_standby();
-                }
+            if (g_tx_active) {
+                /* Transmitting, drop back to ready */
+                power_standby();
+            } else if (g_psu_on) {
+                /* Already in standby, power off */
+                power_off();
+            } else {
+                /* Powered down, power on to standby */
+                power_on();
             }
             break;
 
@@ -288,8 +305,6 @@ void key_power_action(KeyEventType event)
  */
 void key_menu_action(KeyEventType event)
 {
-    extern void gui_toggle_menu(void);
-
     if (event == KEY_EVENT_SHORTPRESS) {
         gui_toggle_menu();
     }
@@ -301,8 +316,6 @@ void key_menu_action(KeyEventType event)
  */
 void key_band_action(KeyEventType event)
 {
-    extern void gui_toggle_band_popup(void);
-
     if (event == KEY_EVENT_SHORTPRESS) {
         gui_toggle_band_popup();
     }
@@ -314,8 +327,6 @@ void key_band_action(KeyEventType event)
  */
 void key_left_action(KeyEventType event)
 {
-    extern void gui_focus_prev(void);
-
     if (event == KEY_EVENT_SHORTPRESS) {
         gui_focus_prev();
     }
@@ -327,8 +338,6 @@ void key_left_action(KeyEventType event)
  */
 void key_right_action(KeyEventType event)
 {
-    extern void gui_focus_next(void);
-
     if (event == KEY_EVENT_SHORTPRESS) {
         gui_focus_next();
     }
@@ -340,8 +349,6 @@ void key_right_action(KeyEventType event)
  */
 void key_enter_action(KeyEventType event)
 {
-    extern void gui_enter_pressed(void);
-
     if (event == KEY_EVENT_SHORTPRESS) {
         gui_enter_pressed();
     }

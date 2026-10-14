@@ -115,8 +115,8 @@ void fan_tach_calculate_rpm(void)
     __enable_irq();
 
     /* RPM = count * 60 / (poles * window_seconds)
-     *      = count * 60 / (2 * 0.1)
-     *      = count * 300  */
-    s_fan_rpm  = fan_count  * 60U / (FAN_POLES * FAN_WINDOW_MS / 1000U);
-    s_pump_rpm = pump_count * 60U / (FAN_POLES * FAN_WINDOW_MS / 1000U);
+     *      = count * 60 * 1000 / (poles * window_ms)
+     *      = count * 60000 / (2 * 100) = count * 300             */
+    s_fan_rpm  = fan_count  * 60U * 1000U / (FAN_POLES * FAN_WINDOW_MS);
+    s_pump_rpm = pump_count * 60U * 1000U / (FAN_POLES * FAN_WINDOW_MS);
 }

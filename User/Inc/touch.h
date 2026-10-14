@@ -38,6 +38,15 @@ typedef struct {
     bool pressed;
 } TouchPointType;
 
+/* Which controller answered on the bus.  The board carries an NS2009
+ * (resistive); an external GT911 (capacitive) can be attached over the FPC.
+ * Detection order is capacitive first, resistive as the fallback. */
+typedef enum {
+    TOUCH_NONE = 0,
+    TOUCH_RESISTIVE,      /* NS2009, on board  */
+    TOUCH_CAPACITIVE,     /* GT911, on FPC1    */
+} TouchType;
+
 /* Calibration points (5-point) */
 #define CAL_POINT_COUNT  5
 
@@ -45,6 +54,13 @@ typedef struct {
     uint16_t x;   /* Screen x position */
     uint16_t y;   /* Screen y position */
 } CalPointType;
+
+/*============================================================================
+ * Global state
+ *============================================================================*/
+
+/* Which controller answered on the bus.  Set once by touch_init(). */
+extern volatile TouchType g_touch_type;
 
 /*============================================================================
  * Function Prototypes

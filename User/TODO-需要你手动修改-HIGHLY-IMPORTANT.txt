@@ -1,0 +1,334 @@
+========================================================================
+  ！！！！！  需要你手动修改 —— GUI/LTDC 相关 ！！！！！
+  FILE:  TODO-需要你手动修改-HIGHLY-IMPORTANT.txt
+  请勿忽略此文件。里面每一项我都没有权限或无法安全自动修改。
+========================================================================
+
+日期：2026-10-13
+提出人：GUI 开发（TRAE）
+状态：等待你处理
+
+
+------------------------------------------------------------------------
+[1] 【阻塞】ARM 工具链文件已损坏 —— 固件完全无法编译
+------------------------------------------------------------------------
+文件： cmake/gcc-arm-none-eabi.cmake
+
+现象：整个文件的所有换行符被删除了，2244 字节全部挤在一行。
+      CMake 报错：
+        Parse error.  Expected a newline, got identifier with text "set".
+
+原因：文件被某个工具以错误编码/换行方式重写过。
+
+影响：cmake --preset=Debug 直接失败，连 configure 都过不去，
+      更不用说编译。GUI 代码目前只在 PC 模拟器上验证过，
+      目标板从未编译过。
+
+为什么我没改：这个文件在 User/ 目录之外。按你的规则
+      "其他目录下代码由 CubeMX 自动生成，不可修改"。
+      我不确定它是被 CubeMX 生成的还是手写的，
+      所以不敢动。请你确认后手动修复，或授权我重写。
+
+修复建议：把内容按下面的正常格式重新写一遍即可
+      （注意：每行一条 set()，不要合并）：
+
+      set(CMAKE_SYSTEM_NAME               Generic)
+      set(CMAKE_SYSTEM_PROCESSOR          arm)
+      set(CMAKE_C_COMPILER_ID GNU)
+      set(CMAKE_CXX_COMPILER_ID GNU)
+      set(TOOLCHAIN_PREFIX                arm-none-eabi-)
+      set(CMAKE_C_COMPILER                ${TOOLCHAIN_PREFIX}gcc)
+      set(CMAKE_ASM_COMPILER              ${CMAKE_C_COMPILER})
+      set(CMAKE_CXX_COMPILER              ${TOOLCHAIN_PREFIX}g++)
+      set(CMAKE_LINKER                   ${TOOLCHAIN_PREFIX}g++)
+      set(CMAKE_OBJCOPY                  ${TOOLCHAIN_PREFIX}objcopy)
+      set(CMAKE_SIZE                     ${TOOLCHAIN_PREFIX}size)
+      set(CMAKE_EXECUTABLE_SUFFIX_C      ".elf")
+      set(CMAKE_TRY_COMPILE_TARGET_TYPE  STATIC_LIBRARY)
+      set(TARGET_FLAGS "-mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard ")
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${TARGET_FLAGS}")
+      set(CMAKE_ASM_FLAGS "${CMAKE_C_FLAGS} -x assembler-with-cpp -MMD -MP")
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -fdata-sections -ffunction-sections -fstack-usage")
+      set(CMAKE_C_FLAGS_DEBUG   "-O0 -g3")
+      set(CMAKE_C_FLAGS_RELEASE "-O2 -g0")
+      set(CMAKE_EXE_LINKER_FLAGS "${TARGET_FLAGS}")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T \"${CMAKE_SOURCE_DIR}/STM32H7B0XX_FLASH.ld\"")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --specs=nano.specs")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-Map=${CMAKE_PROJECT_NAME}.map -Wl,--gc-sections")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--print-memory-usage")
+      set(TOOLCHAIN_LINK_LIBRARIES "m")
+
+
+------------------------------------------------------------------------
+[2] 【阻塞】LTDC 仍然是 800x480 的配置，必须改成 480x272
+------------------------------------------------------------------------
+文件： Core/Src/ltdc.c   （CubeMX 生成，请改 .ioc 后重新生成）
+
+当前值（800x480）           需要改成（480x272）
+--------------------------  --------------------------
+WindowX1        = 800       WindowX1        = 480
+WindowY1        = 480       WindowY1        = 272
+ImageWidth      = 800       ImageWidth      = 480
+ImageHeight     = 480       ImageHeight     = 272
+AccumulatedActiveW = 814    AccumulatedActiveW = 494   (480+14)
+AccumulatedActiveH = 485    AccumulatedActiveH = 277   (272+5)
+TotalWidth      = 820       TotalWidth      = 500   (480+20)
+TotalHeigh      = 487       TotalHeigh      = 279   (272+7)
+FBStartAdress   = 0x24000000  ← 必须与链接脚本一致，见 [3]
+
+HorizontalSync / VerticalSync / HBP / VBP 这几个值取决于
+你手上这块屏的时序 datasheet，我无法替你决定，请按屏手册填。
+
+为什么我没改：Core/Src/ltdc.c 由 CubeMX 自动生成，
+      直接改源码会在下次 regenerate 时被覆盖。
+      正确做法是在 OPA2000_h7.ioc 里改 LTDC 参数后重新生成。
+
+
+------------------------------------------------------------------------
+[3] 【需确认】链接脚本里的 .framebuffer / .lvgl_buffer 区域
+------------------------------------------------------------------------
+文件： STM32H7B0XX_FLASH.ld
+
+现状：这两个 section 已经存在，都放在 RAM（0x24000000，960KB）里，
+      这一部分没问题，LVGL 和 LTDC 都能访问。
+
+需要你确认：
+  a) RAM 总共 960KB。新的缓冲区占用：
+       .framebuffer  480x272x2 = 261,120 字节
+       .lvgl_buffer  480x136x2 = 130,560 字节
+       合计                        391,680 字节（约 383KB）
+     剩余约 577KB 给堆栈和其它变量。请用 --print-memory-usage
+     实际跑一次链接确认没有溢出（CMakeLists 里已经加了这个选项）。
+
+  b) 链接脚本里的注释还写着旧尺寸
+     "480 x 800 x 2 bytes = 768,000 bytes" 和
+     "480 x 160 x 2 bytes = 153,600 bytes"
+     建议改成实际的 480x272 / 480x136，避免以后误导。
+     这只是注释，不影响功能，但请顺手更新。
+
+
+------------------------------------------------------------------------
+[4] 【需确认】.framebuffer 的物理地址要和 LTDC FBStartAdress 一致
+------------------------------------------------------------------------
+现在的写法：
+  lv_port_disp.c 里用数组名取址：
+      static uint16_t __attribute__((section(".framebuffer")))
+          ltdc_framebuffer[480*272];
+  链接脚本把 .framebuffer 放在 RAM 的哪个位置，
+  LTDC 的 FBStartAdress 就必须填那个绝对地址。
+
+CubeMX 默认给的是 0x24000000，但那段 RAM 起始处通常还有别的用途，
+所以两者很可能对不上。
+
+两种做法（选一种）：
+  方案A（推荐，不用改 ioc）：
+    在链接脚本里加一个导出符号，然后在 ltdc.c 的
+    /* USER CODE BEGIN LTDC_Init 2 */ 里写：
+        extern uint32_t _framebuffer_start;
+        hltdc.LayerCfg[0].FBStartAdress = _framebuffer_start;
+    这样地址永远跟着链接结果走，不会错。
+
+  方案B：
+    手工算好 .framebuffer 在 RAM 里的偏移，
+    把这个绝对值填进 ioc 的 LTDC layer 配置里。
+
+
+------------------------------------------------------------------------
+[5] 【提醒】CMakeLists.txt 的源文件列表和实际文件对不上
+------------------------------------------------------------------------
+文件： CMakeLists.txt
+
+列了但不存在的文件（会导致链接失败）：
+    User/Src/eeprom.c
+    User/Src/pca9539.c
+
+存在但没有列进去的文件（代码写了但不会被编译）：
+    User/Src/alc_pwm.c
+    User/Src/buzzer.c
+    User/Src/fan_tach.c
+    User/Src/freq_detect.c   （可能已经列了，请确认）
+    User/Src/probe.h 相关
+
+另外 app_tasks.c 里调用了几个不存在的函数，编译会报错：
+    adc_process_data()      -> 头文件里叫 adc_process()
+    power_init()            -> 头文件里叫 power_init_fan_pwm()
+    power_tx_enable()       -> 头文件里叫 power_relays_tx_on()
+    power_tx_disable()      -> 头文件里叫 power_relays_tx_off()
+    power_get_ptt_state()   -> 头文件里没有，需要自己加
+    power_update_band()     -> 头文件里没有，需要自己加
+    power_play_alert()      -> 头文件里没有，需要自己加
+    power_set_buzzer()      -> 头文件里没有，需要自己加
+    pca9539_init/process/get_buttons -> pca9539.c 不存在
+
+这些属于 Control agent 的范围，但会阻塞整体链接，
+需要和负责那部分的人对齐。
+
+
+------------------------------------------------------------------------
+[6] 【提醒】git 仓库找不到
+------------------------------------------------------------------------
+你之前说 "我在../../目录下创建了git"。
+我在 E:\Projects\RADIO 和 E:\Projects\RADIO\Projects\OPA2000
+都执行了 git 命令，都返回 "not a git repository"。
+
+所以这次改动我无法提交。请确认 git 仓库实际位置，
+或者告诉我是否需要我执行 git init。
+
+
+========================================================================
+  以上 1~4 项不处理的话，GUI 代码无法在目标板上跑起来。
+  1 和 2 是硬阻塞。
+========================================================================
+
+
+========================================================================
+  以下是 2026-10-13 第二轮检查 GUI 主界面时新发现的问题
+========================================================================
+
+------------------------------------------------------------------------
+[7] 【阻塞】config.c 整个文件和新的 ConfigType 不匹配，编译不过
+------------------------------------------------------------------------
+文件： User/Src/config.c
+
+现象：config.c 里还在用早已删除的旧字段，例如：
+        g_config.touch_cal.x_slope        (旧: float)
+        g_config.touch_cal.x_offset       (旧: float)
+        g_config.protect_reflect_power2_w (旧: float)
+        g_config.cal_tx_power1.forward_slope (旧)
+        ...
+      而 opa2000.h 里的 ConfigType 已经改成了：
+        g_config.touch.x_a_q10 / x_b_q10 (Q10.10 定点)
+        g_config.band_rev2_max_w 等 (uint16_t)
+        g_config.fwd1.a_q16 / b_mW (coupler_t)
+
+      这些字段现在都不存在了，config.c 一编译就是一堆错误。
+
+      注意：User/Inc/config.h 里还有另一个 config_t 结构体
+      （band_protection_t / coupler_calib_t / touch_calib_t 那套），
+      和 opa2000.h 里的 ConfigType 是两套不同的东西。
+      现在项目里 config.h 和 ConfigType 并存，很混乱。
+      需要你决定保留哪一套，我再把 config.c 对齐。
+
+影响：config_init / config_save / config_load 全部无法编译。
+      触屏校准结果和耦合器校准参数都存不下去。
+
+我已做的：GUI 侧已经改成用新字段了
+      (g_config.touch.x_a_q10 / g_config.fwd1.a_q16 等)，
+      等你把 config.c 对齐后就能直接编译通过。
+
+
+------------------------------------------------------------------------
+
+
+========================================================================
+  2026-10-13 第三轮：GUI 已按你的 4 条指示改完
+========================================================================
+
+[已解决] 8. protocol_detector
+    你确认 comm_get_radio_type() 就是正确接口。
+    GUI 已经在用它了，无需再改。显示效果：
+        有协议 -> "协议: ICOM"    绿色
+        无协议 -> "协议: 未连接"   灰色
+    如果 Control agent 之后把它换成真正的探测结果，GUI 那边
+    只需要保证 comm_get_radio_type() 返回推断出来的类型即可，
+    gui.c 一行都不用动。
+
+[已解决] 9. peak 变量的命名（我不管算法，只消费）
+    变量名已经定好，放在 User/Inc/opa2000.h 的 AdcDataType 里：
+
+        volatile int32_t fwd2_peak_mW;   /*!< 耦合器2 发射功率峰值, 毫瓦 */
+        volatile int32_t rev2_peak_mW;   /*!< 耦合器2 反射功率峰值, 毫瓦 */
+        volatile int32_t swr_x100;       /*!< 瞬时 SWR x100（不是峰值） */
+
+    约定：
+      - 只有 user_adc.c（Control agent）写这两个 peak 变量。
+      - GUI 只读，绝不写。
+      - GUI 上的 SWR 由这两个峰值现算，保证三条进度条数值一致：
+            calculate_swr_x100(fwd2_peak_mW, rev2_peak_mW)
+      - 缓降算法、下降速率、非发射时是否清零，全部由你决定，
+        我不再实现。user_adc.c 里只留了一行注释说明这一点。
+
+[已解决] 10. gui_init() 重复调用
+    按你说的，只保留 task 侧：
+      - Core/Src/main.c 的 USER CODE 2 里已删除 gui_init()，
+        换成一行注释说明由 GUI task 负责。
+      - app_tasks.c 的 app_gui_task() 里保留唯一一次调用。
+    这样 lv_init() 只跑一次，"already inited" 警告消失。
+
+[已解决] 2. 定点数全部去掉
+    按你的要求，能用 float 就用 float，精度不够的地方改用更小的单位：
+
+    触屏校准  User/Inc/opa2000.h  touch_cal_t   （原来是 Q10.10 定点）
+        float x_gain, x_offset, y_gain, y_offset;
+        uint8_t calibrated;
+        用法：screen = raw * gain + offset
+
+    耦合器校准 coupler_t                      （原来是 Q16.16 定点）
+        int32_t gain_uW_per_code;   /* 斜率：每个ADC码对应多少微瓦 */
+        int32_t offset_mW;          /* 截距：毫瓦 */
+        用法：power_mW = raw * gain_uW_per_code / 1000 + offset_mW
+        斜率用"微瓦/码"存，既是精确整数，又不用写定点。
+
+    保护阈值  band_im_max_a  ->  band_im_max_mA   （安培 -> 毫安）
+    温度单位  新增 uint8_t temp_fahrenheit 存进 ConfigType，
+              语言菜单里切换后立刻 config_save()，掉电不丢。
+
+    注意：改了 ConfigType 的字段名和类型，config.c 必须同步改，
+          见上面第 [7] 项。
+
+========================================================================
+
+================================================================
+
+========================================================================
+  2026-10-14 第四轮：peak 变量已按新要求重做（第二版）
+========================================================================
+
+[已解决] 9. peak 变量 —— Control 已实现，GUI 可直接用
+    变量名沿用你定的，已在 User/Inc/opa2000.h 的 AdcDataType：
+
+        volatile int32_t fwd2_peak_mW;   /* 耦合器2 发射功率峰值, 毫瓦 */
+        volatile int32_t rev2_peak_mW;   /* 耦合器2 反射功率峰值, 毫瓦 */
+
+    swr_x100 仍是瞬时值，你用两个 peak 现算 SWR 的做法照旧可行：
+        calculate_swr_x100(fwd2_peak_mW, rev2_peak_mW)
+
+    算法（你说由我决定）：
+        out[n] = max(sample[n], out[n-1] × exp(-dt / tau))
+        tau = 500 ms
+      · attack 瞬时：新值更大立刻跳上去
+      · release 指数：500ms 后剩 36.8%，1.5s 后剩 5%，5s 后剩 0.67%
+      · 已改用 float + expf()，不再是定点数
+
+    ★ 与上一版不同的两点，请注意 ★
+
+    (1) 完全不受按键 / g_tx_active 影响。
+        peak 表是"仪器读数"，客观反映耦合器测到的东西，不是按键状态的
+        函数：
+          · 空闲时读数为 0，peak 自己按 tau 淡出到 0；
+          · 空闲时读数非 0（前端噪声/耦合器故障/外部漏进来的 RF），
+            就如实显示出来 —— 这正是操作员需要看到的，不该被藏起来。
+        上一版做的"按键上升沿清零""未按键不采样"都已删除，因为那会让
+        读数在跟射频无关的时刻跳变，反而不是客观反映。
+
+    (2) 驱动函数换了，请不要在中断里调用：
+            void adc_peak_hold_tick(void);
+        由 ADC task（app_tasks.c，50ms）调用一次。
+        原因：adc_process() 同时挂在 ADC1 DMA 完成中断（主优先级 0）上，
+        而 release 需要 expf()。把 peak 放在 task 里跑，优先级 0 的中断
+        就不会碰 libm 和 FPU。
+        adc_process() 本身仍会照常在中断里跑（那是保护判定需要的），
+        它只负责更新瞬时值 fwd2_mW / rev2_mW。
+
+    写入方：只有 User/Src/user_adc.c。
+    读取方：GUI。请勿写这两个字段。
+
+    测试：User/Tests/test_user_adc.c 里 14 个 peak 用例，其中专门覆盖
+    "按键状态不影响结果""按键跳变不清零""空闲非零读数如实显示"
+    "中断/task 两种发布节奏结果一致"。
+
+    另外提醒：ConfigType 字段名/类型上轮被 Control 改过（见下面第 [2]
+    项），config.c 必须同步改，见第 [7] 项。那是让固件能编译的前提，
+    优先级高于本次 peak 接入。
+
+========================================================================

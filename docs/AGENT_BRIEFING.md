@@ -155,33 +155,122 @@ ioc 现状没有 ADC1_2/COMP/EXTI15_10 的 NVIC 行 → **必须打开 CubeMX �
 
 ---
 
-## 5. 保护逻辑要点（GUI 显示弹窗时要知道）
+## 5. 保护逻辑（Control 已实现；GUI / Networking 需要配合的部分见 5.4 / 5.5）
 
-### 5.1 触发源（ISR 中判定，task 中响应）
+> Control 侧已全部实现并有 host 单元测试覆盖（`User/Tests/test_protection.c`，27 个用例）。
+> **你们不需要重写判定逻辑，只需要做"告知用户 + 解除"这两件事。**
 
-| 来源 | 阈值/动作 |
-|---|---|
-| AWD1（CH4）| RF 输入超限，按波段表 10~20W |
-| AWD2（CH5）| 主电流 > 30A |
-| AWD3（CH6）| REV1 > 800W（硬件最后防线）|
-| COMP1 | RF1 过驱（COMP1 正输入=PB2=ADC1_INP4）|
-| COMP2 | 主电流过流（COMP2 正输入=PE9=ADC1_INP5）|
-| EXTI12 (HARDPWR_ERR PB12) | 电源故障 |
-| 软件判读 | REV2 > 400W、REV2>200W 且 SWR>2.0、FWD1>1100W、FWD2>1050W、NTC>90℃ |
+### 5.1 触发源
 
-### 5.2 保护动作（ISR 中执行，**0 延迟**）
+**数字量**（EXTI 中断，高电平有效，中断里直接取消发射并断电）
 
-1. 释放 PTT（拒响应 PTT_INX）
-2. 释放 RELAY1/RELAY2
-3. 拉高 PB13 (RF_IN_PROTECT_CPU_SIG)
-4. 拉低 PG7 (PWR_ON_SIG) 关闭高压
-5. 置位 volatile 告警 flag（GUI task 后续读）
+| 来源 | 引脚 | 语义 |
+|---|---|---|
+| HARDPWR_ERR | PB12 / EXTI12 | 电源板报警，**高电平有效**；ISR 内会重读引脚，伪边沿不动作 |
+| （预留）RF deck 故障线 | 待定 | `protection_digital_isr(cause)` 是通用入口，加线只调它，不改关断路径 |
 
-GUI 显示告警时直接读 `volatile` 标志位，**不要在 GUI task 里轮询 ADC 数值判保护**。
+**模拟量**
+
+| 通道 | 判定方式 | 阈值 |
+|---|---|---|
+| IMain | AWD2（CH5）硬件看门狗中断 | 30 A |
+| REV1 | AWD3（CH6）硬件看门狗中断 | 800 W |
+| RF 输入 | AWD1（CH4）硬件看门狗中断 | 按波段表 |
+| REV2 | **ADC1 DMA 完成中断**（无 AWD） | 400 W |
+| FWD1 | **ADC1 DMA 完成中断**（无 AWD） | 1100 W |
+| FWD2 | **ADC1 DMA 完成中断**（无 AWD） | 1050 W |
+| NTC | **ADC2 注入完成中断**（无 AWD） | 90.0 ℃ |
+
+组合规则：`REV2 > 200 W 且 SWR > 2.0` 也报 `ALERT_SWR_HIGH`。
+耦合器编号约定：coupler 1 = PA→LPF，coupler 2 = LPF→天线；**GUI 上显示的是 coupler 2**。
+另有 COMP1（RF 过驱）/ COMP2（主电流过流）走 `protection_comp1_isr()` / `protection_comp2_isr()`。
+最后 `protection_check()`（Control task 100 ms tick）把所有比较再兜一遍底。
+
+### 5.2 保护动作（中断上下文执行，**0 延迟**，只有第一次触发生效）
+
+1. `RELAY1_OFF` + `RELAY2_OFF` + `PTT_OUT` 拉低（PC15，高有效）+ `ptt_state = IDLE`
+2. `PWR_ON_DISABLE()`（PG7，断高压）
+3. `RF_BIAS_DISABLE()`（PG2，断 PA 偏置）
+4. `RF_IN_PROTECT_RAISE()`（PB13 拉高，通知 RF 板执行自己的保护）
+5. `buzzer_start()`（TIM15 PWM 三音阶警示，循环播放）
+6. `g_alert_active = 原因`、`g_alert_flag = true`、`g_allow_rf = false`、`g_tx_active = false`
+
+只要 `g_alert_flag` 为真，任何 PTT 路径都会被拒绝（EXTI PTT、轮询兜底、`power_tx_enable()` 全部拒动）。
 
 ### 5.3 故障锁存总线 RF_IN_PROTECT_MIXED
 
 PE12 (COMP1_OUT) → D1、PE8 (COMP2_OUT) → D6、PB13 → D7，三只二极管线或。任何一路拉高都触发外部硬件锁存（功放板切断）。
+
+### 5.4 【GUI Agent 必做】告警弹窗与解除
+
+保护一旦触发就**锁存**，不会自动恢复。以下两步必须由 GUI 完成：
+
+**第一步：弹窗**
+
+- 在 GUI task 里轮询这两个 volatile（**不要**在 GUI 里重新判 ADC 数值）：
+  ```c
+  extern volatile bool      g_alert_flag;      /* 已锁存 */
+  extern volatile AlertType g_alert_active;    /* 故障原因 */
+  bool protection_is_active(void);
+  const char *protection_get_fault_string(AlertType a);  /* 英文短语 */
+  ```
+- `g_alert_flag` 由 false 变 true 的瞬间弹一个**模态**告警框，标题/正文用
+  `protection_get_fault_string(g_alert_active)`。
+- 弹窗期间要**每帧持续重绘/保持**，因为蜂鸣器在后台循环鸣响，弹窗是用户唯一的静态提示。
+- 多语言：这条短语要走 i18n 字典（§7.4），不要硬编码。
+- 同一故障只弹一次：自己保存"已弹过"标志，否则 100 ms 一次的 `protection_check()`
+  不会重复触发（锁存后函数直接 return），但你自己别每帧重建对象。
+- **弹窗显示期间不要调用任何能改 `g_alert_*` 的函数**，否则用户还没点确定就被解除了。
+
+**第二步：解除**
+
+用户点"确定/知道了"之后：
+
+```c
+protection_clear();
+```
+
+`protection_clear()` 做了三件事，**你不用重复做**：
+- 复位内部锁存 + `g_alert_active = ALERT_NONE`、`g_alert_flag = false`
+- 拉低 PB13（`RF_IN_PROTECT_CLEAR()`），通知 RF 板保护已解除
+- `buzzer_stop()`（TIM15 PWM 停，蜂鸣器静音）
+
+**解除后仍然不会自动恢复发射**，这是有意为之：
+
+- `g_allow_rf` 保持 `false`，必须让用户重新跑一次 IM 零点校准才重新允许发射。
+- `g_psu_on` **不会**被保护清掉，电源指示灯仍是"就绪"。如果你的"一键恢复"流程需要
+  重新上电，请显式调 `power_off()` → `power_on()`，不要去改 `g_psu_on`。
+
+**如果你要做"一键复位"**：只能在用户长按确认（防误触）后，先 `power_off()`、
+再 `protection_clear()`、再引导用户重跑零点校准。顺序反了会留下 PB13 仍拉高的状态。
+
+### 5.5 【Networking Agent 必做】CAT 串口 / SPI6 解除命令
+
+远程解除走命令通道，判定逻辑仍由 Control 负责，你只做透传：
+
+- 收到 **CAT 串口（UART4）或 SPI6 数据包**里的"解除告警/复位故障"命令时，调：
+  ```c
+  protection_clear();
+  ```
+  效果与 §5.4 第二步完全相同：停蜂鸣器、拉低 PB13、清 `g_alert_flag`。
+- **不要自己再去拉 PB13、不要自己去停 TIM15**，全部由 `protection_clear()` 收口，
+  否则会和 ISR 里的关断动作打架。
+- 解除后建议回一条确认帧（你定协议），让上位机知道告警已清。
+- 同样地，`g_allow_rf` 解除后仍是 false，**不要在协议里假装"已恢复发射"**；
+  需要真正恢复发射时，让操作员重跑零点校准。
+- CAT 侧还可以顺手做只读上报：把 `g_alert_active` 编进状态查询帧（SWR/电流类故障码）。
+  **只读上报不要调任何 clear 类函数。**
+- GUI 和 Networking 可能同时收到解除请求：`protection_clear()` 是幂等的，
+  重复调用不会出错，但也别在同一次故障里反复发解除命令。
+
+### 5.6 责任边界（避免重复劳动）
+
+| 事情 | 谁做 |
+|---|---|
+| 判定阈值、DMA/AWD/EXTI 中断里关断、锁存、蜂鸣器启动 | **Control（已完成，勿重写）** |
+| 弹窗显示、多语言文案、解除按钮 | **GUI（§5.4）** |
+| CAT/SPI6 解除命令、状态上报 | **Networking（§5.5）** |
+| IM 零点校准后恢复 `g_allow_rf` | Control 已提供，GUI 负责触发流程 |
 
 ---
 

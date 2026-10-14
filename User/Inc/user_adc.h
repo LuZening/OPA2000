@@ -48,10 +48,26 @@ void adc_start(void);
 void adc_stop(void);
 /* Process the latest DMA snapshot into g_adc_data.  Called from the
  * Control task periodically (e.g. 100 ms tick) and from the IM
- * zero-offset state machine during calibration. */
+ * zero-offset state machine during calibration.
+ *
+ * ALSO runs from the ADC1 DMA completion interrupt at main priority 0, so
+ * it must stay integer-only and free of libm / FPU work. */
 void adc_process(void);
 /* ADC1 + ADC2 start + DMA enable.  Idempotent. */
 void adc_init(void);
+
+/* Advance the coupler-2 peak holds by one step, using the time elapsed
+ * since the previous call.  Attack is instantaneous, release is
+ * exponential with tau = 500 ms.
+ *
+ * Call from task context only (the ADC task): the release uses expf(), and
+ * this must not run in the priority-0 DMA interrupt.  It is deliberately
+ * independent of PTT / g_tx_active - the holds report what the coupler
+ * measures, not what the keying state suggests.
+ *
+ * Reads g_adc_data.fwd2_mW / rev2_mW (so adc_process() must have run at
+ * least once) and writes fwd2_peak_mW / rev2_peak_mW. */
+void adc_peak_hold_tick(void);
 
 /* IM zero-offset state machine.  Run from a task at >= 10 ms tick.
  * Returns true once calibration has succeeded (g_allow_rf set). */

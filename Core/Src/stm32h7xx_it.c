@@ -26,6 +26,8 @@
 #include "touch.h"
 #include "power_control.h"
 #include "freq_detect.h"
+#include "buzzer.h"
+#include "fan_tach.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -442,6 +444,16 @@ void TIM7_IRQHandler(void)
   if (__HAL_TIM_GET_FLAG(&htim7, TIM_FLAG_UPDATE) && __HAL_TIM_GET_IT_SOURCE(&htim7, TIM_IT_UPDATE)) {
       __HAL_TIM_CLEAR_IT(&htim7, TIM_IT_UPDATE);
       freq_detect_isr();
+      /* Release-safety fallback for PTT_INX.  The EXTI5 interrupt is the
+       * primary path for both edges; this guarantees the amplifier comes
+       * back within one tick even if the release edge is lost.  Level
+       * based, idempotent and interrupt-safe. */
+      power_ptt_poll();
+      /* 3-tone warning state machine (buzzer.c) - integer only, no FPU,
+       * and it is driven straight from TIM15 ARR so no DMA is needed. */
+      buzzer_tick();
+      /* Fan / pump tachometer edge counting. */
+      fan_tach_tick();
   }
   /* USER CODE END TIM7_IRQn 0 */
   HAL_TIM_IRQHandler(&htim7);

@@ -76,6 +76,39 @@ void power_relays_tx_on(void);
 void power_relays_tx_off(void);
 
 /*============================================================================
+ *  Front-panel power (task context; called from gui.c / key.c / app_tasks.c)
+ *==========================================================================*/
+
+/* Bring every output and the fan/pump PWM to their power-on state.  Call
+ * once before the scheduler starts. */
+void power_init(void);
+
+/* Operator "ready": main supply, HV and PA bias engaged, PA not keyed. */
+void power_on(void);
+/* Drop back to ready from transmit (supply stays engaged). */
+void power_standby(void);
+/* Full shutdown: relays open, supply / HV / bias off. */
+void power_off(void);
+
+/*============================================================================
+ *  Transmit request from a task source
+ *
+ *  Same interlocks as the PTT EXTI path: refused while the CC6920
+ *  zero-offset is unfinished (g_allow_rf) or protection is latched
+ *  (g_alert_flag).  Used for CAT / serial / front-panel initiated TX.
+ *==========================================================================*/
+void power_tx_enable(void);
+void power_tx_disable(void);
+
+/* Live level of PTT_INX, for task-side polling when an EXTI edge may have
+ * been missed.  True means "transmit requested" (pin low, active low). */
+bool power_get_ptt_state(void);
+
+/* Follow the radio: pick the LPF band that frequency_hz falls into.
+ * Out-of-band frequencies leave the current band alone. */
+void power_update_band(uint32_t frequency_hz);
+
+/*============================================================================
  *  Band switching
  *============================================================================*/
 
@@ -92,12 +125,26 @@ void power_set_lcd_backlight(bool enable);
  *  PTT ISR / task glue
  *============================================================================*/
 
-/* Called from EXTI5 ISR.  Runs no FreeRTOS APIs.  Updates RELAY state
- * machine and posts the event flag. */
+/* Called from EXTI5 ISR for BOTH edges of PTT_INX (falling = press,
+ * rising = release; the pin is active low).  Runs no FreeRTOS APIs, reads
+ * the live pin level rather than trusting the edge, and is therefore safe
+ * to call for a duplicate edge. */
 void power_control_ptt_isr(void);
+
+/* Release-safety fallback, called from the fast TIM7 tick.  Reconciles the
+ * state machine against the live PTT_INX level so a release edge that never
+ * arrives still unkeys the amplifier within one tick.  Level based and
+ * idempotent; interrupt-safe (no FreeRTOS API, no FPU). */
+void power_ptt_poll(void);
+
 /* Returns then clears the PTT event flag. */
 int  power_get_ptt_flag(void);
 void power_clear_ptt_flag(void);
+
+/* Drive the PTT_OUT keying feedback pin (PC15, active high).  Normally
+ * called by the PTT state machine; protection calls it directly so the
+ * feedback to the radio drops in the same instant the relays do. */
+void power_ptt_out_set(bool asserted);
 
 /*============================================================================
  *  RELAY delay timer (TIM5 one-shot 15 ms)

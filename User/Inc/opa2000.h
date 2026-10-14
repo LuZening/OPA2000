@@ -130,13 +130,6 @@ typedef enum {
     BAND_FAULT,            /*!< Invalid frequency */
 } BandType;
 
-/* Power state machine */
-typedef enum {
-    POWER_STATE_OFF = 0,
-    POWER_STATE_STANDBY,
-    POWER_STATE_TX,
-} PowerStateType;
-
 /* Alert cause */
 typedef enum {
     ALERT_NONE = 0,
@@ -192,51 +185,96 @@ typedef struct {
     volatile int32_t ntc_aux_tenth_c;     /*!< aux NTC, 0.1 Celsius */
     volatile int32_t mcu_int_tenth_c;    /*!< MCU internal temp, 0.1 Celsius */
 
+    /* Multi-key resistor ladder code (ADC1_RANK_KEY_ADC), raw 16-bit. */
+    volatile uint16_t key_adc;
+
     /* VSWR - derived from fwd2_mW and rev2_mW.
-     * If fwd2_mW < 10W (10 000 mW), swr is forced to 100 (=1.0). */
-    volatile int32_t swr_x100;           /*!< SWR * 100 */
+     * If fwd2_mW < 10W (10 000 mW), swr is forced to 100 (=1.0).
+     * NOTE: this is the *instantaneous* value.  The GUI computes its own
+     * SWR from the two peak-hold values below so that all three bar graphs
+     * on screen agree with each other. */
+    volatile int32_t swr_x100;           /*!< SWR * 100, instantaneous */
+
+    /* Peak-hold (peak detector with exponential release) on the coupler the
+     * operator actually sees.  Written only by adc_peak_hold_tick() in
+     * user_adc.c; the GUI reads them and must never write.
+     *
+     * Semantics: attack is instantaneous (a new maximum replaces the held
+     * value at once), release is an exponential decay with a 500 ms time
+     * constant, i.e. the held value falls to 1/e (36.8 %) of its starting
+     * amplitude 500 ms after the input drops below it, and to 5 % after
+     * 1.5 s.  This is what makes a short power spike readable on a bar
+     * graph without the needle flickering back to zero between syllables.
+     *
+     * These are a measurement, not a function of the keying state: they
+     * track the coupler unconditionally and are NOT gated on g_tx_active /
+     * PTT.  If the amplifier is idle and the reading is zero, the holds
+     * decay to zero on their own; if something non-zero is present while
+     * idle (front-end noise, a stuck coupler, RF arriving from elsewhere)
+     * that is exactly what the operator needs to see, so it is displayed
+     * rather than hidden. */
+    volatile int32_t fwd2_peak_mW;       /*!< coupler 2 forward, peak-hold, mW */
+    volatile int32_t rev2_peak_mW;       /*!< coupler 2 reverse, peak-hold, mW */
 
     /* Sequence counter (increments on every fresh DMA batch) */
     volatile uint32_t seq;
 } AdcDataType;
 
-/* Calibration for a single forward / reflected channel */
+/* Touch screen transform.  Least-squares fit over CAL_POINT_COUNT samples:
+ * screen = raw * slope + offset.  Floats, not fixed point - the MCU has an
+ * FPU and these are only evaluated at calibration time and once per touch
+ * report.  `valid` gates the transform: until the first calibration the raw
+ * values pass through unchanged. */
 typedef struct {
-    int32_t a_q16;     /*!< slope, Q16.16 fixed-point */
-    int32_t b_mW;      /*!< intercept, milli-Watt */
-} coupler_t;
+    float    x_slope;
+    float    x_offset;
+    float    y_slope;
+    float    y_offset;
+    uint8_t  valid;
+    uint8_t  reserved[3];
+} TouchCalType;
 
-/* Persistent configuration blob.  Stored at /fs/config.bin by
- * Networking/sdconfig.cpp.  Mirrored by config.c into the global g_config. */
+/* Persistent configuration blob.  Held in RAM as the global g_config;
+ * config.c mirrors it to /fs/config.bin.
+ *
+ * NOTE: there are deliberately no per-channel coupler coefficients.  The
+ * directional-coupler front end is modelled exactly like OPA1000 (see
+ * adc_calibration.h section 1b), so power conversion needs no stored
+ * coefficients.  Only the current-sense zero offset is calibrated. */
 typedef struct {
+    uint32_t magic;                   /*!< CONFIG_MAGIC, see config.h       */
+    uint8_t  version;                 /*!< CONFIG_VERSION, bump on layout change */
+    uint8_t  reserved0[3];
+
     uint32_t pc_baud_rate;
     RadioType radio_type;
     uint32_t radio_baud_rate;
 
     /* Per-band protection thresholds (Hz / Watts / Amps / Celsius) */
     uint16_t band_rf_in_max_w[6];     /*!< AWD1 RF input threshold, by band */
-    uint16_t band_rev1_max_w;        /*!< AWD3 reflected 1 threshold */
-    uint16_t band_rev2_max_w;        /*!< software REV2 threshold */
-    uint16_t band_rev2_swr_w;        /*!< SWR-check REV2 threshold */
-    uint16_t band_swr_max_x100;      /*!< SWR threshold * 100 */
-    uint16_t band_ntc_max_tenth_c;   /*!< NTC overheat threshold */
-    uint16_t band_fwd1_max_w;        /*!< FWD1 software threshold */
-    uint16_t band_fwd2_max_w;        /*!< FWD2 software threshold */
-    uint16_t band_im_max_a;          /*!< main current threshold */
-    uint16_t band_vbias_max_mV;      /*!< VBIAS threshold */
-
-    /* Coupler calibration (linear fit y = (a/65536) * raw + b) */
-    coupler_t fwd1, fwd2, rev1, rev2;
+    uint16_t band_rev1_max_w;         /*!< AWD3 coupler 1 reverse (PA->LPF) */
+    uint16_t band_rev2_max_w;         /*!< software coupler 2 reverse       */
+    uint16_t band_rev2_swr_w;         /*!< SWR-check coupler 2 reverse     */
+    uint16_t band_swr_max_x100;       /*!< SWR threshold * 100             */
+    uint16_t band_ntc_max_tenth_c;    /*!< NTC overheat threshold          */
+    uint16_t band_fwd1_max_w;         /*!< coupler 1 forward software limit */
+    uint16_t band_fwd2_max_w;         /*!< coupler 2 forward software limit */
+    uint16_t band_im_max_a;           /*!< main current threshold          */
+    uint16_t band_vbias_max_mV;       /*!< VBIAS threshold                 */
 
     /* IM zero-offset calibration */
     uint16_t im_zero_offset_adc;
     uint8_t  im_calibrated;
+
+    /* Touch screen calibration */
+    TouchCalType touch_cal;
 
     /* Misc */
     LanguageType language;
     uint8_t  buzzer_enable;
     uint8_t  reserved[6];
 
+    /* MUST stay last: config.c computes the CRC over everything ahead of it. */
     uint32_t crc32;
 } ConfigType;
 
@@ -245,9 +283,28 @@ typedef struct {
  *============================================================================*/
 
 extern volatile AdcDataType    g_adc_data;
-extern volatile PowerStateType g_power_state;
+
+/* Amplifier front-panel state.  These two are deliberately independent:
+ * the supply can be on while the amplifier is idle, and a fault can
+ * latch with the supply still on.
+ *
+ *   g_psu_on    PSU / main supply engaged - PSU_ON_SIG (PG5), PWR_ON_SIG
+ *               (PG7) and RF_BIAS_ON (PG2) are high.  This is the
+ *               front-panel "ready" state the operator toggles.
+ *   g_tx_active the transmit sequence is engaged: RELAY2 is closed, so the
+ *               PA is still connected to the antenna side.  It stays true
+ *               through the 15 ms stop delay after the pedal is released
+ *               (RELAY1 is open but RELAY2 is not yet), so protection keeps
+ *               running until the PA is fully disconnected.  Only
+ *               meaningful while g_psu_on is true.
+ *
+ * Anything that means "no RF may be produced" is expressed by
+ * g_allow_rf (CC6920 zero-offset not finished) or g_alert_flag
+ * (protection latched), not by clearing g_psu_on. */
+extern volatile bool           g_psu_on;
+extern volatile bool           g_tx_active;
+
 extern volatile BandType       g_current_band;
-extern volatile bool           g_ptt_active;
 extern volatile bool           g_allow_rf;        /*!< CC6920 zero-offset done */
 extern volatile AlertType      g_alert_active;
 extern volatile bool           g_alert_flag;

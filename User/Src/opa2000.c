@@ -12,6 +12,7 @@
  */
 
 #include "opa2000.h"
+#include "adc_calibration.h"
 #include <math.h>     /*!< logf() for NTC B-equation */
 
 /*============================================================================
@@ -24,10 +25,12 @@
 /* Raw + engineering values - updated by Control task from ADC DMA */
 volatile AdcDataType    g_adc_data;
 
-/* Power state machine - written by Control, read by GUI */
-volatile PowerStateType g_power_state = POWER_STATE_OFF;
+/* Front-panel state.  g_psu_on is the operator's power/ready switch,
+ * g_tx_active follows the PTT relay sequence.  See opa2000.h. */
+volatile bool           g_psu_on      = false;
+volatile bool           g_tx_active   = false;
+
 volatile BandType       g_current_band = BAND_NONE;
-volatile bool           g_ptt_active   = false;
 
 /* IM zero-offset calibration gate (Control sets true after success).
  * PWR_ON_SIG (PG7) and RF_BIAS_ON (PG2) are only allowed to be HIGH
@@ -69,33 +72,40 @@ BandType frequency_to_band(uint32_t frequency_hz)
 }
 
 /* VSWR = (1 + |Gamma|) / (1 - |Gamma|), |Gamma| = sqrt(Pr / P_fwd).
- * Returned as x100 (e.g. 150 = 1.50).  Below 10W forward power the
+ * Returned as x100 (e.g. 150 = 1.50).  Below 10 W forward power the
  * result is forced to 100 (=1.00) per design spec to avoid noise
  * inflating SWR at low signal levels. */
+
+/* floor(sqrt(n)) for n <= 2^32-1, by binary search (16 iterations). */
+static uint32_t isqrt_u32(uint32_t n)
+{
+    uint32_t lo = 0U, hi = 65535U, mid;
+
+    if (n == 0U) return 0U;
+    while (lo < hi) {
+        mid = lo + ((hi - lo + 1U) / 2U);
+        if (mid <= (n / mid)) lo = mid;
+        else                    hi = mid - 1U;
+    }
+    return lo;
+}
+
 int32_t calculate_swr_x100(int32_t fwd2_mW, int32_t rev2_mW)
 {
-    if (fwd2_mW < 10000) {           /* 10 W */
-        return 100;
-    }
-    if (rev2_mW <= 0 || rev2_mW >= fwd2_mW) {
-        return 999;                  /* invalid; clamp */
-    }
-    /* integer sqrt approximation: x = (n + fwd / n) >> 1, 8 iterations */
-    int64_t ratio = (int64_t)rev2_mW * 1000000 / fwd2_mW;   /* Q.6 */
-    int64_t gamma_sq_x = ratio;
-    /* Newton's sqrt */
-    int64_t n = 1000;                /* initial guess for sqrt(gamma_sq_x*1e6) */
-    for (int i = 0; i < 8; i++) {
-        int64_t next = (n + (gamma_sq_x * 1000) / n) >> 1;
-        if (next >= n - 1 && next <= n + 1) break;
-        n = next;
-    }
-    /* gamma ~ n / 1000 (i.e. sqrt of gamma_sq_x * 1e-3) */
-    /* SWR = (1 + gamma) / (1 - gamma), scale x100 */
-    int64_t swr_x100 = (1000 + n) * 100 / (1000 - n);
-    if (swr_x100 < 100) swr_x100 = 100;
-    if (swr_x100 > 999) swr_x100 = 999;
-    return (int32_t)swr_x100;
+    uint32_t gamma_sq_q16, root, swr;
+
+    if (fwd2_mW < 10000) return 100;       /* below 10 W */
+    if (rev2_mW <= 0)     return 100;       /* perfect match / no signal */
+    if (rev2_mW >= fwd2_mW) return 999;     /* impossible: clamp */
+
+    gamma_sq_q16 = (uint32_t)(((int64_t)rev2_mW << 16) / fwd2_mW);
+    root = isqrt_u32(gamma_sq_q16);          /* |Gamma| in Q8 (0..256)   */
+    if (root >= 256U) return 999;
+
+    swr = ((256U + root) * 100U) / (256U - root);
+    if (swr < 100U) swr = 100U;
+    if (swr > 999U) swr = 999U;
+    return (int32_t)swr;
 }
 
 /*============================================================================
@@ -142,7 +152,7 @@ const char *strBands[] = {
 void opa2000_init(void)
 {
     /* Zero ADC data buffer */
-    for (int i = 0; i < ADC1_RANK_COUNT; i++) g_adc_data.adc1_raw[i] = 0U;
+    for (unsigned i = 0; i < ADC1_RANK_COUNT; i++) g_adc_data.adc1_raw[i] = 0U;
     g_adc_data.adc2_if_pa_raw       = 0U;
     g_adc_data.adc2_if_radio_raw    = 0U;
     g_adc_data.adc2_inj_ntc_core_raw = 0U;
@@ -154,6 +164,7 @@ void opa2000_init(void)
     g_adc_data.rev1_mW = g_adc_data.rev2_mW = 0;
     g_adc_data.rf_in_mW = 0;
     g_adc_data.vbias_mV = 0;
+    g_adc_data.key_adc  = 0U;
     g_adc_data.ntc_core_tenth_c = 250;   /* 25.0 C default */
     g_adc_data.ntc_aux_tenth_c = 250;
     g_adc_data.mcu_int_tenth_c = 250;
@@ -174,18 +185,14 @@ void opa2000_init(void)
     g_config.band_fwd2_max_w       = (uint16_t)MAX_TX_POWER2_W;
     g_config.band_im_max_a         = (uint16_t)MAX_MAIN_CURRENT_A;
     g_config.band_vbias_max_mV     = 5000U;
-    g_config.fwd1.a_q16 = 65536; g_config.fwd1.b_mW = 0;
-    g_config.fwd2.a_q16 = 65536; g_config.fwd2.b_mW = 0;
-    g_config.rev1.a_q16 = 65536; g_config.rev1.b_mW = 0;
-    g_config.rev2.a_q16 = 65536; g_config.rev2.b_mW = 0;
-    g_config.im_zero_offset_adc    = 43253U;  /* 1.65 V / 2.5 V * 65535 */
+    g_config.im_zero_offset_adc    = 43254U;  /* 1.65 V / 2.5 V * 65535 */
     g_config.im_calibrated         = 0U;
     g_config.language              = MULTILANG_CHINESE;
     g_config.buzzer_enable         = 1U;
 
-    g_power_state = POWER_STATE_OFF;
+    g_psu_on      = false;
+    g_tx_active   = false;
     g_current_band = BAND_NONE;
-    g_ptt_active = false;
     g_allow_rf = false;
     g_alert_active = ALERT_NONE;
     g_alert_flag = false;

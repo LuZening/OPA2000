@@ -7,6 +7,7 @@
 #include "config.h"
 #include "user_adc.h"
 #include "power_control.h"
+#include "protection.h"
 #include "opa2000.h"
 #include "string.h"
 #include "stdio.h"
@@ -48,10 +49,6 @@ static const char* const coupler_names[] = {
     "Coupler 1 (PA->LPF)",
     "Coupler 2 (LPF->Antenna)"
 };
-
-/* ADC channels for each coupler (forward, reflected) */
-static const uint8_t coupler_adc_fwd[] = {ADC_CHANNEL_TX_POWER1, ADC_CHANNEL_TX_POWER2};
-static const uint8_t coupler_adc_ref[] = {ADC_CHANNEL_REF_POWER1, ADC_CHANNEL_REF_POWER2};
 
 /*============================================================================
  * Private Functions
@@ -149,41 +146,46 @@ static void comm_execute(CommandType cmd_type, const char *args)
         case CMD_GET_STATUS:
             snprintf(comm_response_buffer, sizeof(comm_response_buffer),
                 "PWR=%s,Band=%d,Freq=%lu,Power=%.1f,Reflect=%.1f,SWR=%.1f,Volt=%.1f,Current=%.1f,Temp=%.1f,Alert=%d",
-                g_power_state == POWER_STATE_TX ? "TX" : (g_power_state == POWER_STATE_STANDBY ? "STBY" : "OFF"),
+                g_psu_on ? (g_tx_active ? "TX" : "STBY") : "OFF",
                 g_current_band,
                 g_radio_frequency,
-                g_adc_data.tx_power2,
-                g_adc_data.ref_power2,
-                g_adc_data.swr,
-                g_adc_data.voltage,
-                g_adc_data.current,
-                g_adc_data.ntc_temp,
+                (double)g_adc_data.fwd2_mW / 1000.0,
+                (double)g_adc_data.rev2_mW / 1000.0,
+                (double)g_adc_data.swr_x100 / 100.0,
+                (double)g_adc_data.vm_mV / 1000.0,
+                (double)g_adc_data.im_mA / 1000.0,
+                (double)g_adc_data.ntc_core_tenth_c / 10.0,
                 g_alert_active);
             comm_send_string(comm_response_buffer);
             break;
 
         case CMD_GET_POWER:
-            snprintf(comm_response_buffer, sizeof(comm_response_buffer), "POWER=%.1f", g_adc_data.tx_power2);
+            snprintf(comm_response_buffer, sizeof(comm_response_buffer),
+                "POWER=%.1f", (double)g_adc_data.fwd2_mW / 1000.0);
             comm_send_string(comm_response_buffer);
             break;
 
         case CMD_GET_SWR:
-            snprintf(comm_response_buffer, sizeof(comm_response_buffer), "SWR=%.2f", g_adc_data.swr);
+            snprintf(comm_response_buffer, sizeof(comm_response_buffer),
+                "SWR=%.2f", (double)g_adc_data.swr_x100 / 100.0);
             comm_send_string(comm_response_buffer);
             break;
 
         case CMD_GET_VOLTAGE:
-            snprintf(comm_response_buffer, sizeof(comm_response_buffer), "VOLTAGE=%.1f", g_adc_data.voltage);
+            snprintf(comm_response_buffer, sizeof(comm_response_buffer),
+                "VOLTAGE=%.1f", (double)g_adc_data.vm_mV / 1000.0);
             comm_send_string(comm_response_buffer);
             break;
 
         case CMD_GET_CURRENT:
-            snprintf(comm_response_buffer, sizeof(comm_response_buffer), "CURRENT=%.1f", g_adc_data.current);
+            snprintf(comm_response_buffer, sizeof(comm_response_buffer),
+                "CURRENT=%.1f", (double)g_adc_data.im_mA / 1000.0);
             comm_send_string(comm_response_buffer);
             break;
 
         case CMD_GET_TEMP:
-            snprintf(comm_response_buffer, sizeof(comm_response_buffer), "TEMP=%.1f", g_adc_data.ntc_temp);
+            snprintf(comm_response_buffer, sizeof(comm_response_buffer),
+                "TEMP=%.1f", (double)g_adc_data.ntc_core_tenth_c / 10.0);
             comm_send_string(comm_response_buffer);
             break;
 
@@ -245,8 +247,11 @@ static void comm_execute(CommandType cmd_type, const char *args)
         }
 
         case CMD_ALERT_OFF:
-            g_alert_active = ALERT_NONE;
-            g_alert_flag = false;
+            /* Clearing the two flags is not enough: the latch inside
+             * protection.c would stay set, PB13 would stay high and the
+             * buzzer would keep running while the PC believed the fault
+             * was gone.  protection_clear() does all three. */
+            protection_clear();
             comm_send_string("ALERT OFF OK");
             break;
 
@@ -273,16 +278,16 @@ static void comm_execute(CommandType cmd_type, const char *args)
         case CMD_GET_CONFIG:
             snprintf(comm_response_buffer, sizeof(comm_response_buffer),
                 "CONFIG: PC_BAUD=%lu, RADIO=%s, RADIO_BAUD=%lu, "
-                "PROT_REF_PWR2=%u, PROT_REF_PWR2_SWR=%u, PROT_SWR=%.1f, "
-                "PROT_REF_PWR1=%u, PROT_CURRENT=%.1f",
+                "REV2=%u, REV2_SWR=%u, SWR=%u.%02u, REV1=%u, IM=%u",
                 g_config.pc_baud_rate,
                 config_get_radio_type_string(g_config.radio_type),
                 g_config.radio_baud_rate,
-                (uint32_t)g_config.protect_reflect_power2_w,
-                (uint32_t)g_config.protect_reflect_power2_swr,
-                g_config.protect_swr_threshold,
-                (uint32_t)g_config.protect_reflect_power1_w,
-                g_config.protect_main_current_a);
+                (uint32_t)g_config.band_rev2_max_w,
+                (uint32_t)g_config.band_rev2_swr_w,
+                (uint32_t)(g_config.band_swr_max_x100 / 100U),
+                (uint32_t)(g_config.band_swr_max_x100 % 100U),
+                (uint32_t)g_config.band_rev1_max_w,
+                (uint32_t)g_config.band_im_max_a);
             comm_send_string(comm_response_buffer);
             break;
 
@@ -723,30 +728,24 @@ bool comm_calibrate_coupler_start(CouplerId coupler_id)
 bool comm_calibrate_coupler_continue(void)
 {
     float current_adc = 0;
+    bool forward_stage = (coupler_cal_state == COUPLER_CAL_STAGE1_5W_FWD ||
+                          coupler_cal_state == COUPLER_CAL_STAGE2_20W_FWD);
 
-    /* Get current ADC value based on coupler being calibrated */
+    /* Get current ADC value based on coupler being calibrated.  Coupler 1 is
+     * PA->LPF (ADC1_RANK_FWD1 / ADC1_RANK_REV1), coupler 2 is LPF->antenna
+     * (ADC1_RANK_FWD2 / ADC1_RANK_REV2). */
+    uint8_t rank;
     switch (coupler_cal_id) {
         case COUPLER_1:
-            /* Coupler 1: forward is TX_POWER1, reflected is REF_POWER1 */
-            if (coupler_cal_state == COUPLER_CAL_STAGE1_5W_FWD ||
-                coupler_cal_state == COUPLER_CAL_STAGE2_20W_FWD) {
-                current_adc = (float)g_adc_data.raw[ADC_CHANNEL_TX_POWER1];
-            } else {
-                current_adc = (float)g_adc_data.raw[ADC_CHANNEL_REF_POWER1];
-            }
+            rank = forward_stage ? ADC1_RANK_FWD1 : ADC1_RANK_REV1;
             break;
         case COUPLER_2:
-            /* Coupler 2: forward is TX_POWER2, reflected is REF_POWER2 */
-            if (coupler_cal_state == COUPLER_CAL_STAGE1_5W_FWD ||
-                coupler_cal_state == COUPLER_CAL_STAGE2_20W_FWD) {
-                current_adc = (float)g_adc_data.raw[ADC_CHANNEL_TX_POWER2];
-            } else {
-                current_adc = (float)g_adc_data.raw[ADC_CHANNEL_REF_POWER2];
-            }
+            rank = forward_stage ? ADC1_RANK_FWD2 : ADC1_RANK_REV2;
             break;
         default:
             return false;
     }
+    current_adc = (float)g_adc_data.adc1_raw[rank];
 
     switch (coupler_cal_state) {
         case COUPLER_CAL_START:
@@ -771,7 +770,8 @@ bool comm_calibrate_coupler_continue(void)
             comm_send_string("");
             comm_send_string(">>> Recording 5W REFLECTED power...");
             snprintf(comm_response_buffer, sizeof(comm_response_buffer),
-                "ADC=%d, Reflected=%.1fW", (int)current_adc, g_adc_data.ref_power2);
+                "ADC=%d, Reflected=%.1fW", (int)current_adc,
+                (double)g_adc_data.rev2_mW / 1000.0);
             comm_send_string(comm_response_buffer);
             coupler_cal_data.stage1_ref_adc = current_adc;
 
@@ -800,77 +800,44 @@ bool comm_calibrate_coupler_continue(void)
             break;
 
         case COUPLER_CAL_STAGE2_20W_FWD:
-            /* Stage 2 forward recorded, now record reflected and calculate */
+            /* Stage 2 forward recorded, now record reflected and report */
             coupler_cal_state = COUPLER_CAL_COMPLETE;
             comm_send_string("");
             comm_send_string(">>> Recording 20W REFLECTED power...");
             snprintf(comm_response_buffer, sizeof(comm_response_buffer),
-                "ADC=%d, Reflected=%.1fW", (int)current_adc, g_adc_data.ref_power2);
+                "ADC=%d, Reflected=%.1fW", (int)current_adc,
+                (double)g_adc_data.rev2_mW / 1000.0);
             comm_send_string(comm_response_buffer);
             coupler_cal_data.stage2_ref_adc = current_adc;
 
-            /* Calculate calibration parameters using linear regression */
-            /* y = mx + b where y is power (W), x is ADC value */
-            /* Using two points: (stage1_fwd_adc, 5.0) and (stage2_fwd_adc, 20.0) */
+            /* Report the two-point fit through the 5W / 20W reference
+             * points.  The forward-power conversion itself is NOT adjusted
+             * here: the coupler front end is modelled exactly like OPA1000
+             * (see adc_calibration.h section 1b), so there are no per-channel
+             * slope / offset coefficients in g_config to store - the numbers
+             * below are for the operator to sanity-check, nothing more. */
             {
-                float x1 = coupler_cal_data.stage1_fwd_adc;
-                float x2 = coupler_cal_data.stage2_fwd_adc;
-                float y1 = 5.0f;
-                float y2 = 20.0f;
-                float slope = (y2 - y1) / (x2 - x1);
-                float offset = y1 - slope * x1;
-
-                /* Apply calibration based on coupler ID */
-                CalDataType *cal_fwd = NULL;
-                CalDataType *cal_ref = NULL;
-                switch (coupler_cal_id) {
-                    case COUPLER_1:
-                        cal_fwd = &g_config.cal_tx_power1;
-                        cal_ref = &g_config.cal_ref_power1;
-                        break;
-                    case COUPLER_2:
-                        cal_fwd = &g_config.cal_tx_power2;
-                        cal_ref = &g_config.cal_ref_power2;
-                        break;
-                    default:
-                        break;
-                }
-
-                /* Calculate forward calibration: (20-5)/(ADC2-ADC1) */
                 float fwd_x1 = coupler_cal_data.stage1_fwd_adc;
                 float fwd_x2 = coupler_cal_data.stage2_fwd_adc;
-                float fwd_slope = (20.0f - 5.0f) / (fwd_x2 - fwd_x1);
-                float fwd_offset = 5.0f - fwd_slope * fwd_x1;
+                float fwd_slope = (fwd_x2 != fwd_x1) ? (20.0f - 5.0f) / (fwd_x2 - fwd_x1) : 0.0f;
 
-                /* Calculate reflected calibration */
                 float ref_x1 = coupler_cal_data.stage1_ref_adc;
                 float ref_x2 = coupler_cal_data.stage2_ref_adc;
-                float ref_slope = (20.0f - 5.0f) / (ref_x2 - ref_x1);
-                float ref_offset = 5.0f - ref_slope * ref_x1;
-
-                if (cal_fwd) {
-                    cal_fwd->forward_slope = fwd_slope;
-                    cal_fwd->forward_offset = fwd_offset;
-                }
-                if (cal_ref) {
-                    cal_ref->reflect_slope = ref_slope;
-                    cal_ref->reflect_offset = ref_offset;
-                }
-
-                /* Save config */
-                config_save();
+                float ref_slope = (ref_x2 != ref_x1) ? (20.0f - 5.0f) / (ref_x2 - ref_x1) : 0.0f;
 
                 comm_send_string("");
                 comm_send_string("========================================");
                 comm_send_string("CALIBRATION COMPLETE!");
                 comm_send_string("========================================");
                 snprintf(comm_response_buffer, sizeof(comm_response_buffer),
-                    "Slope: %.6f", slope);
+                    "Forward: ADC %.0f -> %.0f  (%.6f W/code)",
+                    (double)fwd_x1, (double)fwd_x2, (double)fwd_slope);
                 comm_send_string(comm_response_buffer);
                 snprintf(comm_response_buffer, sizeof(comm_response_buffer),
-                    "Offset: %.6f", offset);
+                    "Reflect: ADC %.0f -> %.0f  (%.6f W/code)",
+                    (double)ref_x1, (double)ref_x2, (double)ref_slope);
                 comm_send_string(comm_response_buffer);
-                comm_send_string("Config saved!");
+                comm_send_string("Conversion coefficients are fixed in firmware; nothing stored.");
             }
             coupler_cal_state = COUPLER_CAL_IDLE;
             break;
@@ -902,10 +869,10 @@ CouplerCalState comm_calibrate_get_state(void)
 
 /**
  * @brief UART RX callback
+ * @note  Removed: the radio link is handled by radio_uart.c (DMA + IDLE
+ *        line interrupt) and radio_band.c (framing + protocol), driven
+ *        from app_comm_task.  The old per-character path called
+ *        comm_process_radio_data() once per byte, which re-ran the whole
+ *        protocol decoder N times for an N-byte frame and could not tell
+ *        where a frame started or ended.
  */
-void comm_uart_rx_callback(uint8_t byte)
-{
-    comm_queue_rx_byte(byte);
-    /* Also process radio data on radio UART */
-    comm_process_radio_data(&byte, 1);
-}

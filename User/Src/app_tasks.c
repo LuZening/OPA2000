@@ -11,8 +11,10 @@
 #include "touch.h"
 #include "protection.h"
 #include "freq_detect.h"
+#include "buzzer.h"
+#include "fan_tach.h"
+#include "radio_uart.h"
 #include "config.h"
-#include "pca9539.h"
 
 /*============================================================================
  * Private Variables
@@ -167,8 +169,16 @@ void app_adc_task(void *argument)
     adc_start();
 
     while (1) {
-        /* Process ADC data */
-        adc_process_data();
+        /* Publish the instantaneous engineering values.  Note this also
+           runs from the ADC1 DMA interrupt, so the task-side call is only
+           a second, slower consumer of the same data - not the primary
+           path. */
+        adc_process();
+
+        /* Advance the coupler-2 peak holds for the GUI bar graphs.  Task
+           context on purpose: the release step uses expf(), which must not
+           run in the priority-0 DMA interrupt. */
+        adc_peak_hold_tick();
 
         /* 50ms - 20Hz update rate */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(50));
@@ -190,15 +200,20 @@ void app_comm_task(void *argument)
     comm_init();
     comm_start();
 
+    /* Start the radio CAT link: UART4 DMA + IDLE receive, with the
+     * protocol layer attached.  After this the task only has to pump the
+     * poll accumulator and drain received bytes. */
+    (void)radio_uart_init();
+
     while (1) {
         /* Process received commands */
         comm_process_rx();
 
-        /* Check for alerts from communication (e.g., "ALERT OFF") */
-        if (g_alert_flag) {
-            g_alert_flag = false;
-            /* Alert was set, GUI will handle display */
-        }
+        /* Radio CAT: 10 ms tick drives a 100 ms poll accumulator, and the
+         * poll itself slices frames out of whatever the IDLE/DMA callbacks
+         * delivered.  Both must run here, in task context. */
+        radio_band_tick();
+        radio_band_poll();
 
         /* 10ms tick */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(10));
@@ -219,9 +234,7 @@ void app_monitor_task(void *argument)
 
     /* Initialize power control */
     power_init();
-
-    /* Initialize PCA9539 button expander */
-    pca9539_init();
+    buzzer_init();
 
     /* Initialize PTT state tracking based on current GPIO state */
     ptt_last_handled = power_get_ptt_state();
@@ -258,12 +271,12 @@ void app_monitor_task(void *argument)
         if (ptt_just_changed) {
             if (ptt_current) {
                 /* PTT pressed */
-                if (g_power_state == POWER_STATE_STANDBY) {
+                if (g_psu_on) {
                     power_tx_enable();
                 }
             } else {
                 /* PTT released */
-                if (g_power_state == POWER_STATE_TX) {
+                if (g_tx_active) {
                     power_tx_disable();
                 }
             }
@@ -273,27 +286,15 @@ void app_monitor_task(void *argument)
         }
 
         /* Update fan based on temperature */
-        power_update_fan(g_adc_data.ntc_temp);
+        power_update_fan(g_adc_data.ntc_core_tenth_c);
 
         /* Update band from frequency detector */
-        if (g_power_state == POWER_STATE_TX) {
+        if (g_tx_active) {
             power_update_band(freq_detect_get_frequency());
         }
 
-        /* Process PCA9539 buttons (debounced) */
-        pca9539_process();
-
-        /* Check for button presses */
-        Pca9539ButtonState buttons;
-        if (pca9539_get_buttons(&buttons)) {
-            if (buttons.power_on) {
-                /* Power on button pressed */
-            }
-            if (buttons.power_off) {
-                /* Power off button pressed */
-            }
-            /* Add other button handling as needed */
-        }
+        /* Fan / pump tachometer, refreshed on the same slow tick */
+        fan_tach_calculate_rpm();
 
         /* 100ms tick */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
@@ -321,33 +322,23 @@ void app_protect_task(void *argument)
     freq_detect_start();
 
     while (1) {
-        /* Check protection conditions */
-        if (g_power_state == POWER_STATE_TX) {
-            protection_check();
-        }
+        /* Backstop for the conditions that have no hardware watchdog.  Runs
+         * unconditionally: NTC over-temperature applies while idle too, and
+         * the coupler limits inside protection_check() gate on g_tx_active
+         * themselves. */
+        protection_check();
 
         /* Check frequency if transmitting */
-        if (g_power_state == POWER_STATE_TX) {
+        if (g_tx_active) {
             freq_detect_check();
         }
 
-        /* If alert triggered, update GUI alert if needed */
-        if (g_alert_flag) {
-            g_alert_flag = false;
-            if (!gui_is_alert_active()) {
-                gui_show_alert(g_alert_active);
-            }
-            /* Play alert sound */
-            power_play_alert();
-        }
-
-        /* Check if alert was cleared (from GUI or comm) */
-        if (!protection_is_active() && gui_is_alert_active()) {
-            /* Protection cleared externally */
-            gui_dismiss_alert();
-            /* Stop alert sound */
-            power_set_buzzer(false);
-        }
+        /* NOTE: the alert popup and the buzzer are NOT driven from here.
+         * protection_trigger_locked() already latches g_alert_flag and
+         * starts the 3-tone warning the instant the fault happens, and
+         * protection_clear() silences it.  Re-touching either here would
+         * race with the GUI task (which owns the popup) and with the CAT /
+         * SPI6 command path.  See docs/AGENT_BRIEFING.md 5.4 / 5.5. */
 
         /* 20ms tick - 50Hz protection check */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(20));

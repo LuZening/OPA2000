@@ -4,10 +4,21 @@
 #include "dma2d.h"
 #include "ltdc.h"
 
+/* Panel geometry.  Taken from the LTDC layer that CubeMX generated
+ * (Core/Src/ltdc.c: WindowX1 480, WindowY1 272, RGB565, FB at 0x24000000)
+ * rather than from lv_conf.h's LV_HOR_RES_MAX, which is only an upper bound
+ * the library allocates against.  LV_HOR_RES / LV_VER_RES are runtime macros
+ * (they call into the display driver) and cannot be used here - the buffers
+ * below are sized at compile time and before any driver is registered. */
+#define LCD_WIDTH       480
+#define LCD_HEIGHT      272
+#define LCD_FB_ADDR     0x24000000UL
+
 /* Double partial buffers: 1/10 screen height each, so 2 fit in 153.6KB */
-/* 800 x 48 x 2 bytes = 76,800 bytes per buffer, total 153,600 bytes */
-#define LVGL_BUF_HEIGHT  48
-#define LVGL_BUF_PIXELS  (HOR_RES * LVGL_BUF_HEIGHT)
+/* 480 x 27 x 2 bytes = 25,920 bytes per buffer, total 51,840 bytes */
+#define LVGL_BUF_HEIGHT  27
+#define LVGL_BUF_PIXELS  (LCD_WIDTH * LVGL_BUF_HEIGHT)
+
 static uint16_t __attribute__((section(".lvgl_buffer"))) lvgl_draw_buf1[LVGL_BUF_PIXELS];
 static uint16_t __attribute__((section(".lvgl_buffer"))) lvgl_draw_buf2[LVGL_BUF_PIXELS];
 
@@ -36,11 +47,13 @@ static void dma2d_transfer_done(void)
 
 void DMA2D_XferCpltCallback(DMA2D_HandleTypeDef *hdma2d)
 {
+    (void)hdma2d;
     dma2d_transfer_done();
 }
 
 void DMA2D_ErrorCallback(DMA2D_HandleTypeDef *hdma2d)
 {
+    (void)hdma2d;
     /* On error, release the bus so we don't hang in the spin loop */
     dma2d_transfer_done();
 }
@@ -59,10 +72,10 @@ static void disp_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
 
     uint16_t area_w = lv_area_get_width(area);
     uint16_t area_h = lv_area_get_height(area);
-    uint16_t line_offset = HOR_RES - area_w;
+    uint16_t line_offset = LCD_WIDTH - area_w;
 
-    uint32_t dst_addr = (uint32_t)ltdc_framebuffer
-                      + (area->y1 * HOR_RES + area->x1) * sizeof(uint16_t);
+    uint32_t dst_addr = LCD_FB_ADDR
+                      + ((uint32_t)area->y1 * LCD_WIDTH + area->x1) * sizeof(uint16_t);
 
     hdma2d.Init.OutputOffset = line_offset;
     hdma2d.LayerCfg[1].InputOffset = line_offset;
@@ -88,17 +101,17 @@ void lv_port_disp_init(void)
 
     /* Raise DMA2D IRQ priority to 1 so it is NOT masked by FreeRTOS BASEPRI
      * during critical sections, preventing the spin-wait from hanging.
-     * DMA2D_IRQn is safe at 1 — the ISR only sets flags, no FreeRTOS APIs. */
+     * DMA2D_IRQn is safe at 1 - the ISR only sets flags, no FreeRTOS APIs. */
     HAL_NVIC_SetPriority(DMA2D_IRQn, 1, 0);
 
     /* Double buffering: LVGL renders into one buffer while DMA copies from the other */
     lv_disp_buf_init(&disp_buf, lvgl_draw_buf1, lvgl_draw_buf2, LVGL_BUF_PIXELS);
 
     lv_disp_drv_init(&disp_drv);
-    disp_drv.buffer  = &disp_buf;
+    disp_drv.buffer   = &disp_buf;
     disp_drv.flush_cb = disp_flush_cb;
-    disp_drv.hor_res = HOR_RES;
-    disp_drv.ver_res = VER_RES;
+    disp_drv.hor_res  = LCD_WIDTH;
+    disp_drv.ver_res  = LCD_HEIGHT;
     lv_disp_drv_register(&disp_drv);
 #else
     /* Simulator provides its own display driver */

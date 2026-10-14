@@ -1,7 +1,8 @@
 /**
  * @file key.h
  * @brief Button Input Processing Header
- * @note Supports 6 buttons via PCA9539 I/O expander with debounce and short/long press detection
+ * @note 6 buttons: KEY1 on PC13 (PWR_WKUP4, keeps the wake-up path),
+ *       KEY2..KEY6 on a resistor ladder read by ADC1_INP17 (PA1).
  */
 
 #ifndef KEY_H
@@ -12,16 +13,40 @@ extern "C" {
 #endif
 
 #include "opa2000.h"
+#include "hw_pinmap.h"
 
 /*============================================================================
- * Button Definitions (connected to PCA9539 Port 0)
+ * Button Definitions
  *============================================================================*/
-#define KEY_POWER       0       /* P00 - Power key */
-#define KEY_MENU        1       /* P01 - Menu key */
-#define KEY_BAND        2       /* P02 - Band key */
-#define KEY_LEFT        3       /* P03 - Left arrow key */
-#define KEY_RIGHT       4       /* P04 - Right arrow key */
-#define KEY_ENTER       5       /* P05 - Enter/Confirm key */
+#define KEY_POWER       0   /* PC13 KEY1_WKUP  - dedicated GPIO (wake-up)   */
+#define KEY_MENU        1   /* ADC ladder     - menu                      */
+#define KEY_BAND        2   /* ADC ladder     - band select               */
+#define KEY_LEFT        3   /* ADC ladder     - left                      */
+#define KEY_RIGHT       4   /* ADC ladder     - right                     */
+#define KEY_ENTER       5   /* ADC ladder     - enter / confirm           */
+#define KEY_COUNT       6
+
+#define KEY_NONE        0xFFU   /*!< no ladder key recognised */
+
+/*============================================================================
+ * Resistor ladder decoding (ADC1_INP17, PA1)
+ *
+ * Each key pulls the node to its own divider tap, so a pressed key shows up
+ * as a distinct ADC code.  KEY_NONE when nothing is pressed is whatever the
+ * pull-up alone produces.
+ *
+ * Thresholds are the *midpoints* between neighbouring taps, so a tap only
+ * has to be within half a bucket of its nominal value to be recognised.
+ * They are deliberately wide: the ladder is resistively loaded by a
+ * C91 filter and the code drifts with temperature, so precision here buys
+ * nothing.  Recalibrate from measured codes if the ladder is respun.
+ *============================================================================*/
+#define KEY_ADC_IDLE_MIN     62000U  /*!< above this: pull-up, nothing pressed */
+#define KEY_ADC_TAP_MENU     55000U  /*!< >= this: KEY_MENU                   */
+#define KEY_ADC_TAP_BAND     47000U  /*!< >= this: KEY_BAND                   */
+#define KEY_ADC_TAP_LEFT     38000U  /*!< >= this: KEY_LEFT                   */
+#define KEY_ADC_TAP_RIGHT    26000U  /*!< >= this: KEY_RIGHT                  */
+#define KEY_ADC_TAP_ENTER    10000U  /*!< >= this: KEY_ENTER                  */
 
 /*============================================================================
  * Button Timing Configuration
@@ -35,10 +60,10 @@ extern "C" {
  *============================================================================*/
 typedef enum {
     KEY_EVENT_NONE = 0,
-    KEY_EVENT_SHORTPRESS,              /* Short press detected */
-    KEY_EVENT_LONGPRESS_START,         /* Long press started (first time) */
-    KEY_EVENT_LONGPRESS_HOLD,          /* Long press held (repeated) */
-    KEY_EVENT_RELEASED                 /* Key released */
+    KEY_EVENT_SHORTPRESS,              /*!< Short press detected */
+    KEY_EVENT_LONGPRESS_START,         /*!< Long press started (first time) */
+    KEY_EVENT_LONGPRESS_HOLD,          /*!< Long press held (repeated) */
+    KEY_EVENT_RELEASED                 /*!< Key released */
 } KeyEventType;
 
 /*============================================================================
@@ -55,10 +80,10 @@ typedef enum {
  * Button Information Structure
  *============================================================================*/
 typedef struct {
-    KeyStateType state;                /* Current button state */
-    uint32_t press_start_tick;         /* Tick when button was pressed */
-    bool longpress_sent;               /* Long press event already sent */
-    bool repeat_sent;                  /* Repeat event already sent */
+    KeyStateType state;                /*!< Current button state */
+    uint32_t press_start_tick;         /*!< Tick when button was pressed */
+    bool longpress_sent;               /*!< Long press event already sent */
+    bool repeat_sent;                  /*!< Repeat event already sent */
 } KeyInfoType;
 
 /*============================================================================
@@ -72,7 +97,6 @@ typedef void (*KeyCallback)(uint8_t key, KeyEventType event);
 
 /**
  * @brief Initialize key processing
- * @note Must be called after PCA9539 initialization
  */
 void key_init(void);
 
@@ -81,6 +105,13 @@ void key_init(void);
  * @note Non-blocking, call every 10ms
  */
 void key_process(void);
+
+/**
+ * @brief Decode an ADC1_INP17 code into a key id
+ * @param code Raw 16-bit ADC code from g_adc_data.key_adc
+ * @return KEY_POWER..KEY_ENTER, or KEY_NONE
+ */
+uint8_t key_decode_adc(uint16_t code);
 
 /**
  * @brief Register key event callback
@@ -101,42 +132,36 @@ bool key_is_pressed(uint8_t key);
 void key_reset(void);
 
 /*============================================================================
- * Key Action Functions (to be implemented by user)
+ * Key Action Functions
  *============================================================================*/
 
 /**
  * @brief Handle power key action
- * @param event Key event type
  */
 void key_power_action(KeyEventType event);
 
 /**
  * @brief Handle menu key action
- * @param event Key event type
  */
 void key_menu_action(KeyEventType event);
 
 /**
  * @brief Handle band key action
- * @param event Key event type
  */
 void key_band_action(KeyEventType event);
 
 /**
  * @brief Handle left key action
- * @param event Key event type
  */
 void key_left_action(KeyEventType event);
 
 /**
  * @brief Handle right key action
- * @param event Key event type
  */
 void key_right_action(KeyEventType event);
 
 /**
  * @brief Handle enter key action
- * @param event Key event type
  */
 void key_enter_action(KeyEventType event);
 

@@ -7,6 +7,7 @@
 #include "ff.h"
 #include "sdcard_storage.h"
 #include <string.h>
+#include <strings.h>
 
 /*============================================================================
  * Private Variables
@@ -103,14 +104,16 @@ static bool config_read_file(const char *filename, void *data, uint32_t len)
 }
 
 /**
- * @brief Update config CRC
+ * @brief Recompute the CRC over everything ahead of the crc32 field
+ *
+ * crc32 is the last member of ConfigType, so "everything ahead of it" is
+ * simply the first sizeof(ConfigType) - 4 bytes.  See the comment on the
+ * field itself - moving it would silently invalidate every stored blob.
  */
 static void config_update_crc(void)
 {
-    /* Calculate CRC of all config except CRC itself */
-    uint32_t crc = crc32_calculate((const uint8_t*)&g_config,
-                                   sizeof(ConfigType) - sizeof(uint32_t));
-    g_config.crc32 = crc;
+    g_config.crc32 = crc32_calculate((const uint8_t *)&g_config,
+                                     sizeof(ConfigType) - sizeof(uint32_t));
 }
 
 /*============================================================================
@@ -130,8 +133,7 @@ bool config_sdcard_ready(void)
  */
 bool config_init(void)
 {
-    uint32_t magic;
-    uint32_t version;
+    ConfigType stored;
 
     /* Mount FatFS */
     if (!config_mount_fs()) {
@@ -139,36 +141,32 @@ bool config_init(void)
         return false;
     }
 
-    /* Try to read magic and version first */
-    ConfigType temp_config;
-    if (!config_read_file(CONFIG_FILENAME, &temp_config, sizeof(ConfigType))) {
+    /* Read the blob as-is and validate magic / version / CRC before it is
+     * allowed anywhere near g_config - a partially written file would
+     * otherwise be interpreted as real settings. */
+    if (!config_read_file(CONFIG_FILENAME, &stored, sizeof(ConfigType))) {
         /* Config file not accessible or not programmed */
         config_reset_default();
         return false;
     }
 
-    magic = temp_config.pc_baud_rate;  /* Reuse field for magic check */
-    version = temp_config.radio_type;  /* Reuse field for version check */
-
-    /* Check magic and version - using first fields as magic/version */
-    if (magic != CONFIG_MAGIC || version != CONFIG_VERSION) {
-        /* Invalid or old config, use defaults */
+    if (stored.magic != CONFIG_MAGIC || stored.version != CONFIG_VERSION) {
+        /* Invalid or old layout, use defaults */
         config_reset_default();
         return false;
     }
 
-    /* Read full configuration */
-    if (!config_read_file(CONFIG_FILENAME, &g_config, sizeof(ConfigType))) {
-        config_reset_default();
-        return false;
+    {
+        uint32_t want = stored.crc32;
+        stored.crc32 = 0U;
+        if (crc32_calculate((const uint8_t *)&stored,
+                            sizeof(ConfigType) - sizeof(uint32_t)) != want) {
+            config_reset_default();
+            return false;
+        }
     }
 
-    /* Validate CRC */
-    if (!config_validate()) {
-        config_reset_default();
-        return false;
-    }
-
+    g_config = stored;
     return true;
 }
 
@@ -177,30 +175,26 @@ bool config_init(void)
  */
 bool config_save(void)
 {
-    ConfigType save_config;
-
-    /* Ensure filesystem is mounted */
     if (!config_mount_fs()) {
         return false;
     }
 
-    /* Copy current config and embed magic/version in the copy */
-    memcpy(&save_config, &g_config, sizeof(ConfigType));
-    save_config.pc_baud_rate = CONFIG_MAGIC;
-    save_config.radio_type = (RadioType)CONFIG_VERSION;
+    /* Stamp magic / version / CRC into a copy so g_config itself keeps the
+     * caller's values (a save must not mutate live settings). */
+    ConfigType out = g_config;
+    out.magic   = CONFIG_MAGIC;
+    out.version = (uint8_t)CONFIG_VERSION;
+    out.crc32   = 0U;
+    out.crc32   = crc32_calculate((const uint8_t *)&out,
+                                  sizeof(ConfigType) - sizeof(uint32_t));
 
-    /* Update CRC on the copy */
-    uint32_t crc = crc32_calculate((const uint8_t*)&save_config,
-                                   sizeof(ConfigType) - sizeof(uint32_t));
-    save_config.crc32 = crc;
-
-    /* Write main config file */
-    if (!config_write_file(CONFIG_FILENAME, &save_config, sizeof(ConfigType))) {
+    if (!config_write_file(CONFIG_FILENAME, &out, sizeof(ConfigType))) {
         return false;
     }
 
-    /* Write backup file */
-    config_write_file(CONFIG_BACKUP_FILENAME, &save_config, sizeof(ConfigType));
+    /* Backup copy: if power is lost mid-write of the main file the loader
+     * can still fall back to this one. */
+    (void)config_write_file(CONFIG_BACKUP_FILENAME, &out, sizeof(ConfigType));
 
     return true;
 }
@@ -210,48 +204,49 @@ bool config_save(void)
  */
 void config_reset_default(void)
 {
-    /* Set default values */
-    g_config.pc_baud_rate = DEFAULT_PC_BAUD_RATE;
-    g_config.radio_type = RADIO_TYPE_UNKNOWN;
-    g_config.radio_baud_rate = 19200;
+    /* Start from a clean slate: the reserved[] padding must be zero or the
+     * CRC of an otherwise-identical blob would differ between runs. */
+    memset(&g_config, 0, sizeof(g_config));
 
-    /* Protection defaults */
-    g_config.protect_reflect_power2_w = DEFAULT_PROTECT_REFLECT_POWER2_W;
-    g_config.protect_reflect_power2_swr = DEFAULT_PROTECT_REFLECT_POWER2_SWR;
-    g_config.protect_swr_threshold = DEFAULT_PROTECT_SWR_THRESHOLD;
-    g_config.protect_reflect_power1_w = DEFAULT_PROTECT_REFLECT_POWER1_W;
-    g_config.protect_main_current_a = DEFAULT_PROTECT_MAIN_CURRENT_A;
-    g_config.protect_ntc_temp_c = DEFAULT_PROTECT_NTC_TEMP_C;
-    g_config.protect_tx_power1_w = DEFAULT_PROTECT_TX_POWER1_W;
-    g_config.protect_tx_power2_w = DEFAULT_PROTECT_TX_POWER2_W;
+    g_config.pc_baud_rate    = DEFAULT_PC_BAUD_RATE;
+    g_config.radio_type      = RADIO_TYPE_UNKNOWN;
+    g_config.radio_baud_rate = 19200U;
 
-    /* Default calibration (unity) */
-    g_config.cal_tx_power1.forward_slope = 1.0f;
-    g_config.cal_tx_power1.forward_offset = 0.0f;
-    g_config.cal_tx_power2.forward_slope = 1.0f;
-    g_config.cal_tx_power2.forward_offset = 0.0f;
-    g_config.cal_ref_power1.reflect_slope = 1.0f;
-    g_config.cal_ref_power1.reflect_offset = 0.0f;
-    g_config.cal_ref_power2.reflect_slope = 1.0f;
-    g_config.cal_ref_power2.reflect_offset = 0.0f;
-    g_config.cal_rf_input.forward_slope = 1.0f;
-    g_config.cal_rf_input.forward_offset = 0.0f;
+    /* Protection defaults - these mirror the DEFAULT_PROTECT_* / MAX_* in
+     * opa2000.h, which protection.c compares against directly. */
+    g_config.band_rev1_max_w      = (uint16_t)DEFAULT_PROTECT_REFLECT_POWER1_W;
+    g_config.band_rev2_max_w      = (uint16_t)DEFAULT_PROTECT_REFLECT_POWER2_W;
+    g_config.band_rev2_swr_w      = (uint16_t)DEFAULT_PROTECT_REFLECT_POWER2_SWR;
+    g_config.band_swr_max_x100    = (uint16_t)DEFAULT_PROTECT_SWR_THRESHOLD_X100;
+    g_config.band_ntc_max_tenth_c = (uint16_t)(MAX_NTC_TEMP_C * 10);
+    g_config.band_fwd1_max_w      = (uint16_t)MAX_TX_POWER1_W;
+    g_config.band_fwd2_max_w      = (uint16_t)MAX_TX_POWER2_W;
+    g_config.band_im_max_a        = (uint16_t)MAX_MAIN_CURRENT_A;
+    g_config.band_vbias_max_mV    = 5000U;
+    for (int i = 0; i < 6; i++) {
+        g_config.band_rf_in_max_w[i] = 20U;
+    }
 
-    /* Touch calibration invalid */
-    g_config.touch_cal.x_slope = 1.0f;
+    /* IM zero-offset: 1.65 V of a 2.5 V reference on a 16-bit converter. */
+    g_config.im_zero_offset_adc = 43254U;   /* 1.65 / 2.5 * 65535 */
+    g_config.im_calibrated      = 0U;
+
+    /* Touch: identity transform, flagged invalid so touch.c passes raw
+     * through until the operator runs the calibration screen. */
+    g_config.touch_cal.x_slope  = 1.0f;
     g_config.touch_cal.x_offset = 0.0f;
-    g_config.touch_cal.y_slope = 1.0f;
+    g_config.touch_cal.y_slope  = 1.0f;
     g_config.touch_cal.y_offset = 0.0f;
-    g_config.touch_cal.valid = false;
+    g_config.touch_cal.valid    = 0U;
 
-    /* Default language */
-    g_config.language = MULTILANG_ENGLISH;
+    g_config.language      = MULTILANG_CHINESE;
+    g_config.buzzer_enable = 1U;
 
-    /* Calculate and set CRC */
     config_update_crc();
 
-    /* Save to FatFS */
-    config_save();
+    /* Persist so the defaults survive a reboot even with no SD write from
+     * the GUI. Failure is not fatal - config_init() will just re-default. */
+    (void)config_save();
 }
 
 /**
@@ -260,13 +255,10 @@ void config_reset_default(void)
 bool config_validate(void)
 {
     uint32_t stored_crc = g_config.crc32;
-    uint32_t calculated_crc;
 
-    /* Temporarily zero CRC for calculation */
-    g_config.crc32 = 0;
-    calculated_crc = crc32_calculate((const uint8_t*)&g_config, sizeof(ConfigType));
-
-    /* Restore stored CRC */
+    g_config.crc32 = 0U;
+    uint32_t calculated_crc = crc32_calculate((const uint8_t *)&g_config,
+                                             sizeof(ConfigType) - sizeof(uint32_t));
     g_config.crc32 = stored_crc;
 
     return (stored_crc == calculated_crc);
@@ -275,9 +267,9 @@ bool config_validate(void)
 /**
  * @brief Get radio type string
  */
-const char* config_get_radio_type_string(RadioType type)
+const char *config_get_radio_type_string(RadioType type)
 {
-    if (type >= RADIO_TYPE_UNKNOWN && type <= RADIO_TYPE_KENWOOD) {
+    if (type <= RADIO_TYPE_KENWOOD) {
         return radio_type_strings[type];
     }
     return radio_type_strings[RADIO_TYPE_UNKNOWN];

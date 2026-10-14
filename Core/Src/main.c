@@ -43,7 +43,6 @@
 /* USER CODE BEGIN Includes */
 #include "config.h"
 #include "user_adc.h"
-#include "eeprom.h"
 #include "power_control.h"
 #include "protection.h"
 #include "touch.h"
@@ -330,19 +329,14 @@ void PeriphCommonClock_Config(void)
   */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (GPIO_Pin == ADC_Overdrive_Pin)
+  if (GPIO_Pin == HARDPWR_ERR_Pin)
   {
-    /* Handle Overdrive external interrupt - call protection handler */
-    protection_overdrive_isr();
-  }
-  else if (GPIO_Pin == HARDPWR_ERR_Pin)
-  {
-    /* Handle HARDPWR_ERR external interrupt */
+    /* Hardware supply fault from the PSU (PB12, EXTI rising edge). */
     protection_hardpwr_err_isr();
   }
   else if (GPIO_Pin == PTT_INX_Pin)
   {
-    /* Handle PTT input change */
+    /* Foot pedal / PTT key edge (PF5, EXTI5, active low). */
     power_control_ptt_isr();
   }
 }
@@ -359,12 +353,53 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
 
 /**
   * @brief DMA complete callback
-  * @param hdma: DMA handle
+  * @param hadc ADC handle
   * @retval None
   */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-  /* User can add code here if needed - ADC data ready */
+  if (hadc->Instance == ADC1)
+  {
+    /* Publish the fresh regular-group results, then compare the channels
+       that have no analog watchdog behind them (REV2 / FWD1 / FWD2).
+       Runs in interrupt context: integer only, no FreeRTOS, no FPU. */
+    adc_process();
+    protection_check_adc1_dma();
+  }
+}
+
+/**
+  * @brief Injected conversion complete callback (ADC2: NTC + die temp)
+  * @param hadc ADC handle
+  * @retval None
+  */
+void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  (void)hadc;
+  /* Core NTC has no analog watchdog, so the over-temperature comparison
+     lives here rather than in the 100 ms backstop. */
+  protection_check_ntc();
+}
+
+/* Analog watchdog interrupts.  These fire from ADC1_2_IRQHandler at main
+   priority 0, so the shutdown happens before anything else can run. */
+
+void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef* hadc)
+{
+  (void)hadc;
+  protection_awd1_cb();     /* AWD1 -> CH4 RF input power  */
+}
+
+void HAL_ADCEx_LevelOutOfWindow2Callback(ADC_HandleTypeDef* hadc)
+{
+  (void)hadc;
+  protection_awd2_cb();     /* AWD2 -> CH5 main current     */
+}
+
+void HAL_ADCEx_LevelOutOfWindow3Callback(ADC_HandleTypeDef* hadc)
+{
+  (void)hadc;
+  protection_awd3_cb();     /* AWD3 -> CH6 coupler 1 reverse */
 }
 
 /* USER CODE END 4 */
@@ -490,7 +525,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     HAL_IncTick();
   }
   /* USER CODE BEGIN Callback 1 */
-
+  if (htim->Instance == TIM5)
+  {
+    /* TIM5 is the 15 ms break-before-make delay for the PTT relay
+     * sequence; it is started/stopped entirely from power_control.c. */
+    power_relay_timer_callback();
+  }
   /* USER CODE END Callback 1 */
 }
 

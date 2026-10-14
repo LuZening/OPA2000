@@ -37,28 +37,69 @@ extern "C" {
 
 /*============================================================================
  *  ISR-side: lock-free direct GPIO shutdown
- *============================================================================*/
+ *==========================================================================*/
+
+/* Bring the protection subsystem to its power-on state: latch cleared, alert
+ * flags down, RF_IN_PROTECT low, buzzer silent.  Call once from main() before
+ * the scheduler starts (before any interrupt can reach a handler). */
+void protection_init(void);
 
 /* Atomic hardware shutdown.  Called from:
- *   - ADC1_AWD1/2/3 callbacks  (from ADC1_2_IRQHandler, main prio 0)
+ *   - ADC1 AWD1/2/3 callbacks  (from ADC1_2_IRQHandler, main prio 0)
  *   - COMP1/2 callbacks         (from COMP_IRQHandler, main prio 0)
  *   - EXTI15_10 IRQHandler      (HARDPWR_ERR, main prio 0)
  *   - User ad-hoc triggers from protection.c
  * MUST NOT call any FreeRTOS API. */
 void protection_trigger_locked(AlertType cause);
 
-/* Hardware fault line state machine: latched until cleared. */
-void protection_hardpwr_err_isr(void);   /* PB12 EXTI rising edge   */
-void protection_comp1_isr(void);          /* COMP1 over-current/drv */
-void protection_comp2_isr(void);          /* COMP2 over-current     */
+/*============================================================================
+ *  Protection sources
+ *
+ *  Digital  : a discrete fault line, brought in on an EXTI pin, handled
+ *             inside the EXTI ISR.  The line is ACTIVE HIGH - the handler
+ *             re-reads the pin before acting so a spurious edge cannot
+ *             shut the amplifier down.
+ *               HARDERR_PWR (PB12)  power board alarm
+ *               (spare)             future RF deck fault lines
+ *  Analog   : a conversion result compared against a limit.  Where the
+ *             channel is wired to an analog watchdog the comparison is in
+ *             hardware and fires the AWD interrupt; the remaining channels
+ *             are compared in the DMA / injected-completion interrupt.
+ *               AWD2  CH5   IMain   30 A
+ *               AWD3  CH6   REV1    800 W
+ *               DMA          REV2    400 W
+ *               DMA          FWD1    1100 W
+ *               DMA          FWD2    1050 W
+ *               ADC2 inj     NTC     90 C
+ *============================================================================*/
+
+/* Digital fault lines.  Generic so RF deck signals can be added without
+ * touching the shutdown path.  Interrupt context, no FreeRTOS API. */
+void protection_hardpwr_err_isr(void);   /* PB12, ACTIVE HIGH         */
+void protection_digital_isr(AlertType cause);   /* future EXTI fault lines */
+void protection_comp1_isr(void);          /* COMP1 RF input overdrive   */
+void protection_comp2_isr(void);          /* COMP2 main over-current     */
 
 /* AWD callbacks are wired into HAL_ADC_LevelOutOfWindowCallback. */
-void protection_awd1_cb(void);   /* CH4 RF input */
-void protection_awd2_cb(void);   /* CH5 main current */
-void protection_awd3_cb(void);   /* CH6 reflected 1 */
+void protection_awd1_cb(void);   /* CH4 RF input  */
+void protection_awd2_cb(void);   /* CH5 IMain     */
+void protection_awd3_cb(void);   /* CH6 REV1      */
 
 /*============================================================================
- *  Task-side checks (Control 100 ms tick)
+ *  Fast analog checks - interrupt context, no FreeRTOS API
+ *
+ *  Called from the ADC1 DMA-completion interrupt, right after the fresh
+ *  conversion results have been published to g_adc_data.  Covers only the
+ *  channels that have no analog watchdog behind them.
+ *============================================================================*/
+void protection_check_adc1_dma(void);
+
+/* Called from the ADC2 injected-completion interrupt, where the core NTC
+ * result lands. */
+void protection_check_ntc(void);
+
+/*============================================================================
+ *  Task-side checks (Control 100 ms tick) - backstop and slow conditions
  *============================================================================*/
 
 /* Run all software protection checks.  Each check may call

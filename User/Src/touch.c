@@ -15,6 +15,10 @@
 /* Current touch type */
 static TouchType detected_touch_type = TOUCH_NONE;
 
+/* Public view of the detected controller, so the GUI can skip drawing
+ * capacitive-only affordances.  touch_init() is the only writer. */
+volatile TouchType g_touch_type = TOUCH_NONE;
+
 /* Current touch position */
 static TouchPointType current_touch = {0, 0, false};
 
@@ -35,9 +39,10 @@ static struct {
     uint16_t screen_y;
 } cal_data[CAL_POINT_COUNT];
 
-/* Screen dimensions */
+/* Screen dimensions - must match the LTDC layer in Core/Src/ltdc.c
+ * (ImageWidth 480 / ImageHeight 272, RGB565). */
 #define SCREEN_WIDTH    480
-#define SCREEN_HEIGHT   800
+#define SCREEN_HEIGHT   272
 
 /* Calibration screen positions (10% from edges + center) */
 static const CalPointType cal_points[CAL_POINT_COUNT] = {
@@ -285,10 +290,7 @@ bool touch_calibrate_add_point(uint16_t screen_x, uint16_t screen_y)
  */
 bool touch_calibrate_complete(void)
 {
-    float sum_x_n = 0, sum_x_d = 0;
-    float sum_y_n = 0, sum_y_d = 0;
-    float x1, y1, x2, y2;
-    float center_residual;
+    float x1, y1;
 
     if (cal_point_index < CAL_POINT_COUNT) {
         calibrating = false;

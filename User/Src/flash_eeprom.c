@@ -144,19 +144,20 @@ uint32_t eeprom_decode(const uint32_t *words, uint32_t n_words,
 
 #ifndef HOST_TEST_NATIVE
 
+/* Must come first: it supplies the FLASH_CR_PSIZE family that the H7 flash
+ * HAL and its legacy header reference unconditionally, and that this part's
+ * CMSIS header omits.  See the file header for the full explanation. */
+#include "h7b0_flash_compat.h"
+
 #include "stm32h7xx_hal.h"
-/*!< FLASH_VOLTAGE_RANGE_3 and FLASH_EraseInitTypeDef live here, not in
- *   stm32h7xx_hal_flash.h. */
 #include "stm32h7xx_hal_flash_ex.h"
 
-/*!< Absolute base ofEEPROM_FIRST_SECTOR.  128 KB part, 8 KB sectors. */
+/*!< Absolute base of EEPROM_FIRST_SECTOR.  128 KB part, 8 KB sectors. */
 #define EEPROM_FLASH_BASE   (0x08000000UL + (EEPROM_FIRST_SECTOR * EEPROM_SECTOR_BYTES))
 
-/*!< All error flags, cleared before every operation.  The H7 flash
- *   controller has separate flag sets per bank, and the bank field in
- *   FLASH_CCR is bank-specific on dual-bank parts, so both sets are
- *   cleared - a stale error from an interrupted earlier save would
- *   otherwise make every subsequent HAL_FLASH_* call return HAL_ERROR. */
+/*!< All error flags, cleared before every operation.  A stale error left by
+ *   an interrupted earlier save would otherwise make every subsequent
+ *   HAL_FLASH_* call return HAL_ERROR. */
 #define EEPROM_FLASH_ERROR_FLAGS  (FLASH_FLAG_ALL_ERRORS_BANK1 | FLASH_FLAG_ALL_ERRORS_BANK2)
 
 static uint32_t eeprom_sector_base(uint32_t sector_index)
@@ -179,19 +180,14 @@ static bool eeprom_hal_erase_sector(uint32_t sector_index)
 {
     FLASH_EraseInitTypeDef er = {0};
 
-    er.TypeErase    = FLASH_TYPEERASE_SECTORS;
-    /* 32-bit parallel programming.  The HAL's FLASH_VOLTAGE_RANGE_* family is
-     * only defined when the CMSIS header exposes FLASH_CR_PSIZE, which on
-     * this part it does not; VOLTAGE_RANGE_3 is the same setting under the
-     * name the CMSIS device header uses, and it is what
-     * IS_FLASH_VOLTAGE_RANGE() checks. */
-    er.VoltageRange = VOLTAGE_RANGE_3;
-    er.Sector       = EEPROM_FIRST_SECTOR + sector_index;
-#if defined(FLASH_BANK_1)
+    er.TypeErase = FLASH_TYPEERASE_SECTORS;
     er.Banks        = FLASH_BANK_1;
-#else
-    er.Banks        = 0U;   /*!< single bank: the HAL ignores the field */
-#endif
+    er.Sector       = EEPROM_FIRST_SECTOR + sector_index;
+    er.NbSectors    = 1U;
+    /* 32-bit parallel programming (PSIZE = 10).  This part always runs at
+     * RANGE_3: FLASH_NB_32BITWORD_IN_FLASHWORD is 4, so a flash word is
+     * 128 bits regardless, and RANGE_3 is what ST's own H7 examples use. */
+    er.VoltageRange = FLASH_VOLTAGE_RANGE_3;
 
     uint32_t sector_error = 0U;
     return HAL_FLASHEx_Erase(&er, &sector_error) == HAL_OK;
@@ -199,6 +195,16 @@ static bool eeprom_hal_erase_sector(uint32_t sector_index)
 
 static bool eeprom_hal_program(uint32_t address, const uint32_t *words, uint32_t n)
 {
+    /* One HAL_FLASH_Program() call per 16-byte flash word, and the caller
+     * guarantees each word is programmed exactly once.
+     *
+     * This matters more than it looks.  Each flash word carries ECC bits
+     * that are computed over the full 128 data bits, so a word must go
+     * from erased to its final value in a single operation.  Programming
+     * part of a word and later programming the rest corrupts the ECC, and
+     * the next read of that address raises a bus fault that hardfaults the
+     * core.  Never retry a failed program on the same address - erase the
+     * sector instead. */
     for (uint32_t i = 0U; i < n; i++) {
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD,
                               address + i * EEPROM_WORD_BYTES,
@@ -209,10 +215,62 @@ static bool eeprom_hal_program(uint32_t address, const uint32_t *words, uint32_t
     return true;
 }
 
-static bool eeprom_word_is_erased(uint32_t address)
+/* Read the record id out of a slot's header word 1, without touching the
+ * payload. */
+uint32_t eeprom_header_id(const uint32_t *words)
 {
-    const uint32_t *p = (const uint32_t *)address;
-    return (*p == 0xFFFFFFFFU);
+    return (words[1] >> 16) & 0xFFFFU;
+}
+
+/* Payload length from the header, without touching the payload. */
+uint32_t eeprom_header_len(const uint32_t *words)
+{
+    return words[1] & 0xFFFFU;
+}
+
+/* Check just the framing: header magic, committed flag, and agreement
+ * between the header and the commit word at the end of the record.
+ *
+ * The payload CRC is deliberately NOT verified here - that would mean
+ * reading the payload, which is exactly what the two-pass load avoids.
+ * A record that passes this but fails its CRC is caught by the full
+ * eeprom_decode() in pass 2. */
+bool eeprom_record_is_intact(const uint32_t *words)
+{
+    uint32_t len;
+    uint32_t need;
+
+    if (words[0] != EEPROM_RECORD_MAGIC) {
+        return false;
+    }
+    if ((words[2] & EEPROM_FLAG_COMMITTED) == 0U) {
+        return false;
+    }
+
+    len  = words[1] & 0xFFFFU;
+    need = eeprom_record_words(len);
+    if (need * EEPROM_WORD_BYTES > EEPROM_SECTOR_BYTES) {
+        return false;
+    }
+
+    /* The commit word is programmed last, so an interrupted save leaves it
+     * erased.  It must also agree with the header: a mismatch means the two
+     * halves came from different saves. */
+    if (words[need - 1U] != EEPROM_RECORD_MAGIC) {
+        return false;
+    }
+    if (eeprom_header_id(words) != (words[need - 1U] >> 16)) {
+        return false;
+    }
+    if (len != (words[need - 1U] & 0xFFFFU)) {
+        return false;
+    }
+    return true;
+}
+
+static bool eeprom_word_is_erased(const uint32_t *words)
+{
+    return (words[0] == 0xFFFFFFFFU);
 }
 
 /*============================================================================
@@ -221,16 +279,34 @@ static bool eeprom_word_is_erased(uint32_t address)
 
 bool eeprom_load(void *out, uint32_t out_size)
 {
-    uint32_t best_id = 0U;
-    bool found = false;
+    /* Two passes, and the split is deliberate: it is what keeps the RAM
+     * cost at zero.
+     *
+     * Pass 1 walks every slot reading ONLY the 4-word header.  It collects
+     * the id and address of each framing-valid record.  The payload is
+     * never touched, so a ring holding 128 records costs 128 bytes of flash
+     * reads, not 16 KB.
+     *
+     * Pass 2 walks that list newest-first and stops at the first record
+     * whose payload actually decodes.
+     *
+     * The single-pass alternative would copy every candidate payload into
+     * `out` on the way past, overwriting the good copy with a worse one
+     * whenever the newest turned out to be torn.  Here `out` is written
+     * exactly once, by the record that survives.
+     */
+    /* Candidate list: one entry per framing-valid record.  Bounded by the
+     * ring capacity (4 sectors x 32 records), so this is a fixed 1 KB worst
+     * case and there is no allocation and no failure path. */
+    static struct { uint32_t addr; uint32_t words; uint32_t id; }
+           s_cand[EEPROM_MAX_RECORDS];
+    uint32_t n_cand = 0U;
 
     if (out == NULL) {
         return false;
     }
 
-    /* Scan every slot of every sector.  Ids increase monotonically, so the
-     * record carrying the highest valid id is the newest one no matter which
-     * sector it happens to sit in. */
+    /* ---- Pass 1: locate every framing-valid record, headers only ---- */
     for (uint32_t sec = 0U; sec < EEPROM_SECTOR_COUNT; sec++) {
         uint32_t base = eeprom_sector_base(sec);
 
@@ -240,19 +316,20 @@ bool eeprom_load(void *out, uint32_t out_size)
             uint32_t len;
             uint32_t need;
 
-            if (eeprom_word_is_erased(addr)) {
+            if (eeprom_word_is_erased(words)) {
                 /* Slots are filled in order, so once one is erased nothing
                  * further along in this sector can be valid. */
                 break;
             }
-            if (words[0] != EEPROM_RECORD_MAGIC) {
+
+            /* Header and commit word only - never the payload between
+             * them.  This is the whole point of the two-pass split. */
+            if (!eeprom_record_is_intact(words)) {
                 s_stats.loads_corrupt++;
                 continue;
             }
 
-            /* The header carries the payload length, so there is no need to
-             * guess: read it, then hand decode() the exact slot size. */
-            len  = words[1] & 0xFFFFU;
+            len  = eeprom_header_len(words);
             need = eeprom_record_words(len);
 
             if (need * EEPROM_WORD_BYTES > EEPROM_SECTOR_BYTES) {
@@ -260,20 +337,11 @@ bool eeprom_load(void *out, uint32_t out_size)
                 break;      /*!< nonsense length: the chain is untrustworthy */
             }
 
-            if (eeprom_decode(words, need, out, out_size) == 0U) {
-                s_stats.loads_corrupt++;
-                /* Skip the rest of this record so a torn tail cannot be
-                 * mistaken for the header of a following record. */
-                w += (need - 1U) * 2U;
-                continue;
-            }
-
-            {
-                uint32_t id = words[1] >> 16;
-                if (!found || id > best_id) {
-                    best_id = id;
-                    found = true;
-                }
+            if (n_cand < EEPROM_MAX_RECORDS) {
+                s_cand[n_cand].addr  = addr;
+                s_cand[n_cand].words = need;
+                s_cand[n_cand].id    = eeprom_header_id(words);
+                n_cand++;
             }
 
             /* Jump past this record; the loop increments w by 2 on top. */
@@ -281,12 +349,50 @@ bool eeprom_load(void *out, uint32_t out_size)
         }
     }
 
-    if (found) {
-        s_stats.loads_ok++;
-    } else {
+    if (n_cand == 0U) {
         s_stats.loads_empty++;
+        return false;
     }
-    return found;
+
+    /* ---- Pass 2: newest first, stop at the first that decodes ---- */
+    /* Selection sort by id, descending, done in place.  At most a few
+     * records are ever examined in practice, and insertion into an already
+     * sorted list keeps the inner loop tiny. */
+    for (uint32_t i = 1U; i < n_cand; i++) {
+        uint32_t key_addr  = s_cand[i].addr;
+        uint32_t key_words = s_cand[i].words;
+        uint32_t key_id    = s_cand[i].id;
+        uint32_t j = i;
+
+        while (j > 0U && s_cand[j - 1U].id < key_id) {
+            s_cand[j] = s_cand[j - 1U];
+            j--;
+        }
+        s_cand[j].addr  = key_addr;
+        s_cand[j].words = key_words;
+        s_cand[j].id    = key_id;
+    }
+
+    for (uint32_t i = 0U; i < n_cand; i++) {
+        if (eeprom_decode((const uint32_t *)s_cand[i].addr, s_cand[i].words,
+                          out, out_size) != 0U) {
+            if (i > 0U) {
+                /* The newer ones were framing-valid but their payloads did
+                 * not decode, i.e. bit rot or a marginal brown-out during
+                 * the write.  Falling back to an older intact record is the
+                 * whole reason several are kept. */
+                s_stats.loads_corrupt += i;
+            }
+            s_stats.loads_ok++;
+            return true;
+        }
+        s_stats.loads_corrupt++;
+    }
+
+    /* Every candidate failed its payload CRC: treat it as no configuration
+     * rather than handing back a partially valid struct. */
+    s_stats.loads_empty++;
+    return false;
 }
 
 uint32_t eeprom_current_id(void)
@@ -299,13 +405,13 @@ uint32_t eeprom_current_id(void)
         for (uint32_t w = 0U; w < EEPROM_WORDS_PER_SECTOR; w += 2U) {
             uint32_t addr = base + w * EEPROM_WORD_BYTES;
             const uint32_t *words = (const uint32_t *)addr;
-            if (eeprom_word_is_erased(addr)) {
+            if (eeprom_word_is_erased(words)) {
                 break;
             }
             if (words[0] != EEPROM_RECORD_MAGIC) {
                 continue;
             }
-            uint32_t id = words[1] >> 16;
+            uint32_t id = eeprom_header_id(words);
             if (!found || id > best) {
                 best = id;
                 found = true;
@@ -313,7 +419,7 @@ uint32_t eeprom_current_id(void)
             /* Step to the next record rather than the next pair of words:
              * the length lives in the header, so this cannot land inside
              * the record we just read. */
-            w += (eeprom_record_words(words[1] & 0xFFFFU) - 1U) * 2U;
+            w += (eeprom_record_words(eeprom_header_len(words)) - 1U) * 2U;
         }
     }
     return best;
@@ -341,7 +447,9 @@ bool eeprom_save(const void *src, uint32_t len)
     for (uint32_t sec = 0U; sec < EEPROM_SECTOR_COUNT && erased_first; sec++) {
         uint32_t base = eeprom_sector_base(sec);
         for (uint32_t w = 0U; w < EEPROM_WORDS_PER_SECTOR; w += need) {
-            if (eeprom_word_is_erased(base + w * EEPROM_WORD_BYTES)) {
+            const uint32_t *words =
+                (const uint32_t *)(base + w * EEPROM_WORD_BYTES);
+            if (eeprom_word_is_erased(words)) {
                 target_sec  = sec;
                 target_slot = w;
                 erased_first = false;
@@ -363,14 +471,14 @@ bool eeprom_save(const void *src, uint32_t len)
             bool any = false;
             for (uint32_t w = 0U; w < EEPROM_WORDS_PER_SECTOR; w += 2U) {
                 uint32_t addr = base + w * EEPROM_WORD_BYTES;
-                if (eeprom_word_is_erased(addr)) {
+                const uint32_t *words = (const uint32_t *)addr;
+                if (eeprom_word_is_erased(words)) {
                     break;
                 }
-                const uint32_t *words = (const uint32_t *)addr;
                 if (words[0] != EEPROM_RECORD_MAGIC) {
                     continue;
                 }
-                uint32_t id = words[1] >> 16;
+                uint32_t id = eeprom_header_id(words);
                 if (!any || id < sec_min) {
                     sec_min = id;
                     any = true;

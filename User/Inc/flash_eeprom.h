@@ -81,6 +81,12 @@ extern "C" {
 #define EEPROM_MAX_RECORD_WORDS \
     (1U + ((EEPROM_MAX_PAYLOAD_BYTES + EEPROM_WORD_BYTES - 1U) / EEPROM_WORD_BYTES) + 1U)
 
+/*!< Highest number of records the ring can hold.  eeprom_load() uses this to
+ *   size its candidate table, so it must not be raised past what the sectors
+ *   can actually store. */
+#define EEPROM_MAX_RECORDS \
+    ((EEPROM_SECTOR_COUNT * EEPROM_WORDS_PER_SECTOR) / EEPROM_MAX_RECORD_WORDS)
+
 /*============================================================================
  *  Record header (word 0)
  *============================================================================*/
@@ -158,6 +164,32 @@ uint32_t eeprom_encode(uint32_t id, const void *src, uint32_t len,
  */
 uint32_t eeprom_decode(const uint32_t *words, uint32_t n_words,
                        void *out, uint32_t out_size);
+
+/*==============================================================================
+ *  Header-only accessors
+ *
+ *  These read a slot's header and commit word but never its payload.  eeprom_load()
+ *  uses them to survey the ring cheaply before committing to reading any
+ *  record in full.  Exposed for the host tests.
+ *===========================================================================*/
+
+/** @brief Record id from a slot's header, without reading the payload. */
+uint32_t eeprom_header_id(const uint32_t *words);
+
+/** @brief Payload length from a slot's header, without reading the payload. */
+uint32_t eeprom_header_len(const uint32_t *words);
+
+/**
+ * @brief Check a slot's framing only: header magic, committed flag, and
+ *        agreement between header and commit word.
+ *
+ * @note  Does NOT verify the payload CRC - that would mean reading the
+ *        payload, which is what eeprom_load() is avoiding.  A record that
+ *        passes here but fails its CRC is caught by eeprom_decode().
+ *
+ * @param words First word of the slot, i.e. the header
+ */
+bool eeprom_record_is_intact(const uint32_t *words);
 
 #ifdef __cplusplus
 }

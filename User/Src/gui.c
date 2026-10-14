@@ -19,6 +19,47 @@
  * Private Variables
  *============================================================================*/
 
+/*============================================================================
+ *  Deferred-save staging
+ *
+ *  Two levels of dirty flag, because the menu is an editing session rather
+ *  than a series of committed steps:
+ *
+ *    s_menu_dirty   raised by any sub-page callback that edits a g_config
+ *                   field.  Lives only for the duration of the session.
+ *    config's flag  raised when the session ends.
+ *
+ *  Why it matters: the flash write is deferred to app_config_task() one
+ *  second later, and the main menu can be closed and reopened inside that
+ *  window.  Writing on every edit would mean a power cut mid-session
+ *  restores a half-applied set of thresholds.  Staging until the menu
+ *  closes makes the save land on a boundary the operator actually perceives
+ *  as "I finished editing".
+ *
+ *  Declared up here because the calibration screens that call
+ *  gui_menu_mark_dirty() are textually above the menu code.
+ *==========================================================================*/
+
+static bool s_menu_dirty = false;
+
+/** @brief Record an in-menu edit. Takes effect when the menu closes. */
+static void gui_menu_mark_dirty(void)
+{
+    s_menu_dirty = true;
+}
+
+/** @brief Publish a staged session to the deferred-save machinery. */
+static void gui_menu_commit_dirty(void)
+{
+    if (!s_menu_dirty) {
+        return;
+    }
+    s_menu_dirty = false;
+#ifndef LVGL_SIM
+    config_mark_dirty();
+#endif
+}
+
 /* Screen dimensions — 480x272 landscape, RGB565 via LTDC */
 #define HOR_RES  480
 #define VER_RES  272
@@ -801,7 +842,7 @@ static void cal_accept_cb(lv_obj_t *obj, lv_event_t e)
         calibrating = false;
         cal_state = 0;
 #ifndef LVGL_SIM
-        config_mark_dirty();
+        gui_menu_mark_dirty();
 #endif
         lv_scr_load(main_screen);
     }
@@ -1180,7 +1221,7 @@ void gui_set_language(LanguageType lang)
     current_language = lang;
 #ifndef LVGL_SIM
     g_config.language = lang;
-    config_mark_dirty();
+    gui_menu_mark_dirty();
 #endif
 
     for (size_t i = 0; i < sizeof(lang_refresh) / sizeof(lang_refresh[0]); i++) {
@@ -1276,19 +1317,12 @@ static void settings_menu_cb(lv_obj_t *obj, lv_event_t e)
     if (e == LV_EVENT_CLICKED) {
         uint16_t btn_id = lv_btnmatrix_get_active_btn(obj);
 
-        /* Leaving the main menu is the point where a whole batch of edits is
-         * finished, so this is the natural place to ask for a save.  Each
-         * individual sub-page already raised the flag as its values
-         * changed; doing it here as well covers anything edited without
-         * going through a sub-page callback.
-         *
-         * It is only a request - app_config_task() does the flash write a
-         * second later, at the lowest priority, because programming flash
-         * stalls instruction fetch and must not happen inside an LVGL
-         * callback. */
-#ifndef LVGL_SIM
-        config_mark_dirty();
-#endif
+        /* Every button on this screen opens a sub-page, so leaving the menu
+         * is the moment a batch of edits is finished.  Publish the staged
+         * flag now; app_config_task() does the actual flash write a second
+         * later, at the lowest priority, because programming flash stalls
+         * instruction fetch and must not run inside an LVGL callback. */
+        gui_menu_commit_dirty();
 
         if (btn_id == 0) {
             lv_obj_del_async(lv_obj_get_parent(obj));
@@ -1352,13 +1386,13 @@ static void language_sel_cb(lv_obj_t *obj, lv_event_t e)
             temp_fahrenheit = false;
 #ifndef LVGL_SIM
             g_config.temp_fahrenheit = 0U;
-            config_mark_dirty();
+            gui_menu_mark_dirty();
 #endif
         } else if (id == 3) {
             temp_fahrenheit = true;
 #ifndef LVGL_SIM
             g_config.temp_fahrenheit = 1U;
-            config_mark_dirty();
+            gui_menu_mark_dirty();
 #endif
         }
         lv_obj_del_async(obj);
@@ -1591,7 +1625,7 @@ static void cc_accept_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
 #ifndef LVGL_SIM
-        config_mark_dirty();
+        gui_menu_mark_dirty();
 #endif
         cc_active = false;
         cc_state = 0;
@@ -2192,7 +2226,7 @@ static void band_comm_cb(lv_obj_t *obj, lv_event_t e)
 #ifndef LVGL_SIM
         if (btn_id <= 2) {
             g_config.radio_type = (RadioType)(btn_id + 1);
-            config_mark_dirty();
+            gui_menu_mark_dirty();
         }
 #endif
     }
@@ -2335,7 +2369,7 @@ static void prot_save_cb(lv_obj_t *obj, lv_event_t e)
     if (e == LV_EVENT_CLICKED) {
         prot_to_config();
 #ifndef LVGL_SIM
-        config_mark_dirty();
+        gui_menu_mark_dirty();
 #endif
         prot_screen = NULL; lv_scr_load(main_screen);
     }

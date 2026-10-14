@@ -8,6 +8,7 @@
 #include "user_adc.h"
 #include "power_control.h"
 #include "protection.h"
+#include "radio_band.h"
 #include "opa2000.h"
 #include "string.h"
 #include "stdio.h"
@@ -287,7 +288,7 @@ static void comm_execute(CommandType cmd_type, const char *args)
                 (uint32_t)(g_config.band_swr_max_x100 / 100U),
                 (uint32_t)(g_config.band_swr_max_x100 % 100U),
                 (uint32_t)g_config.band_rev1_max_w,
-                (uint32_t)g_config.band_im_max_a);
+                (uint32_t)g_config.band_im_max_mA);
             comm_send_string(comm_response_buffer);
             break;
 
@@ -621,10 +622,13 @@ uint32_t comm_get_radio_frequency(void)
 
 /**
  * @brief Get radio type
+ * @note  Reports what radio_band.c actually detected on the CAT line, not
+ *        the configured default: until a frame is recognised the answer is
+ *        RADIO_TYPE_UNKNOWN, which is what the GUI shows as "not connected".
  */
 RadioType comm_get_radio_type(void)
 {
-    return g_radio_type;
+    return radio_band_get_type();
 }
 
 /**

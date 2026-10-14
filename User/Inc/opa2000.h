@@ -150,6 +150,19 @@ typedef enum {
     FAN_SPEED_HIGH,      /*!< 100 % */
 } FanSpeedType;
 
+/* Front-panel power state.
+ *
+ * This is the operator-visible three-position view, derived by power_control.c
+ * from the two independent flags below.  g_psu_on and g_tx_active stay
+ * separate because "supply on but not keyed" and "keyed" are genuinely
+ * different conditions that the protection logic cares about individually;
+ * the GUI just wants one label. */
+typedef enum {
+    POWER_STATE_OFF = 0,     /*!< supply disengaged                       */
+    POWER_STATE_STANDBY,     /*!< supply on, PA disconnected             */
+    POWER_STATE_TX,          /*!< supply on and transmitting            */
+} PowerStateType;
+
 /*============================================================================
  * Cross-task shared structures
  *============================================================================*/
@@ -221,26 +234,36 @@ typedef struct {
 } AdcDataType;
 
 /* Touch screen transform.  Least-squares fit over CAL_POINT_COUNT samples:
- * screen = raw * slope + offset.  Floats, not fixed point - the MCU has an
+ * screen = raw * gain + offset.  Floats, not fixed point - the MCU has an
  * FPU and these are only evaluated at calibration time and once per touch
- * report.  `valid` gates the transform: until the first calibration the raw
- * values pass through unchanged. */
+ * report.  `calibrated` gates the transform: until the first calibration
+ * the raw values pass through unchanged. */
 typedef struct {
-    float    x_slope;
+    float    x_gain;
     float    x_offset;
-    float    y_slope;
+    float    y_gain;
     float    y_offset;
-    uint8_t  valid;
+    uint8_t  calibrated;
     uint8_t  reserved[3];
-} TouchCalType;
+} touch_cal_t;
+
+/* Directional-coupler calibration, one per coupler / direction.
+ *
+ * The slope is kept as micro-Watt per ADC code and the intercept in
+ * milli-Watt, so both are exact integers without any fixed-point
+ * arithmetic:
+ *
+ *     power_mW = raw * gain_uW_per_code / 1000 + offset_mW
+ *
+ * Only the coupler calibration screen writes these; adc_calibration.c
+ * uses them as a trim on top of the OPA1000 front-end model. */
+typedef struct {
+    int32_t  gain_uW_per_code;
+    int32_t  offset_mW;
+} coupler_t;
 
 /* Persistent configuration blob.  Held in RAM as the global g_config;
- * config.c mirrors it to /fs/config.bin.
- *
- * NOTE: there are deliberately no per-channel coupler coefficients.  The
- * directional-coupler front end is modelled exactly like OPA1000 (see
- * adc_calibration.h section 1b), so power conversion needs no stored
- * coefficients.  Only the current-sense zero offset is calibrated. */
+ * config.c mirrors it to /fs/config.bin. */
 typedef struct {
     uint32_t magic;                   /*!< CONFIG_MAGIC, see config.h       */
     uint8_t  version;                 /*!< CONFIG_VERSION, bump on layout change */
@@ -259,7 +282,7 @@ typedef struct {
     uint16_t band_ntc_max_tenth_c;    /*!< NTC overheat threshold          */
     uint16_t band_fwd1_max_w;         /*!< coupler 1 forward software limit */
     uint16_t band_fwd2_max_w;         /*!< coupler 2 forward software limit */
-    uint16_t band_im_max_a;           /*!< main current threshold          */
+    uint16_t band_im_max_mA;          /*!< main current threshold, milli-Amp */
     uint16_t band_vbias_max_mV;       /*!< VBIAS threshold                 */
 
     /* IM zero-offset calibration */
@@ -267,12 +290,19 @@ typedef struct {
     uint8_t  im_calibrated;
 
     /* Touch screen calibration */
-    TouchCalType touch_cal;
+    touch_cal_t touch;
+
+    /* Directional-coupler trims, written by the coupler calibration screen */
+    coupler_t fwd1;
+    coupler_t fwd2;
+    coupler_t rev1;
+    coupler_t rev2;
 
     /* Misc */
     LanguageType language;
     uint8_t  buzzer_enable;
-    uint8_t  reserved[6];
+    uint8_t  temp_fahrenheit;         /*!< display temperatures in degF     */
+    uint8_t  reserved[5];
 
     /* MUST stay last: config.c computes the CRC over everything ahead of it. */
     uint32_t crc32;
@@ -310,6 +340,10 @@ extern volatile AlertType      g_alert_active;
 extern volatile bool           g_alert_flag;
 extern volatile FanSpeedType   g_fan_speed;
 extern volatile uint32_t       g_radio_freq_hz;   /*!< last measured Hz */
+
+/* Operator-visible power state, derived from g_psu_on / g_tx_active.
+ * Written only by power_control.c; read by the GUI for its status banner. */
+extern volatile PowerStateType g_power_state;
 
 extern ConfigType  g_config;
 

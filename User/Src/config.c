@@ -221,7 +221,7 @@ void config_reset_default(void)
     g_config.band_ntc_max_tenth_c = (uint16_t)(MAX_NTC_TEMP_C * 10);
     g_config.band_fwd1_max_w      = (uint16_t)MAX_TX_POWER1_W;
     g_config.band_fwd2_max_w      = (uint16_t)MAX_TX_POWER2_W;
-    g_config.band_im_max_a        = (uint16_t)MAX_MAIN_CURRENT_A;
+    g_config.band_im_max_mA       = (uint16_t)(MAX_MAIN_CURRENT_A * 1000U);
     g_config.band_vbias_max_mV    = 5000U;
     for (int i = 0; i < 6; i++) {
         g_config.band_rf_in_max_w[i] = 20U;
@@ -231,16 +231,23 @@ void config_reset_default(void)
     g_config.im_zero_offset_adc = 43254U;   /* 1.65 / 2.5 * 65535 */
     g_config.im_calibrated      = 0U;
 
-    /* Touch: identity transform, flagged invalid so touch.c passes raw
+    /* Touch: identity transform, flagged uncalibrated so touch.c passes raw
      * through until the operator runs the calibration screen. */
-    g_config.touch_cal.x_slope  = 1.0f;
-    g_config.touch_cal.x_offset = 0.0f;
-    g_config.touch_cal.y_slope  = 1.0f;
-    g_config.touch_cal.y_offset = 0.0f;
-    g_config.touch_cal.valid    = 0U;
+    g_config.touch.x_gain      = 1.0f;
+    g_config.touch.x_offset    = 0.0f;
+    g_config.touch.y_gain      = 1.0f;
+    g_config.touch.y_offset    = 0.0f;
+    g_config.touch.calibrated  = 0U;
+
+    /* Coupler trims zero == "no calibration, use the OPA1000 model as is". */
+    g_config.fwd1 = (coupler_t){0, 0};
+    g_config.fwd2 = (coupler_t){0, 0};
+    g_config.rev1 = (coupler_t){0, 0};
+    g_config.rev2 = (coupler_t){0, 0};
 
     g_config.language      = MULTILANG_CHINESE;
     g_config.buzzer_enable = 1U;
+    g_config.temp_fahrenheit = 0U;
 
     config_update_crc();
 

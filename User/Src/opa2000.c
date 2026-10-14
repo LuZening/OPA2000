@@ -47,6 +47,10 @@ volatile FanSpeedType   g_fan_speed    = FAN_SPEED_LOW;
 /* Last measured RF frequency in Hz, written by Control freq_detect task */
 volatile uint32_t       g_radio_freq_hz = 0U;
 
+/* Operator-visible power state, kept in step with g_psu_on / g_tx_active
+ * by power_control.c. */
+volatile PowerStateType g_power_state   = POWER_STATE_OFF;
+
 /* Persistent config blob.  Default-initialised in opa2000_init(); the
  * Networking agent's sdconfig.cpp overwrites it from /fs/config.bin
  * after startup. */
@@ -183,15 +187,32 @@ void opa2000_init(void)
     g_config.band_ntc_max_tenth_c  = (uint16_t)(MAX_NTC_TEMP_C * 10U);
     g_config.band_fwd1_max_w       = (uint16_t)MAX_TX_POWER1_W;
     g_config.band_fwd2_max_w       = (uint16_t)MAX_TX_POWER2_W;
-    g_config.band_im_max_a         = (uint16_t)MAX_MAIN_CURRENT_A;
+    g_config.band_im_max_mA        = (uint16_t)(MAX_MAIN_CURRENT_A * 1000U);
     g_config.band_vbias_max_mV     = 5000U;
     g_config.im_zero_offset_adc    = 43254U;  /* 1.65 V / 2.5 V * 65535 */
     g_config.im_calibrated         = 0U;
     g_config.language              = MULTILANG_CHINESE;
     g_config.buzzer_enable         = 1U;
+    g_config.temp_fahrenheit       = 0U;
+
+    /* Touch: identity transform, flagged uncalibrated so touch.c passes raw
+     * through until the operator runs the calibration screen. */
+    g_config.touch.x_gain = 1.0f;
+    g_config.touch.x_offset = 0.0f;
+    g_config.touch.y_gain = 1.0f;
+    g_config.touch.y_offset = 0.0f;
+    g_config.touch.calibrated = 0U;
+
+    /* Coupler trims stay at zero until calibrated: adc_calibration.c treats
+     * gain 0 as "use the OPA1000 front-end model unchanged". */
+    g_config.fwd1 = (coupler_t){0, 0};
+    g_config.fwd2 = (coupler_t){0, 0};
+    g_config.rev1 = (coupler_t){0, 0};
+    g_config.rev2 = (coupler_t){0, 0};
 
     g_psu_on      = false;
     g_tx_active   = false;
+    g_power_state = POWER_STATE_OFF;
     g_current_band = BAND_NONE;
     g_allow_rf = false;
     g_alert_active = ALERT_NONE;

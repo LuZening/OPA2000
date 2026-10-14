@@ -63,11 +63,16 @@ static FanSpeedType   fan_current_speed  = FAN_SPEED_LOW;
 static void ptt_enter_tx(void)
 {
     g_tx_active = true;
+    g_power_state = POWER_STATE_TX;
 }
 
 static void ptt_leave_tx(void)
 {
     g_tx_active = false;
+    /* Back to standby if the supply is still engaged, off otherwise.
+     * ptt_leave_tx() also runs from power_psu_off(), which clears
+     * g_psu_on right after, so re-check the flag rather than assume. */
+    g_power_state = g_psu_on ? POWER_STATE_STANDBY : POWER_STATE_OFF;
 }
 
 /*============================================================================
@@ -248,6 +253,7 @@ void power_init_outputs(void)
     /* Everything is wired to the inactive state above. */
     g_psu_on    = false;
     g_tx_active = false;
+    g_power_state = POWER_STATE_OFF;
 }
 
 /*============================================================================
@@ -263,6 +269,8 @@ void power_psu_on(void)
     /* PA bias enable. */
     RF_BIAS_ENABLE();
     g_psu_on = true;
+    /* Not TX: keying goes through power_relays_tx_on(). */
+    g_power_state = POWER_STATE_STANDBY;
 }
 
 void power_psu_off(void)
@@ -273,6 +281,10 @@ void power_psu_off(void)
     RF_BIAS_DISABLE();
     PSU_ON_PWR_OFF();
     g_psu_on = false;
+    /* power_relays_tx_off() above already ran ptt_leave_tx() and picked
+     * STANDBY because the supply was still on at that point; the supply
+     * is gone now, so restate the final state. */
+    g_power_state = POWER_STATE_OFF;
 }
 
 void power_relays_tx_on(void)

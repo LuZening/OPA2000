@@ -7,6 +7,7 @@
 #include "lv_port_disp.h"
 #include <math.h>
 #ifndef LVGL_SIM
+#include "comm.h"
 #include "config.h"
 #include "touch.h"
 #include "power_control.h"
@@ -1513,6 +1514,7 @@ static lv_obj_t *cc_raw_val_label = NULL;
 static lv_obj_t *cc_step_label = NULL;
 static lv_obj_t *cc_instr_label = NULL;
 static lv_obj_t *cc_ch_label = NULL;
+static lv_obj_t *cc_title_label = NULL;
 static uint16_t cc_meas[CC_STEPS];
 static char cc_buf[48];
 /* The step UI must not be rebuilt from inside the button's own event
@@ -1720,6 +1722,10 @@ static void cc_refresh_ui(uint8_t step)
 {
     char buf[64];
     char step_str[32];
+
+    snprintf(buf, sizeof(buf), "%s %s",
+             cc_coupler_name(), gui_get_string(STR_CALIBRATION));
+    lv_label_set_text(cc_title_label, buf);
 
     cc_step_desc(step, step_str, sizeof(step_str));
     snprintf(buf, sizeof(buf), "%d/%d  %s", step + 1, CC_STEPS, step_str);
@@ -2052,7 +2058,7 @@ void gui_update_sensor_inspect(void)
 {
     if (!si_overlay) return;
     char buf[48];
-    for (int i = 0; i < SI_ROW_COUNT; i++) {
+    for (unsigned i = 0; i < SI_ROW_COUNT; i++) {
 #ifndef LVGL_SIM
         uint16_t raw = g_adc_data.adc1_raw[i];
         snprintf(buf, sizeof(buf), "%u", raw);
@@ -2075,7 +2081,7 @@ void gui_update_sensor_inspect(void)
                 snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.rev2_mW / 1000.0f);
                 break;
             case ADC1_RANK_VBIAS:
-                snprintf(buf, sizeof(buf), "%.0fmV", (int)g_adc_data.vbias_mV);
+                snprintf(buf, sizeof(buf), "%.0fmV", (double)g_adc_data.vbias_mV);
                 break;
             case ADC1_RANK_FWD2:
                 snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.fwd2_mW / 1000.0f);
@@ -2250,7 +2256,7 @@ static void prot_from_config(void)
     prot_val[1] = (float)g_config.band_rev2_swr_w;
     prot_val[2] = (float)g_config.band_swr_max_x100     / 100.0f;
     prot_val[3] = (float)g_config.band_rev1_max_w;
-    prot_val[4] = (float)g_config.band_im_max_a;
+    prot_val[4] = (float)g_config.band_im_max_mA / 1000.0f;   /* mA -> A */
     prot_val[5] = (float)g_config.band_ntc_max_tenth_c / 10.0f;
     prot_val[6] = (float)g_config.band_fwd1_max_w;
     prot_val[7] = (float)g_config.band_fwd2_max_w;

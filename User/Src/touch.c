@@ -223,7 +223,7 @@ void touch_process(void)
 
     if (detected_touch_type == TOUCH_RESISTIVE) {
         if (touch_resistive_read(&x, &y, &pressed)) {
-            if (pressed && g_config.touch_cal.valid) {
+            if (pressed && g_config.touch.calibrated) {
                 /* Apply calibration */
                 touch_apply_calibration(x, y, &x, &y);
             }
@@ -316,8 +316,8 @@ bool touch_calibrate_complete(void)
         return false;
     }
 
-    g_config.touch_cal.x_slope = (CAL_POINT_COUNT * sum_raw_x_screen_x - sum_raw_x * sum_screen_x) / x1;
-    g_config.touch_cal.x_offset = (sum_screen_x - g_config.touch_cal.x_slope * sum_raw_x) / CAL_POINT_COUNT;
+    g_config.touch.x_gain = (CAL_POINT_COUNT * sum_raw_x_screen_x - sum_raw_x * sum_screen_x) / x1;
+    g_config.touch.x_offset = (sum_screen_x - g_config.touch.x_gain * sum_raw_x) / CAL_POINT_COUNT;
 
     /* Linear regression for Y */
     float sum_raw_y = 0, sum_screen_y = 0;
@@ -337,13 +337,13 @@ bool touch_calibrate_complete(void)
         return false;
     }
 
-    g_config.touch_cal.y_slope = (CAL_POINT_COUNT * sum_raw_y_screen_y - sum_raw_y * sum_screen_y) / y1;
-    g_config.touch_cal.y_offset = (sum_screen_y - g_config.touch_cal.y_slope * sum_raw_y) / CAL_POINT_COUNT;
+    g_config.touch.y_gain = (CAL_POINT_COUNT * sum_raw_y_screen_y - sum_raw_y * sum_screen_y) / y1;
+    g_config.touch.y_offset = (sum_screen_y - g_config.touch.y_gain * sum_raw_y) / CAL_POINT_COUNT;
 
     /* Check center point residual */
     /* Center point is at index 4 */
-    float predicted_x = cal_data[4].raw_x * g_config.touch_cal.x_slope + g_config.touch_cal.x_offset;
-    float predicted_y = cal_data[4].raw_y * g_config.touch_cal.y_slope + g_config.touch_cal.y_offset;
+    float predicted_x = cal_data[4].raw_x * g_config.touch.x_gain + g_config.touch.x_offset;
+    float predicted_y = cal_data[4].raw_y * g_config.touch.y_gain + g_config.touch.y_offset;
 
     float residual_x = fabsf(predicted_x - cal_data[4].screen_x) / cal_data[4].screen_x;
     float residual_y = fabsf(predicted_y - cal_data[4].screen_y) / cal_data[4].screen_y;
@@ -355,7 +355,7 @@ bool touch_calibrate_complete(void)
     }
 
     /* Calibration successful */
-    g_config.touch_cal.valid = true;
+    g_config.touch.calibrated = 1U;
     calibrating = false;
 
     /* Save to config */
@@ -378,14 +378,14 @@ bool touch_is_pressed(void)
 void touch_apply_calibration(uint16_t raw_x, uint16_t raw_y,
                              uint16_t *cal_x, uint16_t *cal_y)
 {
-    if (!g_config.touch_cal.valid) {
+    if (!g_config.touch.calibrated) {
         *cal_x = raw_x;
         *cal_y = raw_y;
         return;
     }
 
-    *cal_x = (uint16_t)(raw_x * g_config.touch_cal.x_slope + g_config.touch_cal.x_offset);
-    *cal_y = (uint16_t)(raw_y * g_config.touch_cal.y_slope + g_config.touch_cal.y_offset);
+    *cal_x = (uint16_t)(raw_x * g_config.touch.x_gain + g_config.touch.x_offset);
+    *cal_y = (uint16_t)(raw_y * g_config.touch.y_gain + g_config.touch.y_offset);
 
     /* Clamp to screen bounds */
     if (*cal_x > SCREEN_WIDTH) *cal_x = SCREEN_WIDTH;

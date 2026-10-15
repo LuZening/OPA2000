@@ -72,9 +72,11 @@ extern "C" {
  *   nothing the compiler emits can land on top of them. */
 #define EEPROM_FIRST_SECTOR        12U
 
-/*!< Largest payload this layer will store.  ConfigType is 124 bytes, which
- *   needs 9 words including header and commit; the cap leaves room for the
- *   structure to grow without silently overflowing the staging buffer. */
+/*!< Largest payload this layer will store.  ConfigType is ~128 bytes,
+ *   which needs 10 words including header and commit; the cap leaves
+ *   room for the structure to grow without silently overflowing the
+ *   staging buffer.  Kept in sync with the layout test in
+ *   User/Tests/test_config_layout.c. */
 #define EEPROM_MAX_PAYLOAD_BYTES   256U
 
 /*!< Header + padded payload + commit, for EEPROM_MAX_PAYLOAD_BYTES. */

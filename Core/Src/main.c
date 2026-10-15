@@ -31,16 +31,16 @@
 #include "i2c.h"
 #include "usart.h"
 #include "ltdc.h"
-#include "octospi.h"
 #include "sai.h"
 #include "sdmmc.h"
 #include "spi.h"
 #include "tim.h"
-#include "usb_otg.h"
+#include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "boot.h"
 #include "config.h"
 #include "user_adc.h"
 #include "power_control.h"
@@ -142,7 +142,6 @@ int main(void)
   MX_I2C3_Init();
   MX_LPUART1_UART_Init();
   MX_LTDC_Init();
-  MX_OCTOSPI1_Init();
   MX_SPI1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
@@ -150,7 +149,6 @@ int main(void)
   MX_TIM5_Init();
   MX_TIM7_Init();
   MX_TIM15_Init();
-  MX_USB_OTG_HS_PCD_Init();
   MX_I2C2_Init();
   MX_SDMMC2_SD_Init();
   MX_UART4_Init();
@@ -158,21 +156,69 @@ int main(void)
   MX_TIM4_Init();
   MX_SPI6_Init();
   /* USER CODE BEGIN 2 */
-  /* Initialize configuration from EEPROM */
-  config_init();
-  /* Initialize ADC */
-  adc_init();
-  adc_start();
-  /* Initialize power control */
-  power_init();
-  /* Initialize protection */
-  protection_init();
-  /* Initialize touch screen */
+  /* =========================================================================
+   *  BOOT SEQUENCE (design spec 2026-10-14)
+   *
+   *  Step 0 (hardware defaults, before main): RF_BIAS PG2 = LOW,
+   *         PWR_ON PG7 = LOW, REAR_RESERVED1 PF4 = HIGH.  Nothing
+   *         transmits because the ADC / COMP / protection chain is not
+   *         armed yet and g_ptt_ready is still false.
+   *
+   *  Everything below runs single-threaded - osKernelStart() has NOT
+   *  been called - so no RTOS primitive (mutex, queue) may be used here.
+   *  That is why config_lock() is deliberately absent below.
+   * ====================================================================== */
+
+  /* --- Step 1: pin the safety pins and blank the panel -------------- */
+  /* Explicit, not relying on the reset state: RF path de-energised,
+   * REAR_RESERVED1 held high, BL_PWM forced to 0 % so the operator
+   * never sees a half-drawn screen while we boot. */
+  boot_gpio_safe_state();
+
+  /* --- Step 2: load (or rebuild) the persistent config ---------------- */
+  bool have_valid_config = config_init();
+
+  /* --- Step 3: probe the touch controller ------------------------------ */
+  /* GT911 on I2C3 first, then NS2009 on I2C2; 100 ms per transaction.
+   * Single-threaded, so the probe cannot collide with anything. */
   touch_init();
-  /* NOTE: the GUI is initialised by the GUI task (app_gui_task), not here,
-     so that lv_init() runs exactly once inside the task context. */
-  /* Create application tasks */
-  app_tasks_create();
+
+  /* Decide whether the touch driver needs calibration:
+   *   - config_init() said "no valid record" -> we just reset to
+   *     defaults -> the touch transform is the identity -> prompt.
+   *   - a valid record was loaded but its touch transform is still the
+   *     identity (operator never finished) -> prompt.
+   *   - otherwise -> straight to the main screen. */
+  g_calibration_required = !have_valid_config || config_touch_needs_calibration();
+  g_touch_calibrated     = !g_calibration_required;
+
+  /* --- Step 4: push the config's protection limits into the hardware - */
+  /* AWD1/AWD2/AWD3 thresholds plus the two COMP DAC references.  This
+   * MUST happen before the kernel starts: MX_COMP1/2_Init() already
+   * armed the comparator interrupts, and a DAC reference of 0 would let
+   * noise on the compared inputs latch a protection fault before the
+   * operator ever sees the screen. */
+  boot_apply_thresholds((int)BAND_15M_10M);
+
+  /* --- Enable the two comparators ------------------------------------ */
+  /* MX_COMPx_Init() only configures the peripheral; without this the
+   * comparators stay disabled and HAL_COMP_TriggerCallback() would never
+   * fire, i.e. the COMP1 overdrive and COMP2 over-current protections
+   * would be dead code.  Started only after the DAC references above are
+   * in place, so the very first comparison already uses the configured
+   * threshold instead of the DAC's power-on value of 0 V. */
+  if (HAL_COMP_Start_IT(&hcomp1) != HAL_OK) {
+    Error_Handler();
+  }
+  if (HAL_COMP_Start_IT(&hcomp2) != HAL_OK) {
+    Error_Handler();
+  }
+
+  /* --- Step 5: hand over to the scheduler (below) --------------------- */
+  /* From here on g_gui_ready / g_ptt_ready take over: the GUI task opens
+   * the backlight after its first repaint, and app_adc_task raises
+   * g_ptt_ready once the IM zero-offset calibration has finished.  Until
+   * both are true, power_control refuses every PTT request. */
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -402,6 +448,41 @@ void HAL_ADCEx_LevelOutOfWindow3Callback(ADC_HandleTypeDef* hadc)
   protection_awd3_cb();     /* AWD3 -> CH6 coupler 1 reverse */
 }
 
+/**
+  * @brief Comparator trigger callback.
+  *
+  * Fires from COMP_IRQHandler (main priority 0) via HAL_COMP_IRQHandler()
+  * when either comparator's EXTI line fires.  The HAL provides this as a
+  * __weak no-op, so without this override BOTH COMP protections are
+  * silently dead: the interrupt reaches the HAL and then goes nowhere.
+  *
+  * COMP1 = RF input envelope overdrive (inverting input is DAC1 CH1,
+  *         which boot_apply_thresholds() programs from
+  *         g_config.band_rf_in_max_w).
+  * COMP2 = main current over-current (inverting input is DAC1 CH2,
+  *         programmed from g_config.band_im_max_mA).
+  *
+  * Both handlers run protection_trigger_locked(), which drops the relays,
+  * the high-voltage rail and the PA bias synchronously - see the
+  * concurrency note in protection.h.
+  */
+void HAL_COMP_TriggerCallback(COMP_HandleTypeDef* hcomp)
+{
+  if (hcomp == NULL)
+  {
+    return;
+  }
+
+  if (hcomp->Instance == COMP1)
+  {
+    protection_comp1_isr();
+  }
+  else if (hcomp->Instance == COMP2)
+  {
+    protection_comp2_isr();
+  }
+}
+
 /* USER CODE END 4 */
 
  /* MPU Configuration */
@@ -417,23 +498,11 @@ void MPU_Config(void)
   */
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
-  MPU_InitStruct.BaseAddress = 0x0;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
-  MPU_InitStruct.SubRegionDisable = 0x87;
+  MPU_InitStruct.BaseAddress = 0x08000000;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_256KB;
+  MPU_InitStruct.SubRegionDisable = 0;
   MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
   MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
-  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
-  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
-  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
-  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
-
-  HAL_MPU_ConfigRegion(&MPU_InitStruct);
-
-  /** Initializes and configures the Region and the memory to be protected
-  */
-  MPU_InitStruct.Number = MPU_REGION_NUMBER1;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_64KB;
-  MPU_InitStruct.SubRegionDisable = 0x0;
   MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_ENABLE;
   MPU_InitStruct.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_CACHEABLE;
@@ -443,9 +512,20 @@ void MPU_Config(void)
 
   /** Initializes and configures the Region and the memory to be protected
   */
+  MPU_InitStruct.Number = MPU_REGION_NUMBER1;
+  MPU_InitStruct.BaseAddress = 0x90000000;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_128MB;
+  MPU_InitStruct.SubRegionDisable = 0x0;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
+  /** Initializes and configures the Region and the memory to be protected
+  */
   MPU_InitStruct.Number = MPU_REGION_NUMBER2;
   MPU_InitStruct.BaseAddress = 0x20000000;
   MPU_InitStruct.Size = MPU_REGION_SIZE_128KB;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
 
@@ -454,17 +534,17 @@ void MPU_Config(void)
   MPU_InitStruct.Number = MPU_REGION_NUMBER3;
   MPU_InitStruct.BaseAddress = 0x24000000;
   MPU_InitStruct.Size = MPU_REGION_SIZE_1MB;
-  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
-  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
 
   /** Initializes and configures the Region and the memory to be protected
   */
   MPU_InitStruct.Number = MPU_REGION_NUMBER4;
-  MPU_InitStruct.BaseAddress = 0x240F0000;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_64KB;
-  MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_512KB;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
 
@@ -473,7 +553,6 @@ void MPU_Config(void)
   MPU_InitStruct.Number = MPU_REGION_NUMBER5;
   MPU_InitStruct.BaseAddress = 0x30000000;
   MPU_InitStruct.Size = MPU_REGION_SIZE_128KB;
-  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_CACHEABLE;
   MPU_InitStruct.IsBufferable = MPU_ACCESS_BUFFERABLE;
 
@@ -484,22 +563,8 @@ void MPU_Config(void)
   MPU_InitStruct.Number = MPU_REGION_NUMBER6;
   MPU_InitStruct.BaseAddress = 0x38000000;
   MPU_InitStruct.Size = MPU_REGION_SIZE_32KB;
-
-  HAL_MPU_ConfigRegion(&MPU_InitStruct);
-
-  /** Initializes and configures the Region and the memory to be protected
-  */
-  MPU_InitStruct.Number = MPU_REGION_NUMBER7;
-  MPU_InitStruct.BaseAddress = 0x08000000;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_128KB;
-
-  HAL_MPU_ConfigRegion(&MPU_InitStruct);
-
-  /** Initializes and configures the Region and the memory to be protected
-  */
-  MPU_InitStruct.Number = MPU_REGION_NUMBER8;
-  MPU_InitStruct.BaseAddress = 0x90000000;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_32B;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
   /* Enables the MPU */

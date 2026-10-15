@@ -23,7 +23,13 @@
 #ifndef HW_PINMAP_H
 #define HW_PINMAP_H
 
+/* LVGL v7 PC simulator builds have no CMSIS / HAL; skip the include and
+ * leave the pin-macros (which are just GPIOX / GPIO_PIN_y) available as
+ * raw identifiers for SIM-only paths.  Same guard as in lv_port_disp.c,
+ * gui.c, opa2000.h, etc. — see docs/SIMULATOR_GUIDE.md §2 for context. */
+#ifndef LVGL_SIM
 #include "stm32h7xx_hal.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -48,7 +48,14 @@ static void ptt_set_pressed(bool pressed)
 static void ptt_establish_idle_outputs(void)
 {
     power_init_outputs();
-    power_psu_on();
+    power_psu_on();               /* main supply latch (PG5) */
+    power_hv_on();                /* HV rail: PWR_ON, bias one step later */
+    /* power_hv_on() only raises PWR_ON now; RF_BIAS follows one
+     * power_rail_step() later.  Settle it here so every PTT test starts
+     * from a fully biased, keyable amplifier - otherwise the HV sequencing
+     * interlock would refuse to key and the test would be measuring the
+     * rail sequence instead of what it means to check. */
+    (void)power_rail_step();
     stub_gpio_reset_counters();
     ptt_state    = PTT_STATE_IDLE;
     g_allow_rf   = true;
@@ -322,7 +329,7 @@ TEST_CASE(ptt_flag_is_cleared_by_task_api)
  *
  *  protection_check() and freq_detect() both gate on g_tx_active, so it
  *  has to follow the relay state machine or the software protection never
- *  runs.  g_psu_on is the operator's power switch and must be unaffected
+ *  runs.  g_hv_on is the operator's HV switch and must be unaffected
  *  by PTT.
  *==========================================================================*/
 
@@ -330,7 +337,7 @@ TEST_CASE(ptt_press_raises_tx_active)
 {
     ptt_establish_idle_outputs();
     ASSERT_FALSE(g_tx_active);
-    ASSERT_TRUE(g_psu_on);
+    ASSERT_TRUE(g_hv_on);
 
     ptt_set_pressed(true);
     power_control_ptt_isr();
@@ -361,32 +368,37 @@ TEST_CASE(ptt_never_touches_the_supply_flag)
     ptt_set_pressed(true);
     power_control_ptt_isr();
     power_relay_timer_callback();
-    ASSERT_TRUE(g_psu_on);
+    ASSERT_TRUE(g_hv_on);
 
     ptt_set_pressed(false);
     power_control_ptt_isr();
     power_relay_timer_callback();
-    ASSERT_TRUE(g_psu_on);                 /* still ready, just not keyed */
+    ASSERT_TRUE(g_hv_on);                  /* still up, just not keyed */
     ASSERT_FALSE(g_tx_active);
 }
 
-TEST_CASE(ptt_while_supply_off_only_moves_the_relays)
+TEST_CASE(ptt_while_hv_off_only_moves_the_relays)
 {
     ptt_establish_idle_outputs();
-    power_psu_off();
-    ASSERT_FALSE(g_psu_on);
+    /* Drop the HV rail (PWR_ON + RF_BIAS).  The pedal path must still run its
+     * relay sequence - the RF switch is a separate subsystem from the rail -
+     * but no RF can be produced because power_tx_enable() sees g_hv_on false.
+     * This is the deliberate consequence of keeping the three rails apart. */
+    power_hv_off();
+    (void)power_rail_step();
+    ASSERT_FALSE(g_hv_on);
 
     ptt_set_pressed(true);
     power_control_ptt_isr();
     power_relay_timer_callback();
     ASSERT_TRUE(g_tx_active);              /* relay sequence still ran */
-    ASSERT_FALSE(g_psu_on);                /* but the supply stays off */
+    ASSERT_FALSE(g_hv_on);                  /* but the HV rail stays down */
 
     ptt_set_pressed(false);
     power_control_ptt_isr();
     power_relay_timer_callback();
     ASSERT_FALSE(g_tx_active);
-    ASSERT_FALSE(g_psu_on);
+    ASSERT_FALSE(g_hv_on);
 }
 
 TEST_CASE(ptt_blocked_by_alert_clears_tx_active)
@@ -405,7 +417,7 @@ TEST_CASE(ptt_blocked_by_alert_clears_tx_active)
 
     ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
     ASSERT_FALSE(g_tx_active);
-    ASSERT_TRUE(g_psu_on);                 /* fault must not fake a power-off */
+    ASSERT_TRUE(g_hv_on);                  /* fault must not fake a power-off */
 }
 
 TEST_CASE(ptt_blocked_during_stop_sequence_also_clears_tx_active)
@@ -425,7 +437,7 @@ TEST_CASE(ptt_blocked_during_stop_sequence_also_clears_tx_active)
 
     ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
     ASSERT_FALSE(g_tx_active);
-    ASSERT_TRUE(g_psu_on);
+    ASSERT_TRUE(g_hv_on);
     ASSERT_EQ(stub_gpio_get_last(RELAY1_GPIO_Port, RELAY1_Pin),
               GPIO_PIN_RESET_E);
     ASSERT_EQ(stub_gpio_get_last(RELAY2_GPIO_Port, RELAY2_Pin),
@@ -553,6 +565,26 @@ TEST_CASE(ptt_out_drops_when_an_alert_blocks_ptt)
     ASSERT_EQ(ptt_out_level(), GPIO_PIN_RESET_E);
 }
 
+TEST_CASE(ptt_out_stays_asserted_while_the_hv_rail_sequences_down)
+{
+    ptt_establish_idle_outputs();
+    ptt_set_pressed(true);
+    power_control_ptt_isr();
+    power_relay_timer_callback();
+    ASSERT_EQ(ptt_out_level(), GPIO_PIN_SET_E);
+
+    /* power_hv_off() deliberately does NOT open the relays: the HV rail and
+     * the RF path are independent, so the operator asking to drop high
+     * voltage must not also unkey.  PTT_OUT therefore stays high and the
+     * relay state machine is untouched. */
+    power_hv_off();
+    ASSERT_FALSE(g_hv_on);
+    ASSERT_EQ(ptt_out_level(), GPIO_PIN_SET_E);   /* relays never opened */
+
+    (void)power_rail_step();
+    ASSERT_EQ(ptt_out_level(), GPIO_PIN_SET_E);
+}
+
 TEST_CASE(ptt_out_drops_when_the_supply_is_switched_off)
 {
     ptt_establish_idle_outputs();
@@ -561,10 +593,9 @@ TEST_CASE(ptt_out_drops_when_the_supply_is_switched_off)
     power_relay_timer_callback();
     ASSERT_EQ(ptt_out_level(), GPIO_PIN_SET_E);
 
-    /* power_psu_off() goes through power_relays_tx_off(), which arms the
+    /* power_standby() goes through power_relays_tx_off(), which arms the
      * 15 ms timer - PTT_OUT must not wait for it. */
-    power_psu_off();
-    ASSERT_FALSE(g_psu_on);
+    power_standby();
     ASSERT_EQ(ptt_out_level(), GPIO_PIN_SET_E);   /* still in TX_STOPPING */
 
     power_relay_timer_callback();
@@ -584,53 +615,122 @@ TEST_CASE(ptt_out_is_high_active)
  *  Front-panel power API
  *==========================================================================*/
 
-TEST_CASE(power_on_engages_the_supply_only_once)
+TEST_CASE(power_init_leaves_the_external_psu_and_the_pa_off)
 {
     power_init();
-    ASSERT_FALSE(g_psu_on);
 
-    power_on();
-    ASSERT_TRUE(g_psu_on);
+    /* The PSU is an external device the operator switches themselves, so
+     * the firmware must NOT power it up unprompted.  PG5 stays at its
+     * power-off level (low) after boot. */
+    ASSERT_FALSE(g_psu_on);
+    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port, PSU_ON_Pin),
+              GPIO_PIN_RESET_E);
+
+    /* The PA is dark too - the front-panel button brings the HV rail up. */
+    ASSERT_FALSE(g_hv_on);
+    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin),
+              GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin),
+              GPIO_PIN_RESET_E);
+}
+
+TEST_CASE(power_hv_enable_engages_the_rail_only_once)
+{
+    power_init();
+    ASSERT_FALSE(g_hv_on);
+
+    power_hv_enable();
+    ASSERT_TRUE(g_hv_on);
     ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin),
               GPIO_PIN_SET_E);
     ASSERT_FALSE(g_tx_active);
 
+    /* The external PSU and the relays are NOT part of the HV request.  The
+     * PSU stays off because the operator never switched it on. */
+    ASSERT_FALSE(g_psu_on);
+    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port, PSU_ON_Pin),
+              GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(RELAY1_GPIO_Port, RELAY1_Pin),
+              GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(RELAY2_GPIO_Port, RELAY2_Pin),
+              GPIO_PIN_RESET_E);
+
     stub_gpio_reset_counters();
-    power_on();                              /* idempotent */
+    power_hv_enable();                           /* idempotent */
     ASSERT_EQ(stub_gpio_set_count(PWR_ON_GPIO_Port, PWR_ON_Pin), 0);
 }
 
-TEST_CASE(power_off_drops_everything)
+TEST_CASE(power_hv_disable_drops_the_rail_but_leaves_supply_and_relays)
 {
-    power_init();
-    power_on();
-    power_off();
+    /* The external PSU and both relays are untouched.  Switch the PSU on
+     * first so the assertion is meaningful: with it already on, "untouched"
+     * means it must still be on afterwards. */
+    power_psu_on();
+    power_hv_enable();
+    (void)power_rail_step();
 
-    ASSERT_FALSE(g_psu_on);
+    power_hv_disable();
+    (void)power_rail_step();
+
+    ASSERT_FALSE(g_hv_on);
     ASSERT_FALSE(g_tx_active);
-    ASSERT_EQ(ptt_out_level(), GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin),
+              GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin),
+              GPIO_PIN_RESET_E);
+
+    ASSERT_TRUE(g_psu_on);
+    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port, PSU_ON_Pin),
+              GPIO_PIN_SET_E);
     ASSERT_EQ(stub_gpio_get_last(RELAY1_GPIO_Port, RELAY1_Pin),
               GPIO_PIN_RESET_E);
     ASSERT_EQ(stub_gpio_get_last(RELAY2_GPIO_Port, RELAY2_Pin),
               GPIO_PIN_RESET_E);
 }
 
-TEST_CASE(power_standby_keeps_the_supply_but_drops_the_rf_path)
+TEST_CASE(power_standby_keeps_the_hv_rail_but_drops_the_rf_path)
 {
     power_init();
-    power_on();
+    power_hv_enable();
+    (void)power_rail_step();        /* settle HV: PWR_ON up, then bias */
     power_tx_enable();
     power_relay_timer_callback();
     ASSERT_TRUE(g_tx_active);
 
     power_standby();
     ASSERT_EQ(ptt_state, PTT_STATE_TX_STOPPING);
-    ASSERT_TRUE(g_psu_on);                    /* supply stays engaged */
+    ASSERT_TRUE(g_hv_on);                    /* rail stays engaged */
 
     power_relay_timer_callback();
     ASSERT_FALSE(g_tx_active);
-    ASSERT_TRUE(g_psu_on);
+    ASSERT_TRUE(g_hv_on);
     ASSERT_EQ(ptt_out_level(), GPIO_PIN_RESET_E);
+}
+
+TEST_CASE(ptt_is_refused_while_the_hv_rail_is_still_sequencing)
+{
+    power_init_outputs();
+    ptt_state    = PTT_STATE_IDLE;
+    g_allow_rf   = true;
+    g_alert_flag = false;
+
+    /* HV rail on, bias not yet raised: keying now would put the PA into
+     * service during the very settling window the gap exists to protect.
+     * This interlock is about sequencing only - note that g_psu_on is false
+     * here and that no longer blocks anything. */
+    power_hv_on();
+    ASSERT_TRUE(power_rail_busy());
+
+    power_tx_enable();
+    ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
+    ASSERT_FALSE(g_tx_active);
+
+    /* Once the sequence settles, the same request is honoured. */
+    (void)power_rail_step();
+    ASSERT_FALSE(power_rail_busy());
+    power_tx_enable();
+    ASSERT_EQ(ptt_state, PTT_STATE_TX_STARTING);
+    ASSERT_TRUE(g_tx_active);
 }
 
 /*============================================================================
@@ -654,15 +754,38 @@ TEST_CASE(power_tx_enable_keys_the_amplifier)
     ASSERT_EQ(ptt_out_level(), GPIO_PIN_RESET_E);
 }
 
-TEST_CASE(power_tx_enable_is_refused_before_the_supply_is_up)
+TEST_CASE(power_tx_enable_is_refused_until_the_boot_gate_opens)
 {
+    /* Nothing about the PSU or the HV rail here - only g_ptt_ready, which
+     * stays false until the IM zero-offset calibration has run and the GUI
+     * has painted a frame. */
     power_init();
     g_allow_rf   = true;
     g_alert_flag = false;
+    g_ptt_ready  = false;
 
     power_tx_enable();
     ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
     ASSERT_FALSE(g_tx_active);
+}
+
+TEST_CASE(power_tx_enable_ignores_the_psu_and_hv_rail_state)
+{
+    /* The operator deliberately removed the power-state interlocks: whether
+     * the PA is energised is not the firmware's call at request time.  This
+     * test pins that down - with the PSU off AND the HV rail down, a valid
+     * request must still key.  Keep it this way unless the interlock is
+     * explicitly reinstated. */
+    power_init();
+    ASSERT_FALSE(g_psu_on);                   /* external PSU off */
+    ASSERT_FALSE(g_hv_on);                    /* HV rail off     */
+    g_allow_rf   = true;
+    g_alert_flag = false;
+    g_ptt_ready  = true;
+
+    power_tx_enable();
+    ASSERT_EQ(ptt_state, PTT_STATE_TX_STARTING);
+    ASSERT_TRUE(g_tx_active);
 }
 
 TEST_CASE(power_tx_enable_is_refused_while_calibrating)
@@ -936,42 +1059,124 @@ TEST_CASE(poll_force_releases_when_the_alert_latched)
 }
 
 /*============================================================================
- *  PSU + RELAY sequencing
+ *  HV rail sequencing (PWR_ON + RF_BIAS)
  *==========================================================================*/
 
-TEST_CASE(psu_on_raises_pg7_pg2_pg5)
+TEST_CASE(hv_on_sequences_pwr_on_then_bias)
 {
     stub_gpio_reset_counters();
-    power_psu_on();
+    power_psu_on();                   /* main supply latch first */
+    stub_gpio_reset_counters();
+    power_hv_on();
 
-    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port,   PWR_ON_Pin),
-              GPIO_PIN_SET_E);     /* PG7 */
+    /* Stage 1: PWR_ON comes up, the bias must NOT be on yet - the PA needs
+     * HV_STAGE_DELAY_MS of settling before it is biased. */
+    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin),
+              GPIO_PIN_SET_E);         /* PG7 */
     ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin),
-              GPIO_PIN_SET_E);     /* PG2 */
-    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port,  PSU_ON_Pin),
-              GPIO_PIN_SET_E);     /* PG5 */
+              GPIO_PIN_RESET_E);       /* PG2 still down */
+    ASSERT_TRUE(power_rail_busy());
+    ASSERT_TRUE(g_hv_on);
+
+    /* The main supply latch is NOT part of this sequence - it was already
+     * set before the call and must not be touched by it. */
+    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port, PSU_ON_Pin),
+              GPIO_PIN_SET_E);
     ASSERT_TRUE(g_psu_on);
+
+    /* Stage 2: the monitor task's next tick biases the PA. */
+    ASSERT_TRUE(power_rail_step());
+    ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin),
+              GPIO_PIN_SET_E);         /* PG2 now up */
+    ASSERT_FALSE(power_rail_busy());
+
+    /* Settled: further steps are no-ops. */
+    ASSERT_FALSE(power_rail_step());
 }
 
-TEST_CASE(psu_off_drops_relays_first_then_supplies)
+TEST_CASE(hv_off_sequences_bias_then_pwr_on)
 {
     stub_gpio_reset_counters();
     ptt_state = PTT_STATE_IDLE;
-    g_psu_on  = true;
+    power_psu_on();
+    power_hv_on();
+    (void)power_rail_step();        /* settle the on sequence first */
+    stub_gpio_reset_counters();
 
-    power_psu_off();
+    power_hv_off();
 
+    /* Stage 1: the bias drops, but PWR_ON stays up for the HV_STAGE_DELAY_MS
+     * gap. */
+    ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin),
+              GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin),
+              GPIO_PIN_SET_E);        /* still up during the gap */
+    ASSERT_TRUE(power_rail_busy());
+    ASSERT_FALSE(g_hv_on);
+
+    /* Stage 2: PWR_ON follows. */
+    ASSERT_TRUE(power_rail_step());
+    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin),
+              GPIO_PIN_RESET_E);
+    ASSERT_FALSE(power_rail_busy());
+
+    /* Neither the main supply latch nor the relays were part of this. */
+    ASSERT_TRUE(g_psu_on);
+    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port, PSU_ON_Pin),
+              GPIO_PIN_SET_E);
     ASSERT_EQ(stub_gpio_get_last(RELAY1_GPIO_Port, RELAY1_Pin),
               GPIO_PIN_RESET_E);
     ASSERT_EQ(stub_gpio_get_last(RELAY2_GPIO_Port, RELAY2_Pin),
               GPIO_PIN_RESET_E);
-    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port,  PWR_ON_Pin),
+}
+
+TEST_CASE(rail_abort_drops_a_pending_stage_without_touching_pins)
+{
+    stub_gpio_reset_counters();
+    power_hv_on();                   /* stage 1: PWR_ON up, bias pending */
+
+    power_rail_abort();              /* what the fault ISR does */
+
+    /* No further stage may fire and re-assert anything. */
+    ASSERT_FALSE(power_rail_step());
+    ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin),
+              GPIO_PIN_RESET_E);
+    ASSERT_FALSE(power_rail_busy());
+}
+
+TEST_CASE(hv_on_is_idempotent_once_settled)
+{
+    power_hv_on();
+    (void)power_rail_step();
+    stub_gpio_reset_counters();
+
+    power_hv_on();                   /* already on: must be a no-op */
+    ASSERT_EQ(stub_gpio_set_count(PWR_ON_GPIO_Port, PWR_ON_Pin), 0U);
+    ASSERT_FALSE(power_rail_busy());
+}
+
+TEST_CASE(psu_latch_is_independent_of_the_hv_rail)
+{
+    /* PG5 is a plain latch with no timing: on, off, and it never touches
+     * PWR_ON / RF_BIAS.  This is the counterpart to the HV tests above and
+     * the reason the two got separate names. */
+    stub_gpio_reset_counters();
+    power_init_outputs();
+
+    power_psu_on();
+    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port, PSU_ON_Pin),
+              GPIO_PIN_SET_E);
+    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin),
               GPIO_PIN_RESET_E);
     ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin),
               GPIO_PIN_RESET_E);
-    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port,  PSU_ON_Pin),
+
+    power_psu_off();
+    ASSERT_EQ(stub_gpio_get_last(PSU_ON_GPIO_Port, PSU_ON_Pin),
               GPIO_PIN_RESET_E);
     ASSERT_FALSE(g_psu_on);
+    ASSERT_FALSE(g_hv_on);
+    ASSERT_FALSE(power_rail_busy());     /* no sequencing involved */
 }
 
 TEST_CASE(power_init_outputs_leaves_everything_inactive)
@@ -1106,7 +1311,7 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(ptt_press_raises_tx_active),
     TEST_ENTRY(ptt_release_clears_tx_active),
     TEST_ENTRY(ptt_never_touches_the_supply_flag),
-    TEST_ENTRY(ptt_while_supply_off_only_moves_the_relays),
+    TEST_ENTRY(ptt_while_hv_off_only_moves_the_relays),
     TEST_ENTRY(ptt_blocked_by_alert_clears_tx_active),
     TEST_ENTRY(ptt_blocked_during_stop_sequence_also_clears_tx_active),
     TEST_ENTRY(ptt_repress_during_stop_keeps_tx_active),
@@ -1116,13 +1321,17 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(ptt_out_drops_immediately_on_release),
     TEST_ENTRY(ptt_out_reasserts_when_a_stop_is_cancelled),
     TEST_ENTRY(ptt_out_drops_when_an_alert_blocks_ptt),
+    TEST_ENTRY(ptt_out_stays_asserted_while_the_hv_rail_sequences_down),
     TEST_ENTRY(ptt_out_drops_when_the_supply_is_switched_off),
     TEST_ENTRY(ptt_out_is_high_active),
-    TEST_ENTRY(power_on_engages_the_supply_only_once),
-    TEST_ENTRY(power_off_drops_everything),
-    TEST_ENTRY(power_standby_keeps_the_supply_but_drops_the_rf_path),
+    TEST_ENTRY(power_init_leaves_the_external_psu_and_the_pa_off),
+    TEST_ENTRY(power_hv_enable_engages_the_rail_only_once),
+    TEST_ENTRY(power_hv_disable_drops_the_rail_but_leaves_supply_and_relays),
+    TEST_ENTRY(power_standby_keeps_the_hv_rail_but_drops_the_rf_path),
+    TEST_ENTRY(ptt_is_refused_while_the_hv_rail_is_still_sequencing),
     TEST_ENTRY(power_tx_enable_keys_the_amplifier),
-    TEST_ENTRY(power_tx_enable_is_refused_before_the_supply_is_up),
+    TEST_ENTRY(power_tx_enable_is_refused_until_the_boot_gate_opens),
+    TEST_ENTRY(power_tx_enable_ignores_the_psu_and_hv_rail_state),
     TEST_ENTRY(power_tx_enable_is_refused_while_calibrating),
     TEST_ENTRY(power_tx_enable_is_refused_while_alert_latched),
     TEST_ENTRY(power_get_ptt_state_reads_the_active_low_input),
@@ -1138,8 +1347,11 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(poll_does_nothing_while_the_pedal_is_still_down),
     TEST_ENTRY(poll_is_a_noop_on_an_idle_amplifier),
     TEST_ENTRY(poll_force_releases_when_the_alert_latched),
-    TEST_ENTRY(psu_on_raises_pg7_pg2_pg5),
-    TEST_ENTRY(psu_off_drops_relays_first_then_supplies),
+    TEST_ENTRY(hv_on_sequences_pwr_on_then_bias),
+    TEST_ENTRY(hv_off_sequences_bias_then_pwr_on),
+    TEST_ENTRY(rail_abort_drops_a_pending_stage_without_touching_pins),
+    TEST_ENTRY(hv_on_is_idempotent_once_settled),
+    TEST_ENTRY(psu_latch_is_independent_of_the_hv_rail),
     TEST_ENTRY(power_init_outputs_leaves_everything_inactive),
     TEST_ENTRY(fan_speed_starts_at_50_percent_below_60c),
     TEST_ENTRY(fan_speed_reaches_100_above_70c),

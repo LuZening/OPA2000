@@ -10,21 +10,23 @@
  * the amplifier down.  protection_digital_isr() is the generic entry for
  * the RF deck lines still to be added.
  *
- * Analog - a conversion result against a limit.  Where the analog watchdog
- * owns the channel the comparison is in hardware and the AWD interrupt
- * drives the shutdown:
- *     AWD2 -> CH5  IMain   30 A
- *     AWD3 -> CH6  REV1    800 W
+ * Analog - a conversion result against a limit.  Every limit lives in
+ * g_config, never as a constant in this file (see "Protection limits"
+ * below).  Where the analog watchdog owns the channel the comparison is
+ * in hardware and the AWD interrupt drives the shutdown:
+ *     AWD2 -> CH5  IMain   g_config.band_im_max_mA
+ *     AWD3 -> CH6  REV1    g_config.band_rev1_max_w
  * The channels with no watchdog behind them are compared in interrupt
  * context right after the fresh results are published:
- *     ADC1 DMA complete   REV2 400 W, FWD1 1100 W, FWD2 1050 W
- *     ADC2 injected done  NTC  90 C
+ *     ADC1 DMA complete   REV2 / SWR / FWD1 / FWD2 config limits
+ *     ADC2 injected done  NTC   g_config.band_ntc_max_tenth_c
  *
  * Shutdown sequence (identical from every source, ISR-safe):
- *   1. RELAY1_OFF + RELAY2_OFF + PTT_OUT low + ptt_state = IDLE
- *   2. PWR_ON_DISABLE       (cut high-voltage supply to PA)
- *   3. RF_BIAS_DISABLE      (cut PA bias)
- *   4. RF_IN_PROTECT_RAISE  (tell the RF board to protect, PB13)
+ *   1. RF_IN_PROTECT_RAISE  (tell the RF board to protect, PB13) - first, so
+ *      the RF deck starts latching its hardware bus at the earliest moment
+ *   2. RELAY1_OFF + RELAY2_OFF + PTT_OUT low + ptt_state = IDLE
+ *   3. PWR_ON_DISABLE       (cut high-voltage supply to PA)
+ *   4. RF_BIAS_DISABLE      (cut PA bias)
  *   5. buzzer_start()       (3-tone warning, loops until cleared)
  *   6. g_alert_active / g_alert_flag, g_allow_rf = false, g_tx_active = false
  *
@@ -39,22 +41,59 @@
 #include "power_control.h"
 #include "buzzer.h"
 #include "adc_calibration.h"
+#include "config.h"
 #include "stm32h7xx_hal.h"
 
 /*============================================================================
  *  Protection limits
  *
- *  Milliwatts for the coupler channels, milliamps for IMain, tenths of a
- *  degree for the NTC.  The two channels with a hardware watchdog behind
- *  them (IMain, REV1) get their threshold in ADC code from adc_awd_set_*().
+ *  NO HARD-CODED THRESHOLDS.  Every limit below is read from g_config,
+ *  which is the single source of truth shared by the GUI (Settings
+ *  menu -> Protection page), the CAT/serial link, the flash-backed
+ *  config blob and this file.  Units:
+ *
+ *      power    g_config in W,   comparisons in mW  -> * 1000
+ *      current  g_config in mA,  comparisons in mA  -> as-is
+ *      SWR      g_config in x100                     -> as-is
+ *      NTC      g_config in 0.1 C                    -> as-is
+ *
+ *  The two channels with a hardware watchdog behind them (IMain, REV1)
+ *  additionally get their threshold pushed into the AWD registers by
+ *  boot_apply_thresholds(); the software comparison below is the
+ *  second line of defence for everything that has no AWD.
+ *
+ *  Read pattern: each field is read once into a local.  All of them are
+ *  word-size, so the read is atomic on Cortex-M7 and does not need the
+ *  config mutex (see the concurrency rules in config.h - a single
+ *  field read is allowed unlocked).
  *==========================================================================*/
 
-#define PROTECT_REV2_MAX_MW        400000L   /*!< coupler 2 reverse, 400 W */
-#define PROTECT_REV2_SWR_MW        200000L   /*!< 200 W ...                  */
-#define PROTECT_SWR_MAX_X100       200       /*!< ... above SWR 2.0 trips   */
-#define PROTECT_FWD1_MAX_MW       1100000L   /*!< coupler 1 forward, 1100 W */
-#define PROTECT_FWD2_MAX_MW       1050000L   /*!< coupler 2 forward, 1050 W */
-#define PROTECT_NTC_MAX_TENTH_C      900     /*!< core NTC, 90.0 C          */
+/*! Effective software limits for this evaluation, snapshotted from g_config. */
+typedef struct {
+    int32_t rev2_max_mW;
+    int32_t rev2_swr_mW;
+    int32_t swr_max_x100;
+    int32_t fwd1_max_mW;
+    int32_t fwd2_max_mW;
+    int32_t ntc_max_tenth_c;
+} protect_limits_t;
+
+/**
+ * @brief Snapshot the operator-configured limits out of g_config.
+ *
+ * Called at the top of every protection predicate.  Grouping the reads
+ * into one helper keeps the unit conversions in a single place and
+ * makes it obvious at a glance that nothing is hard-coded any more.
+ */
+static void protect_limits_get(protect_limits_t *lim)
+{
+    lim->rev2_max_mW    = (int32_t)g_config.band_rev2_max_w      * 1000L;
+    lim->rev2_swr_mW    = (int32_t)g_config.band_rev2_swr_w      * 1000L;
+    lim->swr_max_x100   = (int32_t)g_config.band_swr_max_x100;
+    lim->fwd1_max_mW    = (int32_t)g_config.band_fwd1_max_w      * 1000L;
+    lim->fwd2_max_mW    = (int32_t)g_config.band_fwd2_max_w      * 1000L;
+    lim->ntc_max_tenth_c = (int32_t)g_config.band_ntc_max_tenth_c;
+}
 
 /*============================================================================
  *  State (volatile for ISR/task sharing)
@@ -93,23 +132,38 @@ void protection_trigger_locked(AlertType cause)
     s_protection_active = true;
     s_last_fault        = cause;
 
-    /* 1. drop both RELAYs and the keying feedback immediately */
+    /* 1. raise hardware fault latch FIRST (PB13 -> D7 -> RF_IN_PROTECT_MIXED)
+     *    so the RF board starts its own protection and latches the hardware
+     *    bus at the earliest possible moment - every other step below is
+     *    local to this MCU and can afford to follow. */
+    RF_IN_PROTECT_RAISE();
+    /* 2. drop both RELAYs and the keying feedback immediately */
     RELAY1_OFF();
     RELAY2_OFF();
     power_ptt_out_set(false);
     ptt_state = PTT_STATE_IDLE;
-    /* 2. cut high voltage */
+    /* 3. cut high voltage */
     PWR_ON_DISABLE();
-    /* 3. cut PA bias */
+    /* 4. cut PA bias */
     RF_BIAS_DISABLE();
-    /* 4. raise hardware fault latch (PB13 -> D7 -> RF_IN_PROTECT_MIXED) so the
-     *    RF board runs its own protection and latches the hardware bus */
-    RF_IN_PROTECT_RAISE();
 
     /* 5. start the 3-tone warning; it loops until protection_clear().
      *    Done here rather than in the task so the alarm is audible even if
      *    the fault happened while the scheduler was busy. */
     buzzer_start();
+
+    /* 5a. Abandon any HV sequencing that was in flight.  This path drops
+     *     PWR_ON / RF_BIAS directly with zero delay - deliberately not via
+     *     power_hv_off(), whose 10 ms bias-before-rail gap would be the
+     *     wrong thing to do to a fault.  The pending stage therefore has
+     *     to be cleared, or power_rail_step() would later re-assert a rail
+     *     that protection just cut.
+     *
+     *     g_hv_on is left alone for the same reason g_psu_on was: the front
+     *     panel should keep reading "ready" so the operator is told to power
+     *     cycle rather than silently powered off.  What actually blocks RF is
+     *     g_allow_rf / g_alert_flag below. */
+    power_rail_abort();
 
     /* 6. publish to cross-task state (volatiles already declared
      *    volatile in opa2000.c; reads on task side are atomic on M7). */
@@ -118,9 +172,10 @@ void protection_trigger_locked(AlertType cause)
     /* 7. block new PTT until IM is re-calibrated or fault cleared */
     g_allow_rf     = false;
     g_tx_active    = false;
-    /* NOTE: g_psu_on is deliberately left alone.  A fault drops the
-     * relays and the bias, but the front panel still reads "ready" so the
-     * operator is told to power-cycle rather than silently powered off. */
+    /* NOTE: g_hv_on and g_psu_on are deliberately left alone.  A fault
+     * drops the relays, PWR_ON and the bias, but the front panel still reads
+     * "ready" so the operator is told to power-cycle rather than silently
+     * powered off.  g_allow_rf above is what actually blocks RF. */
 }
 
 /*============================================================================
@@ -168,13 +223,15 @@ void protection_awd1_cb(void)
 
 void protection_awd2_cb(void)
 {
-    /* AWD2 -> CH5 main current > 30 A. */
+    /* AWD2 -> CH5 main current, the hardware line behind
+     * g_config.band_im_max_mA (programmed by boot_apply_thresholds()). */
     protection_trigger_locked(ALERT_CURRENT_HIGH);
 }
 
 void protection_awd3_cb(void)
 {
-    /* AWD3 -> CH6 coupler 1 reverse > 800 W hardware last-line. */
+    /* AWD3 -> CH6 coupler 1 reverse, the hardware last line behind
+     * g_config.band_rev1_max_w (programmed by boot_apply_thresholds()). */
     protection_trigger_locked(ALERT_REFLECT_POWER_HIGH);
 }
 
@@ -193,24 +250,29 @@ void protection_check_adc1_dma(void)
         return;
     }
 
-    /* REV2 > 400 W (coupler 2 reverse, the one the operator sees) */
-    if (g_adc_data.rev2_mW > PROTECT_REV2_MAX_MW) {
+    /* Snapshot the operator-configured limits once. */
+    protect_limits_t lim;
+    protect_limits_get(&lim);
+
+    /* Coupler 2 reverse, the reading the operator actually sees. */
+    if (g_adc_data.rev2_mW > lim.rev2_max_mW) {
         protection_trigger_locked(ALERT_REFLECT_POWER_HIGH);
         return;
     }
-    /* REV2 > 200 W and SWR > 2.0 */
-    if (g_adc_data.rev2_mW > PROTECT_REV2_SWR_MW &&
-        g_adc_data.swr_x100 > PROTECT_SWR_MAX_X100) {
+    /* Reverse power above the configured floor AND an SWR above the
+     * configured ceiling: a high SWR at low power is just coupler noise. */
+    if (g_adc_data.rev2_mW > lim.rev2_swr_mW &&
+        g_adc_data.swr_x100 > lim.swr_max_x100) {
         protection_trigger_locked(ALERT_SWR_HIGH);
         return;
     }
-    /* FWD1 > 1100 W (coupler 1 forward) */
-    if (g_adc_data.fwd1_mW > PROTECT_FWD1_MAX_MW) {
+    /* Coupler 1 forward. */
+    if (g_adc_data.fwd1_mW > lim.fwd1_max_mW) {
         protection_trigger_locked(ALERT_REFLECT_POWER_HIGH);
         return;
     }
-    /* FWD2 > 1050 W (coupler 2 forward) */
-    if (g_adc_data.fwd2_mW > PROTECT_FWD2_MAX_MW) {
+    /* Coupler 2 forward. */
+    if (g_adc_data.fwd2_mW > lim.fwd2_max_mW) {
         protection_trigger_locked(ALERT_REFLECT_POWER_HIGH);
     }
 }
@@ -222,7 +284,9 @@ void protection_check_ntc(void)
     }
     /* Over-temperature latches whether or not we are keyed: the PA is still
      * dissipating and the condition will not clear on its own. */
-    if (g_adc_data.ntc_core_tenth_c > PROTECT_NTC_MAX_TENTH_C) {
+    protect_limits_t lim;
+    protect_limits_get(&lim);
+    if (g_adc_data.ntc_core_tenth_c > lim.ntc_max_tenth_c) {
         protection_trigger_locked(ALERT_NTC_OVERHEAT);
     }
 }
@@ -239,7 +303,9 @@ void protection_check(void)
     }
 
     /* Over-temperature applies whether or not we are keyed. */
-    if (g_adc_data.ntc_core_tenth_c > PROTECT_NTC_MAX_TENTH_C) {
+    protect_limits_t lim;
+    protect_limits_get(&lim);
+    if (g_adc_data.ntc_core_tenth_c > lim.ntc_max_tenth_c) {
         protection_trigger_locked(ALERT_NTC_OVERHEAT);
         return;
     }

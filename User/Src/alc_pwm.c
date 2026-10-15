@@ -27,9 +27,18 @@
 
 /* BSRR payloads:
  *  bit 0  set -> PG0 high
- *  bit 16 set -> PG0 low */
-volatile uint32_t alc_bsrr_set   = 0x00000001U;   /*!< PG0 = HIGH */
-volatile uint32_t alc_bsrr_reset = 0x00010000U;   /*!< PG0 = LOW  */
+ *  bit 16 set -> PG0 low
+ *
+ * 这两块内存是 TIM2 CH1/CH2 的 DMA 源，被 DMA2（D2 域）读取；DMA2 访问不到
+ * DTCM(0x20000000)，所以放 app.ld 的 .dma_no_cache（AXI SRAM 非缓存窗口）。
+ * 该段为 NOLOAD，startup 不会赋初值，故在 init/start 里显式赋值。 */
+#if defined(__GNUC__)
+#define ALC_BSRR_SECTION  __attribute__((section(".dma_no_cache"), aligned(4)))
+#else
+#define ALC_BSRR_SECTION
+#endif
+volatile uint32_t alc_bsrr_set   ALC_BSRR_SECTION;   /*!< PG0 = HIGH */
+volatile uint32_t alc_bsrr_reset ALC_BSRR_SECTION;   /*!< PG0 = LOW  */
 
 /* Hard-coded absolute address of GPIOG->BSRR.  ioc configured PG0 as
  * GPIO_Output, so the GPIO port is clocked and the register is alive. */
@@ -41,6 +50,10 @@ volatile uint32_t alc_bsrr_reset = 0x00010000U;   /*!< PG0 = LOW  */
 
 void alc_pwm_init(void)
 {
+    /* 载荷放在 NOLOAD 段，需在运行时赋初值 */
+    alc_bsrr_set   = 0x00000001U;   /*!< PG0 = HIGH */
+    alc_bsrr_reset = 0x00010000U;   /*!< PG0 = LOW  */
+
     /* TIM2 clock = 200 MHz.  Prescaler = 0 -> counter runs at 200 MHz.
      * Default ARR = 999 -> 200 kHz PWM. */
     htim2.Instance->PSC = 0U;
@@ -51,6 +64,10 @@ void alc_pwm_init(void)
 
 void alc_pwm_start(void)
 {
+    /* 载荷在 NOLOAD 段，DMA 启动前确保已赋初值（防止未调 init 直接 start） */
+    alc_bsrr_set   = 0x00000001U;
+    alc_bsrr_reset = 0x00010000U;
+
     /* Each CCR match triggers its DMA channel to copy a single word
      * from RAM to the GPIOG BSRR register.  Data alignment is 32-bit.
      * The HAL_TIM_OC_Start_DMA signature is:

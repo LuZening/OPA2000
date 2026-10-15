@@ -136,8 +136,17 @@ void app_gui_task(void *argument)
     /* Start GUI */
     gui_start();
 
-    /* Initialize touch */
-    touch_init();
+    /* touch_init() and the g_calibration_required flag were already set
+     * by main() before osKernelStart().  We only need to land on the
+     * right first screen.  Re-check the flag once here in case the
+     * touch calibration menu (if displayed) toggles it. */
+    if (g_calibration_required) {
+        gui_show_calibration();
+    }
+
+    /* Note: touch driver is already running (probed in main() during
+     * the single-threaded boot step), so we go straight into the
+     * polling loop here. */
 
     while (1) {
         /* Process LVGL tick */
@@ -194,6 +203,17 @@ void app_adc_task(void *argument)
            run in the priority-0 DMA interrupt. */
         adc_peak_hold_tick();
 
+        /* Transmit gate (design spec step 6): the amplifier may only be
+           keyed once BOTH halves are true -
+             g_allow_rf    the IM zero-offset calibration finished, so the
+                           main-current reading is trustworthy, and
+             g_gui_ready   the GUI painted a frame, so the operator can
+                           actually see what the amp is doing.
+           Until then power_control's ptt_apply_level() refuses every
+           request.  Re-evaluated every 50 ms; the flags are volatile so
+           this is a cheap poll. */
+        g_ptt_ready = (g_allow_rf && g_gui_ready);
+
         /* 50ms - 20Hz update rate */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(50));
     }
@@ -204,11 +224,13 @@ void app_adc_task(void *argument)
  */
 void app_comm_task(void *argument)
 {
-    TickType_t last_wake_time;
-
     (void)argument;
 
-    last_wake_time = xTaskGetTickCount();
+    /* No vTaskDelayUntil() anchor here: the loop blocks for an
+     * unpredictable time in radio_uart_wait_frame(), so there is no
+     * fixed grid left to "catch up" on.  The CAT poll accumulator keeps
+     * its own 100 ms cadence via radio_band_tick()'s internal counter,
+     * which is unaffected by how often this loop runs. */
 
     /* Initialize communication */
     comm_init();
@@ -223,14 +245,29 @@ void app_comm_task(void *argument)
         /* Process received commands */
         comm_process_rx();
 
-        /* Radio CAT: 10 ms tick drives a 100 ms poll accumulator, and the
-         * poll itself slices frames out of whatever the IDLE/DMA callbacks
-         * delivered.  Both must run here, in task context. */
+        /* Radio CAT poll accumulator: ticked every 10 ms, sends a query
+         * every 100 ms.  Must run regardless of whether a CAT frame just
+         * arrived, otherwise an unanswered radio would stop being polled
+         * and we could never discover its protocol in the first place. */
         radio_band_tick();
         radio_band_poll();
 
-        /* 10ms tick */
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(10));
+        /* Block until the UART4 ISR hands over a frame, then let
+         * radio_band slice it, identify the protocol and switch band.
+         * This is what keeps frame parsing out of the ISR.
+         *
+         * Timeout is one poll interval rather than "forever" so the two
+         * calls above keep their 10 ms cadence even when the radio is
+         * silent - which is the normal state, since a CAT radio only
+         * answers when asked. */
+        (void)radio_uart_wait_frame(RADIO_BAND_POLL_PERIOD_MS);
+
+        /* Re-anchor the delay: radio_uart_wait_frame() blocks for an
+         * unpredictable time, so vTaskDelayUntil() can no longer be used
+         * to hold the 10 ms grid (it would try to "catch up" by bursting
+         * iterations).  A plain delay is correct here and the tick above
+         * is what actually needs the grid. */
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -241,6 +278,10 @@ void app_monitor_task(void *argument)
 {
     TickType_t last_wake_time;
     static bool ptt_last_handled = false;  /* Track last handled PTT state */
+    /* Divider for the slow housekeeping below.  The loop itself must run at
+     * 10 ms so power_rail_step() can honour the HV sequencing gap, but the
+     * PTT edge check, fan curve and tach only need 100 ms. */
+    static uint32_t slow_div = 0U;
 
     (void)argument;
 
@@ -254,6 +295,16 @@ void app_monitor_task(void *argument)
     ptt_last_handled = power_get_ptt_state();
 
     while (1) {
+        /* HV rail sequencing first, on every tick.  This is why the loop
+         * runs at 10 ms: power_psu_on() / power_psu_off() only throw one of
+         * the two switches, and power_rail_step() performs the second
+         * HV_STAGE_DELAY_MS later.  It must be serviced even while keyed
+         * or a fault is latched - dropping the bias late is worse than
+         * dropping it early. */
+        power_rail_step();
+
+        if (++slow_div >= 10U) {
+        slow_div = 0U;
         /* Check for PTT edge from ISR */
         int ptt_isr_flag = power_get_ptt_flag();
         bool ptt_current;
@@ -284,10 +335,10 @@ void app_monitor_task(void *argument)
         /* Process PTT state change only on edge */
         if (ptt_just_changed) {
             if (ptt_current) {
-                /* PTT pressed */
-                if (g_psu_on) {
-                    power_tx_enable();
-                }
+                /* PTT pressed.  power_tx_enable() does its own full interlock
+                 * check (g_hv_on, power_rail_busy(), g_alert_flag, ...), so
+                 * there is no point pre-screening the flag here. */
+                power_tx_enable();
             } else {
                 /* PTT released */
                 if (g_tx_active) {
@@ -309,9 +360,10 @@ void app_monitor_task(void *argument)
 
         /* Fan / pump tachometer, refreshed on the same slow tick */
         fan_tach_calculate_rpm();
+        }   /* slow_div */
 
-        /* 100ms tick */
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
+        /* 10ms tick: sets the HV rail sequencing resolution. */
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(10));
     }
 }
 

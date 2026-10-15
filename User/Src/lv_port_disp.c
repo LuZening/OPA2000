@@ -14,8 +14,9 @@
 #define LCD_HEIGHT      272
 #define LCD_FB_ADDR     0x24000000UL
 
-/* Double partial buffers: 1/10 screen height each, so 2 fit in 153.6KB */
-/* 480 x 27 x 2 bytes = 25,920 bytes per buffer, total 51,840 bytes */
+/* 双缓冲局部刷新：每块 480 x 27 x 2 = 25,920 B，两块共 51,840 B。
+ * 放在 AXI SRAM 的 .dma_no_cache 不可缓存窗口（app.ld，0x24040000 起），
+ * 因为 CPU 写、DMA2D 读，非缓存才能免去手动 cache clean。 */
 #define LVGL_BUF_HEIGHT  27
 #define LVGL_BUF_PIXELS  (LCD_WIDTH * LVGL_BUF_HEIGHT)
 

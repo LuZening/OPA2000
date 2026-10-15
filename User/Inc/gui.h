@@ -13,7 +13,49 @@ extern "C" {
 #include "opa2000.h"
 
 /* Font declarations (needed for both normal build and LVGL simulator) */
+LV_FONT_DECLARE(MyCJK_12);
 LV_FONT_DECLARE(MyCJK_16);
+
+/*============================================================================
+ *  Concurrency rules (firmware, NOT the PC simulator)
+ *============================================================================
+ *  LVGL is not thread-safe.  Every entry point into the GUI in this header
+ *  (gui_init / gui_tick / gui_show_alert / gui_dismiss_alert / gui_toggle_* /
+ *  gui_process_* / gui_update_* / gui_set_language / etc.) is wrapped by
+ *  gui_lock()/gui_unlock() so that two FreeRTOS tasks (the GUI task + the
+ *  protect task + the comm task + the monitor task) cannot mutate widgets
+ *  at the same time.
+ *
+ *  ISR / interrupt context:  NO gui_*() function may be called from an ISR.
+ *  An ISR that needs to inform the GUI must set a flag (e.g. g_alert_flag)
+ *  and let the GUI task pick it up in its next tick.  Calling
+ *  gui_lock() from ISR would deadlock on osMutexAcquire.
+ *
+ *  The PC simulator build (LVGL_SIM) has no FreeRTOS, so the lock/unlock
+ *  helpers compile to no-ops.  The "no ISR calls" rule still applies to
+ *  the firmware but is unenforced there.
+ *============================================================================*/
+#ifndef LVGL_SIM
+#include "cmsis_os.h"
+extern osMutexId_t gui_mutex;
+#endif
+
+/** Lock the GUI resource (no-op in LVGL_SIM).  Must NOT be called from ISR. */
+void gui_lock(void);
+
+/** Unlock the GUI resource (no-op in LVGL_SIM). */
+void gui_unlock(void);
+
+/*============================================================================
+ *  SIM-only diagnostics
+ *  Exposed so the multithreaded stress test in LVGL.Simulator.cpp can
+ *  assert that every gui_lock() is matched by a gui_unlock().  Never call
+ *  from firmware code; under LVGL_SIM the symbol is unconditionally
+ *  available because the simulator's stress-test C file needs it.
+ *============================================================================*/
+#ifdef LVGL_SIM
+uint32_t gui_sim_outstanding_locks(void);
+#endif
 
 /*============================================================================
  * Function Prototypes

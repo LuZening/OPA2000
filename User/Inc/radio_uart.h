@@ -34,6 +34,24 @@
  *            TC   —— 满：整个缓冲收满
  *          三种都在 Normal 模式下正确处理，且都要重启接收。
  *
+ *          ============== ISR 只搬运，解析全部在任务里 ==============
+ *
+ *          协议识别（判断这是 ICOM / Kenwood / Yaesu 哪一家、BCD 怎么
+ *          解、要不要切波段）逻辑不短，放在中断里会明显拉长中断时间，
+ *          而 UART4_IRQn 的优先级虽然不是最高，但保护相关的中断都挂在
+ *          更高优先级上，拉长它等于挤占保护链路的响应余量。
+ *
+ *          所以这里的分工是：
+ *            中断 —— 把本段字节 memcpy 进 .bss 的交接缓冲，切换 DMA
+ *                    的乒乓目标并重启接收，释放一个信号量。仅此而已，
+ *                    没有解析、没有浮点、没有阻塞。
+ *            任务 —— 等信号量，取走交接缓冲的内容，交给 radio_band
+ *                    切帧 / 识别 / 换波段。
+ *
+ *          交接缓冲是单槽的：CAT 帧率极低（电台每 100 ms 最多回一帧），
+ *          任务 10 ms 一次足以排空，单槽不会丢。若真出现积压，
+ *          stats.frame_dropped 会记下来，而不是无声覆盖。
+ *
  * @note ioc 里 UART4 的配置（用户已在 CubeMX 配好）：
  *          UART4       PC10 = TX, PC11 = RX, 115200 8N1
  *          UART4_IRQn  抢占优先级 5
@@ -78,13 +96,45 @@ void radio_uart_tx(const uint8_t *data, uint16_t len);
 void radio_uart_rx(const uint8_t *data, uint16_t len);
 
 /*============================================================================
- *  HAL 回调（stm32h7xx_hal_uart.c 反向调用）
+ *  ISR -> 任务 的交接（协议探测走这条路）
  *==========================================================================*/
 
-/* IDLE / HT / TC 三种事件统一入口。huart 必须是 &huart4。 */
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size);
+/*! 等待"有一帧待解析"。任务上下文调用。
+ *
+ *  radio_uart_init() 之后必须有一个任务常驻调用它，否则 CAT 数据会在
+ *  交接缓冲里堆积直到 frame_dropped 递增。返回 true 表示交接缓冲里有
+ *  新数据，已经被取走并喂给协议层；返回 false 表示超时（正常情况，
+ *  电台本来就只在被轮询时才回帧）。
+ *
+ *  典型用法：
+ *      for (;;) {
+ *          radio_uart_wait_frame();      // 阻塞直到有数据
+ *          radio_band_tick();            // 累加器满 100 ms 则发查询
+ *      }
+ *
+ *  @param timeout_ms  最长等待时间。给 0 表示只做一次非阻塞检查，
+ *                     用于"还要兼顾别的周期任务"的场景。
+ *  @return true = 取到并处理了一帧；false = 超时无数据
+ */
+bool radio_uart_wait_frame(uint32_t timeout_ms);
 
-/* DMA 错误（搬运失败 / FIFO error）。 */
+/*! 清空交接缓冲里未处理的数据。radio_uart_init() 会自动调用。 */
+void radio_uart_flush_pending(void);
+
+/*============================================================================
+ *  HAL 回调
+ *==========================================================================*/
+
+/* UART4 的 IDLE / HT / TC 事件统一入口。huart 必须是 &huart4。
+ *
+ * 注意这里不叫 HAL_UARTEx_RxEventCallback：HAL 里那是个全局唯一的弱符号，
+ * 一个工程只能有一处强定义。comm.c 提供了那个唯一入口，按实例分发 ——
+ * LPUART1 自己处理，其余（即 UART4）转到这里。两个文件各定义一个同名
+ * 强符号会直接链接失败（multiple definition）。 */
+void radio_uart_rx_event(UART_HandleTypeDef *huart, uint16_t size);
+
+/* DMA 错误（搬运失败 / FIFO error）。全工程只有这一处定义，可以直接
+ * 沿用 HAL 的弱符号名。 */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart);
 
 /* 诊断计数。 */
@@ -96,6 +146,8 @@ typedef struct {
     uint32_t restart_fail;  /*!< 重启失败次数（应恒为 0）      */
     uint32_t uart_errors;   /*!< UART 错误中断次数            */
     uint32_t dup_idle;      /*!< 无新字节的重复 IDLE 次数     */
+    uint32_t handoffs;      /*!< ISR 成功交给任务的次数        */
+    uint32_t frame_dropped; /*!< 任务没排空就被覆盖的次数      */
 } RadioUartStatsType;
 
 void radio_uart_get_stats(RadioUartStatsType *out);

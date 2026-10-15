@@ -52,6 +52,12 @@ DMA_HandleTypeDef hdma_adc2;
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 
+/* DAC1 handle: boot.c declares it extern and drives it from
+ * boot_apply_comp_thresholds().  The registers behind it are here so a
+ * test can assert the DAC code that a config threshold produced. */
+static DAC_TypeDef s_dac1;
+DAC_HandleTypeDef hdac1 = { &s_dac1, 0, 0, "DAC1", 0, 0 };
+
 /* Fake ADC instances - tests inspect LTR/HTR after the AWD setters run. */
 static ADC_TypeDef s_adc1;
 static ADC_TypeDef s_adc2;
@@ -175,6 +181,36 @@ void HAL_GPIO_TogglePin(GPIO_TypeDef *port, uint16_t pin)
 /*============================================================================
  *  TIM stub
  *============================================================================*/
+
+/*============================================================================
+ *  DAC stub
+ *==========================================================================*/
+
+HAL_StatusTypeDef HAL_DAC_SetValue(DAC_HandleTypeDef *hdac, uint32_t Channel,
+                                   uint32_t Alignment, uint32_t Data)
+{
+    (void)Alignment;
+    if (hdac == NULL || hdac->Instance == NULL) {
+        return HAL_ERROR;
+    }
+    /* The real HAL writes one of the two right-aligned data holding
+     * registers and nothing else - no pin is driven until Start(). */
+    if (Channel == DAC_CHANNEL_1) {
+        hdac->Instance->DHR12R1 = Data & 0xFFFU;
+    } else {
+        hdac->Instance->DHR12R2 = Data & 0xFFFU;
+    }
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef HAL_DAC_Start(DAC_HandleTypeDef *hdac, uint32_t Channel)
+{
+    if (hdac == NULL || hdac->Instance == NULL) {
+        return HAL_ERROR;
+    }
+    hdac->Instance->CR |= (Channel == DAC_CHANNEL_1) ? 0x01U : 0x02U;
+    return HAL_OK;
+}
 
 int HAL_TIM_PWM_Start(TIM_HandleTypeDef *htim, uint32_t channel)
 {

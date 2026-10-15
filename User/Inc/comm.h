@@ -46,6 +46,21 @@ typedef enum {
     CMD_SET_LANGUAGE,
     CMD_GET_LANGUAGE,
     CMD_CALIBRATE_COUPLER,
+    /* Remote control of the external PSU (Power Supply Unit, PG5).
+     *
+     * TODO(PROTOCOL): these two are SKELETON ONLY.  The wire format has not
+     * been decided yet - the user only specified that a CAT packet over the
+     * LPUART link will be able to switch the PSU on and off, alongside the
+     * front panel.  Until the framing / opcode / checksum is agreed, the
+     * parser does NOT recognise any PSU keyword, so these branches are
+     * unreachable and nothing in the firmware can drive the PSU remotely.
+     *
+     * The power_psu_on() / power_psu_off() calls below are the intended
+     * end state and are written out so the plumbing is ready; they are simply
+     * gated on a condition that is always false.  See
+     * User/TODO-PSU远程控制.txt for what still has to be decided. */
+    CMD_PSU_ON,                      /*!< TODO: protocol undefined       */
+    CMD_PSU_OFF,                     /*!< TODO: protocol undefined       */
     CMD_UNKNOWN
 } CommandType;
 

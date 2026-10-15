@@ -74,6 +74,40 @@ extern "C" {
 #define MAX_TX_POWER2_W          1050
 #define MAX_MAIN_CURRENT_A       30
 
+/*==============================================================================
+ *  COMP comparator references (DAC1 outputs)
+ *
+ *  The DAC is 12-bit and referenced to VDDA (3.3 V), NOT to the ADC's
+ *  VREFBUF 2.5 V - the two references are different rails and must not be
+ *  mixed.  One LSB is therefore 3300/4095 = 0.806 mV:
+ *
+ *      dac_code = ref_mV * 4095 / 3300
+ *
+ *  Both thresholds are stored as the reference VOLTAGE in mV rather than
+ *  in watts / amps: the analog gain in front of each COMP input is a
+ *  property of the board, calibrated on the bench, not a firmware
+ *  constant.  See User/TODO-COMP1标定待办.txt.
+ *==========================================================================*/
+#define DAC_VDDA_MV                   3300U   /*!< DAC1 reference rail       */
+#define DAC_FULL_SCALE                4095U   /*!< 12-bit maximum code       */
+
+/*!< COMP1 ceiling.  Full scale is 3300 mV; leave headroom so a
+ *    mis-typed config cannot pin the output at the rail. */
+#define COMP1_REF_MV_MAX              3000U
+/*!< COMP2 ceiling.  COMP2 watches the same node as ADC1_INP5, whose full
+ *    scale is 2500 mV (VREFBUF), so anything above that is meaningless as
+ *    a current threshold - 2442 mV is exactly the 30 A design limit. */
+#define COMP2_REF_MV_MAX              2442U
+
+/*!< Ship default for COMP2: the 30 A design limit through the documented
+ *    CC6920BSO-50A transfer function, V = 1650 + I * 26.4. */
+#define DEFAULT_COMP2_REF_MV          2442U
+/*!< Ship default for COMP1: deliberately conservative (about 45 % of full
+ *    scale).  The D5/R40 peak detector ahead of PB2 is uncalibrated, so
+ *    this only has to sit far above the detector noise floor; the precise
+ *    RF-input limit is enforced by AWD1 in firmware. */
+#define DEFAULT_COMP1_REF_MV          1500U
+
 /* Band frequency ranges (Hz) - 5 combined bands.
  * freq_to_band() returns BAND_* based on these. */
 #define BAND_160M_MIN       1800000U
@@ -285,6 +319,17 @@ typedef struct {
     uint16_t band_im_max_mA;          /*!< main current threshold, milli-Amp */
     uint16_t band_vbias_max_mV;       /*!< VBIAS threshold                 */
 
+    /* COMP comparator references - the DAC1 outputs that COMP1 / COMP2
+     * compare the analog inputs against.  Stored as the reference
+     * VOLTAGE in millivolts rather than in watts / amps, because the
+     * DAC is 12-bit on VDDA and the analog gain in front of the inputs
+     * is a hardware property the operator calibrates on the bench, not
+     * a firmware constant.  GUI shows millivolts for COMP1 and also
+     * the derived amps for COMP2 (CC6920BSO-50A: V = 1650 + I*26.4).
+     * See User/TODO-COMP1标定待办.txt for the COMP1 calibration gap. */
+    uint16_t comp1_ref_mV;            /*!< DAC1 CH1 -> COMP1_INP- (PB2)    */
+    uint16_t comp2_ref_mV;            /*!< DAC1 CH2 -> COMP2_INP- (PE9)    */
+
     /* IM zero-offset calibration */
     uint16_t im_zero_offset_adc;
     uint8_t  im_calibrated;
@@ -314,24 +359,33 @@ typedef struct {
 
 extern volatile AdcDataType    g_adc_data;
 
-/* Amplifier front-panel state.  These two are deliberately independent:
- * the supply can be on while the amplifier is idle, and a fault can
- * latch with the supply still on.
+/* Amplifier front-panel state.  These three are deliberately independent:
+ * the main supply can be engaged while the HV rail is off, the HV rail can
+ * be up while the amplifier is idle, and a fault can latch with everything
+ * still on.
  *
- *   g_psu_on    PSU / main supply engaged - PSU_ON_SIG (PG5), PWR_ON_SIG
- *               (PG7) and RF_BIAS_ON (PG2) are high.  This is the
- *               front-panel "ready" state the operator toggles.
+ *   g_psu_on    Main supply engaged - PSU_ON_SIG (PG5) is latched.  The
+ *               operator's master power switch; power_soft_off() releases
+ *               it at shutdown.  Only this one and g_hv_on together mean
+ *               "the PA can produce RF".
+ *   g_hv_on     High-voltage rail engaged - PWR_ON_SIG (PG7) and
+ *               RF_BIAS_ON (PG2) are high.  The front-panel HV button
+ *               toggles this (power_hv_on / power_hv_off), independently of
+ *               the relays.  The two pins are sequenced 10 ms apart, so
+ *               this flag goes true one tick BEFORE the bias is up; use
+ *               power_rail_busy() when the settled state matters.
  *   g_tx_active the transmit sequence is engaged: RELAY2 is closed, so the
  *               PA is still connected to the antenna side.  It stays true
  *               through the 15 ms stop delay after the pedal is released
  *               (RELAY1 is open but RELAY2 is not yet), so protection keeps
  *               running until the PA is fully disconnected.  Only
- *               meaningful while g_psu_on is true.
+ *               meaningful while g_hv_on is true.
  *
  * Anything that means "no RF may be produced" is expressed by
  * g_allow_rf (CC6920 zero-offset not finished) or g_alert_flag
- * (protection latched), not by clearing g_psu_on. */
+ * (protection latched), not by clearing g_hv_on. */
 extern volatile bool           g_psu_on;
+extern volatile bool           g_hv_on;
 extern volatile bool           g_tx_active;
 
 extern volatile BandType       g_current_band;
@@ -345,7 +399,42 @@ extern volatile uint32_t       g_radio_freq_hz;   /*!< last measured Hz */
  * Written only by power_control.c; read by the GUI for its status banner. */
 extern volatile PowerStateType g_power_state;
 
-extern ConfigType  g_config;
+extern volatile ConfigType g_config;
+
+/*============================================================================
+ *  Boot-time flags (set by app_init_task, consumed by app_gui_task)
+ *============================================================================
+ *  g_calibration_required = true  -> the GUI must show the touch
+ *      calibration screen before going to the main screen.  Set when
+ *      config_init() reports no valid record (or the stored touch
+ *      transform is the identity, see config_touch_needs_calibration()).
+ *  g_touch_calibrated      = false -> touch.c has not yet finished its
+ *      own calibration pass (host sample + the g_config.touch transform
+ *      are still defaults).  Distinct from g_calibration_required:
+ *      the former asks the GUI to PROMPT the user; the latter is the
+ *      runtime "is the touch driver ready" flag.
+ *  Both are volatile bool, single writer (init task) + multiple readers
+ *  (GUI / comm) -- the 1-writer-N-readers rule applies; the reads
+ *  may see a stale value for at most one task tick.
+ *============================================================================*/
+extern volatile bool g_calibration_required;
+extern volatile bool g_touch_calibrated;
+
+/*============================================================================
+ *  Readiness gates (both default to "not ready" = safe)
+ *============================================================================
+ *  g_gui_ready  = true once the GUI has rendered a few frames, so the
+ *      main screen's power numbers are actually on the glass.  The
+ *      backlight is turned on at the same moment.
+ *  g_ptt_ready  = true once BOTH g_gui_ready AND the IM zero-offset
+ *      calibration (g_allow_rf) have completed.  Until then every PTT
+ *      path is refused, because the ADC / COMP / protection chain is
+ *      not trustworthy yet.
+ *  Both are volatile bool, single writer each, read by the monitor
+ *  task and the PTT ISR path - the 1-writer-N-readers rule applies.
+ *============================================================================*/
+extern volatile bool g_gui_ready;
+extern volatile bool g_ptt_ready;
 
 /* Band strings for GUI display (defined in opa2000.c) */
 extern const char *strFreqRanges[];

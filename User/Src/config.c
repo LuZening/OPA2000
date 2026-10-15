@@ -6,8 +6,18 @@
 #include "config.h"
 #include "flash_eeprom.h"
 
+#ifndef LVGL_SIM
+#include "cmsis_os.h"
+#endif
+
 #include <string.h>
-#include <strings.h>
+/* strcasecmp is POSIX; MSVC exposes _stricmp.  Map once here so the
+ * portable spelling works on every host toolchain we use for unit
+ * tests.  (The CMSIS-RTOS2 path in the firmware does not need this
+ * because it runs on the ARM toolchain which has strcasecmp natively.) */
+#if defined(_MSC_VER)
+#define strcasecmp _stricmp
+#endif
 
 /*============================================================================
  * Private Variables
@@ -27,6 +37,48 @@ static const char * const radio_type_strings[] = {
  * later, so no critical section is warranted - and taking one from an LVGL
  * callback would be the wrong trade. */
 static volatile bool s_dirty;
+
+/* Mutex that protects the whole "snapshot the live struct + stamp
+ * magic/version/CRC + push to flash" path.  See config_lock/unlock
+ * contract in config.h: writers take it for the entire save/load/
+ * validate/reset; single-field writes and reads stay unlocked.
+ *
+ * On the PC simulator (LVGL_SIM) the shim falls back to a no-op so this
+ * mutex exists but is never taken, matching the existing gui_lock
+ * behaviour for LVGL code paths. */
+static osMutexId_t s_config_mutex;
+
+/*============================================================================
+ * Public Functions (lock / unlock)
+ *============================================================================*/
+
+void config_lock(void)
+{
+#ifndef LVGL_SIM
+    if (s_config_mutex == NULL) {
+        s_config_mutex = osMutexNew(NULL);
+    }
+    if (s_config_mutex != NULL) {
+        osMutexAcquire(s_config_mutex, osWaitForever);
+    }
+#else
+    /* PC simulator: no FreeRTOS, no contention.  The shim must still
+     * provide a "do nothing" path so the symbol is defined and the
+     * source compiles. */
+    (void)s_config_mutex;
+#endif
+}
+
+void config_unlock(void)
+{
+#ifndef LVGL_SIM
+    if (s_config_mutex != NULL) {
+        osMutexRelease(s_config_mutex);
+    }
+#else
+    (void)s_config_mutex;
+#endif
+}
 
 /*============================================================================
  * Private Functions
@@ -128,7 +180,8 @@ void config_reset_default(void)
     g_config.radio_baud_rate = 19200U;
 
     /* Protection defaults - these mirror the DEFAULT_PROTECT_* / MAX_* in
-     * opa2000.h, which protection.c compares against directly. */
+     * opa2000.h; protection.c and boot.c read them back out of g_config and
+     * never compare against a constant of their own. */
     g_config.band_rev1_max_w      = (uint16_t)DEFAULT_PROTECT_REFLECT_POWER1_W;
     g_config.band_rev2_max_w      = (uint16_t)DEFAULT_PROTECT_REFLECT_POWER2_W;
     g_config.band_rev2_swr_w      = (uint16_t)DEFAULT_PROTECT_REFLECT_POWER2_SWR;
@@ -141,6 +194,22 @@ void config_reset_default(void)
     for (int i = 0; i < 6; i++) {
         g_config.band_rf_in_max_w[i] = 20U;
     }
+
+    /* COMP comparator references, as the DAC reference VOLTAGE in mV.
+     * DAC1 is 12-bit on VDDA 3.3 V, so 3300 mV is the ceiling.
+     *   COMP2 (PE9, main current IM via CC6920BSO-50A) has a documented
+     *   transfer function V = 1650 + I*26.4, so the 30 A design limit is
+     *   exactly 2442 mV.  That is also the practical maximum: 2500 mV is
+     *   the ADC full scale on the very same node.
+     *   COMP1 (PB2, RF1 peak detector through D5/R40) has NOT been
+     *   calibrated - the D5/R40 gain is unknown, so no wattage can be
+     *   derived from it.  Until it is, sit well below full scale and far
+     *   above the detector noise floor: COMP1 acts as a last-resort
+     *   overshoot catcher, while AWD1 on the same node does the precise
+     *   band-dependent limit in firmware.  See
+     *   User/TODO-COMP1标定待办.txt. */
+    g_config.comp1_ref_mV         = DEFAULT_COMP1_REF_MV;
+    g_config.comp2_ref_mV         = DEFAULT_COMP2_REF_MV;
 
     /* IM zero-offset: 1.65 V of a 2.5 V reference on a 16-bit converter. */
     g_config.im_zero_offset_adc = 43254U;   /* 1.65 / 2.5 * 65535 */
@@ -251,4 +320,28 @@ RadioType config_set_radio_type_from_string(const char *str)
     }
 
     return RADIO_TYPE_UNKNOWN;
+}
+
+bool config_touch_needs_calibration(void)
+{
+    /* The reset defaults leave `touch.calibrated = 0` and the gain/offset
+     * pair at the identity.  If a previously saved config was loaded but
+     * the operator never finished calibration (or loaded a fresh board),
+     * we still want to prompt them.  We do NOT take the lock here - the
+     * read is a snapshot, atomic on a word-size field, and any "you
+     * just calibrated it" race is harmless (the user just goes through
+     * the screen twice). */
+    if (g_config.touch.calibrated != 0U) {
+        return false;
+    }
+    /* Identity transform check: gain == 1, offset == 0.  Use an epsilon
+     * for the float gain so a future "factory-calibrated to 0.99" still
+     * gets accepted. */
+    if (g_config.touch.x_gain < 0.99f || g_config.touch.x_gain > 1.01f) {
+        return false;
+    }
+    if (g_config.touch.y_gain < 0.99f || g_config.touch.y_gain > 1.01f) {
+        return false;
+    }
+    return true;
 }

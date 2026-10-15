@@ -95,6 +95,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${LVGL_GPU_SOURCES}
     User/Src/alc_pwm.c
     User/Src/app_tasks.c
+    User/Src/boot.c
     User/Src/buzzer.c
     User/Src/comm.c
     User/Src/config.c
@@ -111,12 +112,19 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     User/Src/protection.c
     User/Src/radio_band.c
     User/Src/radio_uart.c
-    User/Src/sdcard_storage.c
+    # Excluded until CubeMX generates the FatFs middleware: the current build
+    # has no FatFs include directory at all, so sdcard_storage.h's
+    # "#include <ff.h>" cannot resolve.  usbd_msc_if.c includes the same
+    # header, so it goes with it.  Re-add both once FatFs (and USB_DEVICE,
+    # for the MSC stack) are enabled in the .ioc and the code regenerated.
+    # User/Src/sdcard_storage.c
+    # User/Src/usbd_msc_if.c
     User/Src/touch.c
+    User/Src/ns2009.c
     User/Src/user_adc.c
     User/Src/usbd_cdc_msc_wrapper.c
     User/Src/usbd_composite_desc.c
-    User/Src/usbd_msc_if.c
+    User/Src/usb_dma.c
     User/fonts/MyCJK_12.c
     User/fonts/MyCJK_16.c
     User/fonts/MyAwesome_12.c

@@ -25,9 +25,11 @@
 /* Raw + engineering values - updated by Control task from ADC DMA */
 volatile AdcDataType    g_adc_data;
 
-/* Front-panel state.  g_psu_on is the operator's power/ready switch,
- * g_tx_active follows the PTT relay sequence.  See opa2000.h. */
+/* Front-panel state.  g_psu_on is the main supply latch, g_hv_on is the
+ * high-voltage rail (PWR_ON + RF_BIAS), g_tx_active follows the PTT relay
+ * sequence.  See opa2000.h for the full contract. */
 volatile bool           g_psu_on      = false;
+volatile bool           g_hv_on       = false;
 volatile bool           g_tx_active   = false;
 
 volatile BandType       g_current_band = BAND_NONE;
@@ -53,8 +55,28 @@ volatile PowerStateType g_power_state   = POWER_STATE_OFF;
 
 /* Persistent config blob.  Default-initialised in opa2000_init(); the
  * Networking agent's sdconfig.cpp overwrites it from /fs/config.bin
- * after startup. */
-ConfigType g_config;
+ * after startup.
+ *
+ * volatile, not because an ISR touches it (none does - the only writers
+ * are the GUI task's menu callbacks and the config task's load/save), but
+ * because multiple FreeRTOS tasks (GUI / comm / config) read and write
+ * it without a mutex.  "1 writer + N readers" with the design rule
+ * "dirty reads are acceptable" requires only that the compiler not
+ * hoist the load out of the loop; volatile gives us that.  If a future
+ * "must-read-two-fields-atomically" appears, that's the moment to add
+ * g_config_mutex and a lock around the readers. */
+volatile ConfigType g_config;
+
+/* Boot-time flags: see opa2000.h.  Both default to "calibration needed"
+ * and "touch not calibrated", which is the safe state for any path
+ * that reads them before app_init_task has set them. */
+volatile bool g_calibration_required = true;
+volatile bool g_touch_calibrated     = false;
+
+/* Readiness gates: see opa2000.h.  Both start "not ready" so a boot
+ * that dies early can never transmit. */
+volatile bool g_gui_ready = false;
+volatile bool g_ptt_ready = false;
 
 /*============================================================================
  *  2. Band / frequency helpers
@@ -189,6 +211,10 @@ void opa2000_init(void)
     g_config.band_fwd2_max_w       = (uint16_t)MAX_TX_POWER2_W;
     g_config.band_im_max_mA        = (uint16_t)(MAX_MAIN_CURRENT_A * 1000U);
     g_config.band_vbias_max_mV     = 5000U;
+    /* COMP references are DAC output voltages in mV; see the block in
+     * opa2000.h and User/TODO-COMP1标定待办.txt. */
+    g_config.comp1_ref_mV          = DEFAULT_COMP1_REF_MV;
+    g_config.comp2_ref_mV          = DEFAULT_COMP2_REF_MV;
     g_config.im_zero_offset_adc    = 43254U;  /* 1.65 V / 2.5 V * 65535 */
     g_config.im_calibrated         = 0U;
     g_config.language              = MULTILANG_CHINESE;
@@ -211,6 +237,7 @@ void opa2000_init(void)
     g_config.rev2 = (coupler_t){0, 0};
 
     g_psu_on      = false;
+    g_hv_on       = false;
     g_tx_active   = false;
     g_power_state = POWER_STATE_OFF;
     g_current_band = BAND_NONE;

@@ -40,11 +40,25 @@ static void prot_establish_ready_state(void)
 {
     protection_clear();               /* guarantees an unlatched start */
     power_init_outputs();
-    power_psu_on();
+    power_psu_on();                   /* main supply latch (PG5) */
+    power_hv_on();                    /* HV rail: PWR_ON, bias one step later */
+    (void)power_rail_step();          /* settle the bias so the rail is idle */
     ptt_state    = PTT_STATE_IDLE;
     g_allow_rf   = true;
     g_alert_flag = false;
     g_tx_active  = false;
+
+    /* protection.c reads every limit from g_config; opa2000_init() is not
+     * called in the host build, so plant the production defaults here.
+     * Keeping them in one place means a change to the defaults shows up as
+     * a single edit rather than a scatter of magic numbers below. */
+    g_config.band_rev2_max_w       = DEFAULT_PROTECT_REFLECT_POWER2_W;
+    g_config.band_rev2_swr_w       = DEFAULT_PROTECT_REFLECT_POWER2_SWR;
+    g_config.band_swr_max_x100     = DEFAULT_PROTECT_SWR_THRESHOLD_X100;
+    g_config.band_ntc_max_tenth_c  = (uint16_t)(MAX_NTC_TEMP_C * 10U);
+    g_config.band_fwd1_max_w       = MAX_TX_POWER1_W;
+    g_config.band_fwd2_max_w       = MAX_TX_POWER2_W;
+    g_config.band_vbias_max_mV     = 1300U;
 
     g_adc_data.rev2_mW          = 0;
     g_adc_data.rev1_mW          = 0;
@@ -54,7 +68,6 @@ static void prot_establish_ready_state(void)
     g_adc_data.vbias_mV         = 0;
     g_adc_data.swr_x100         = 100;
     g_adc_data.ntc_core_tenth_c = 250;   /* 25.0 C */
-    g_config.band_vbias_max_mV  = 1300;
 
     stub_gpio_reset_counters();
     buzzer_init();

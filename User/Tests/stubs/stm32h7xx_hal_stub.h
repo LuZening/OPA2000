@@ -144,6 +144,36 @@ int HAL_TIM_OC_Stop_DMA (TIM_HandleTypeDef *htim, uint32_t channel);
 
 typedef struct { uint32_t dummy[10]; } DMA_HandleTypeDef;
 
+/*============================================================================
+ *  DAC stub
+ *
+ *  boot_apply_comp_thresholds() writes the two COMP reference voltages
+ *  into DAC1 CH1/CH2.  The stub keeps the data holding registers so a test
+ *  can assert which code a config threshold actually produced.  This
+ *  mirrors the real HAL, where SetValue() only writes DHR12R and Start()
+ *  is what puts the channel on the pin.
+ *==========================================================================*/
+
+typedef struct {
+    uint32_t DHR12R1, DHR12R2, SR, CR, MCR;
+} DAC_TypeDef;
+
+typedef struct {
+    DAC_TypeDef *Instance;
+    uint32_t     init_period;
+    uint32_t     init_prescaler;
+    char         name[16];
+} DAC_HandleTypeDef;
+
+#define DAC_CHANNEL_1          0x00000000U
+#define DAC_CHANNEL_2          0x00000010U
+#define DAC_ALIGN_12B_R        0x00000000U
+
+HAL_StatusTypeDef HAL_DAC_SetValue(DAC_HandleTypeDef *hdac, uint32_t Channel,
+                                   uint32_t Alignment, uint32_t Data);
+HAL_StatusTypeDef HAL_DAC_Start (DAC_HandleTypeDef *hdac, uint32_t Channel);
+
+
 typedef enum {
     DMA_PERIPH_TO_MEMORY = 0U,
     DMA_MEMORY_TO_PERIPH = 1U,

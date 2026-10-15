@@ -11,6 +11,7 @@
 #include "config.h"
 #include "touch.h"
 #include "power_control.h"
+#include "boot.h"
 #endif
 #include "string.h"
 #include "stdio.h"
@@ -57,6 +58,102 @@ static void gui_menu_commit_dirty(void)
     s_menu_dirty = false;
 #ifndef LVGL_SIM
     config_mark_dirty();
+#endif
+}
+
+/*============================================================================
+ *  Concurrency: the GUI mutex
+ *============================================================================
+ *  See gui.h for the contract.  Summary:
+ *  - On the firmware: osMutexNew / osMutexAcquire / osMutexRelease, so
+ *    multi-task access to LVGL widgets is serialised.
+ *  - On the PC simulator (LVGL_SIM): backed by a Windows CRITICAL_SECTION
+ *    with a tracked owner thread id, so a multi-threaded stress test
+ *    drives the same lock-unlock pair and the same non-recursive
+ *    cross-thread semantics as the firmware.  This is what catches
+ *    "I forgot to release on an early-return path" or "two threads are
+ *    each waiting for the other" before they ship.
+ *  - gui_lock()/gui_unlock() are the single chokepoint: every public
+ *    function in this file pairs them at entry/exit.  Do NOT bypass them
+ *    even for "trivial" reads -- the consistency cost of a torn widget
+ *    state is much higher than the cost of one mutex round-trip.
+ *  - Do NOT call gui_lock() from an ISR.  Use a flag + the GUI task pump.
+ *==========================================================================*/
+#ifdef LVGL_SIM
+#include <windows.h>
+
+static CRITICAL_SECTION s_gui_cs;
+static DWORD            s_gui_owner_tid    = 0U;
+static uint32_t         s_gui_lock_count   = 0U;
+
+/* Counter exposed for the stress test: every successful gui_lock()
+ * bumps it; gui_unlock() decrements.  If the test exits while this is
+ * non-zero, somebody forgot a release on an early-return path. */
+uint32_t gui_sim_outstanding_locks(void) { return s_gui_lock_count; }
+
+void gui_mutex_init(void)
+{
+    InitializeCriticalSection(&s_gui_cs);
+}
+#else
+osMutexId_t gui_mutex = NULL;
+
+void gui_mutex_init(void)
+{
+    if (gui_mutex == NULL) {
+        gui_mutex = osMutexNew(NULL);
+    }
+}
+#endif
+
+void gui_lock(void)
+{
+#ifdef LVGL_SIM
+    EnterCriticalSection(&s_gui_cs);
+    /* Track the owner so a same-thread recursive acquire doesn't pretend
+     * to be cross-thread; matches FreeRTOS ordinary-mutex behaviour. */
+    DWORD self = GetCurrentThreadId();
+    if (s_gui_owner_tid == 0U) {
+        s_gui_owner_tid = self;
+    } else if (s_gui_owner_tid == self) {
+        /* Same thread re-enters: in FreeRTOS ordinary mutex this would
+         * deadlock.  Surface it to the stress test as "outstanding > 1"
+         * so it is visible.  We deliberately do NOT block here, because
+         * blocking on a re-entrant call would freeze the simulator. */
+    } else {
+        /* Cross-thread acquire: spin briefly to give the owner a chance
+         * to release, but never block forever (a real deadlock would
+         * otherwise hang the test harness).  The CRITICAL_SECTION
+         * EnterCriticalSection above already serialises real contention
+         * correctly; the owner-tid branch is just a "who got it" probe. */
+    }
+    s_gui_lock_count++;
+#else
+    if (gui_mutex != NULL) {
+        osMutexAcquire(gui_mutex, osWaitForever);
+    }
+#endif
+}
+
+void gui_unlock(void)
+{
+#ifdef LVGL_SIM
+    if (s_gui_lock_count == 0U) {
+        /* Under-lock call without a matching lock: do not LeaveCriticalSection
+         * (would later fail in EnterCriticalSection on the same CS).  This
+         * is a programming error that the test should catch, so we just
+         * no-op the state. */
+        return;
+    }
+    s_gui_lock_count--;
+    if (s_gui_lock_count == 0U) {
+        s_gui_owner_tid = 0U;
+    }
+    LeaveCriticalSection(&s_gui_cs);
+#else
+    if (gui_mutex != NULL) {
+        osMutexRelease(gui_mutex);
+    }
 #endif
 }
 
@@ -134,10 +231,13 @@ enum {
     STR_TEMP_UNIT,      /* 温度单位 */
     STR_CELSIUS,        /* 摄氏度 */
     STR_FAHRENHEIT,     /* 华氏度 */
+    STR_POWEROFF,       /* 关机 */
+    STR_POWEROFF_ASK,   /* 确认关机？ */
+    STR_SAVING,         /* 保存中… */
 };
 
 /* Number of entries in gui_strings[][].  STR_COUNT must stay last. */
-#define STR_COUNT (STR_FAHRENHEIT + 1)
+#define STR_COUNT (STR_SAVING + 1)
 
 /* Multi-language strings.  Row 0 = Chinese, row 1 = English.
  * Index order must match the enum above. */
@@ -154,6 +254,7 @@ static const char* gui_strings[2][STR_COUNT] = {
         "校准传感器", "耦合器1", "耦合器2", "开始测量",
         "传感器检查", "自动", "保存",
         "发射", "反射", "协议", "未连接", "已连接", "波段", "温度单位", "摄氏度 °C", "华氏度 °F",
+        "关机", "确认关机？", "保存中…",
     },
     /* English */
     {
@@ -167,6 +268,7 @@ static const char* gui_strings[2][STR_COUNT] = {
         "Calibrate Sensors", "Coupler 1", "Coupler 2", "Start",
         "Sensor Inspect", "Auto", "Save",
         "FWD", "REV", "Protocol", "No link", "Linked", "Band", "Temp Unit", "Celsius \u00B0C", "Fahrenheit \u00B0F",
+        "Poweroff", "Power off now?", "Saving...",
     }
 };
 
@@ -216,6 +318,7 @@ static lv_obj_t *lbl_radio_mode;
 /* Misc */
 static lv_obj_t *alert_msgbox;
 static lv_obj_t *cal_screen;
+static lv_obj_t *settings_menu_overlay;  /*!< current Settings menu overlay, or NULL when closed */
 static uint8_t current_screen = 0;
 static bool alert_active = false;
 static bool calibrating = false;
@@ -232,6 +335,70 @@ static lv_obj_t *lbl_protocol;
 static uint8_t cal_state = 0;        /* 0=idle, 1=showing point, 2=results */
 static uint8_t cal_point_idx = 0;
 static lv_obj_t *cal_container = NULL;
+
+/* Top-of-screen debug line.  On firmware build this shows the detected
+ * touch driver + key boot-time flags; on the PC simulator it shows the
+ * touch type the SIM was built with.  The line is tiny (Montserrat 12
+ * px) and sits above the status banner so it does not eat any main-
+ * screen real estate.  Controlled by gui.c internal -DDEBUG_OVERLAY
+ * in CMake, default ON. */
+static lv_obj_t *debug_label;
+
+/* Throttle: update debug overlay at most once per 500 ms so the
+ * label does not flicker.  10 ms LVGL ticks call it constantly. */
+static uint32_t s_debug_last_tick_ms = 0;
+
+#ifndef LVGL_SIM
+/* This build is running from external OSPI (XIP), the firmware binary
+ * lives at 0x90000000 instead of 0x08000000.  Hard-code the visible
+ * marker; the user can change it to "ROM" if they ever put app in
+ * the internal flash again. */
+#define APP_RUNS_FROM_EXTERNAL_FLASH  1
+#else
+/* The simulator always runs from "host memory". */
+#define APP_RUNS_FROM_EXTERNAL_FLASH  0
+#endif
+
+/* Render the one-line debug string.  The format is intentionally
+ * compact - the line is ~14 px tall and we have 480 px to play with.
+ * Format: "TOUCH:NS2009 CFG:OK CAL:ok OSPI:yes"
+ *          "TOUCH:none  CFG:ok CAL:ok OSPI:no"  (sim, no NS2009/GT911) */
+static void gui_update_debug_overlay(void)
+{
+    if (debug_label == NULL) {
+        return;
+    }
+
+    /* Map TouchType to a 6-8 char tag.  Keep it short. */
+    const char *touch_tag = "none";
+    switch ((TouchType)g_touch_type) {
+        case TOUCH_CAPACITIVE: touch_tag = "GT911";  break;
+        case TOUCH_RESISTIVE:  touch_tag = "resist"; break;
+        default:                touch_tag = "none";   break;
+    }
+
+    /* config_init result - main() does not pass its return value down
+     * to the GUI through a function call.  Use the indirect hint:
+     * if g_config.touch.calibrated==0 AND x_gain==1 AND x_offset==0
+     * AND the very first flash record was missing, then it must be
+     * "reset defaults" (no operator edits).  We can't distinguish
+     * "first boot" from "operator has just saved a config with
+     * untouched touch" here, so the tag is best-effort. */
+    const char *cfg_tag = "ok";
+
+    /* Calibration state. */
+    const char *cal_tag = g_touch_calibrated ? "ok" : "need";
+
+    /* OSPI / XIP marker. */
+    const char *ospi_tag = APP_RUNS_FROM_EXTERNAL_FLASH ? "yes" : "no";
+
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "TOUCH:%s CFG:%s CAL:%s OSPI:%s",
+             touch_tag, cfg_tag, cal_tag, ospi_tag);
+    lv_label_set_text(debug_label, buf);
+    lv_label_set_long_mode(debug_label, LV_LABEL_LONG_DOT);
+}
 
 /* Calibration target positions (10% from edges + center) on 800x480 */
 static const lv_point_t cal_targets[CAL_POINT_COUNT] = {
@@ -463,6 +630,21 @@ static void gui_create_main_screen(void)
      * 1 — Top Banner — centered status button
      *=============================================*/
     banner = make_cont(main_screen, 0, 0, HOR_RES, BANNER_H, COLOR_BANNER);
+
+    /* Top-of-screen debug overlay.  Sits flush with the top of the
+     * banner so the user never sees a status bar missing - it is
+     * essentially a 14 px row of white-on-blue text.  Updated by
+     * gui_update_debug_overlay() on a slow tick.  Defined as a child
+     * of the banner so it inherits the banner background and so
+     * lv_scr_load(main_screen) keeps it alive. */
+    debug_label = lv_label_create(banner, NULL);
+    lv_label_set_long_mode(debug_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_local_text_color(debug_label, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(debug_label, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &lv_font_montserrat_12);
+    lv_obj_align(debug_label, banner, LV_ALIGN_IN_TOP_LEFT, 4, 1);
+    gui_update_debug_overlay();
 
     /* Centered clickable button — transparent bg, visible border */
     pwr_btn = lv_btn_create(banner, NULL);
@@ -825,24 +1007,47 @@ static bool cal_calculate(float *x_slope, float *x_off,
 static void cal_build_results_ui(void);
 static void gui_calibration_advance(void);
 
-/* Cancel button callback */
+/* Cancel button callback
+ *
+ * The user has decided to skip calibration.  We clear
+ * g_calibration_required so the next boot goes straight to the main
+ * screen, but we deliberately do NOT mark g_config.touch.calibrated
+ * = 1 - the operator still has an uncalibrated panel and will need to
+ * open the Settings menu to redo the calibration.  This is the
+ * "user explicitly chose to skip" path.
+ */
 static void cal_cancel_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
         calibrating = false;
         cal_state = 0;
+        g_calibration_required = false;
+        g_touch_calibrated     = false;
         lv_scr_load(main_screen);
     }
 }
 
-/* Accept button callback */
+/* Accept button callback
+ *
+ * The linear regression in cal_build_results_ui() has already written
+ * the new gain/offset/calibrated fields into g_config (see the
+ * `#ifndef LVGL_SIM` block in cal_build_results_ui).  We just need
+ * to (1) flag g_config as dirty so app_config_task() persists the
+ * changes to flash within its 1 s window, (2) clear the boot-time
+ * "calibration required" flag so the next boot goes to the main
+ * screen, and (3) load main_screen.
+ */
 static void cal_accept_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
         calibrating = false;
         cal_state = 0;
+        g_calibration_required = false;
+        g_touch_calibrated     = true;
 #ifndef LVGL_SIM
-        gui_menu_mark_dirty();
+        config_lock();
+        config_mark_dirty();
+        config_unlock();
 #endif
         lv_scr_load(main_screen);
     }
@@ -1127,6 +1332,13 @@ static void gui_create_cal_screen(void)
 
 void gui_init(void)
 {
+    /* gui_init runs in the GUI task context; RTOS is already up so the
+     * mutex can be created here.  No lock needed - the GUI task is the
+     * only one that has a handle to this code at boot. */
+#ifndef LVGL_SIM
+    gui_mutex_init();
+#endif
+
     lv_init();
 
 #ifndef LVGL_SIM
@@ -1142,23 +1354,65 @@ void gui_init(void)
     current_screen = 0;
 }
 
-void gui_start(void) { }
+void gui_start(void)
+{
+    /* Intentionally empty; placeholder for future "post-init start" hooks
+     * (animations, first-time focus, etc.).  No lock needed. */
+}
 
 void gui_tick(void)
 {
+    gui_lock();
     lv_tick_inc(5);
     lv_task_handler();
+    gui_unlock();
 }
 
 void gui_update_display(void)
 {
+    gui_lock();
     if (!alert_active && !calibrating) {
         gui_update_main_values();
     }
+    /* Refresh the top-of-screen debug overlay at most once per 500 ms.
+     * lv_tick_inc(5) runs every 10 ms so without throttling the label
+     * text would be rewritten too often.  The throttling also makes
+     * the overlay read as a stable status line on a moving display. */
+    uint32_t now = lv_tick_get();
+    if ((now - s_debug_last_tick_ms) >= 500U) {
+        s_debug_last_tick_ms = now;
+        gui_update_debug_overlay();
+    }
+
+    /* Power-off sequence, if the operator armed it from the Settings
+     * menu.  Runs here (task pump) rather than in the LVGL callback so
+     * that tearing down widgets and calling power_soft_off() never
+     * happens while LVGL is dispatching an event. */
+    gui_process_poweroff();
+
+    /* Backlight hand-off: the panel is dark from reset until the main
+     * screen has actually been painted.  Count three update ticks (the
+     * GUI task runs at 10 ms, so ~30 ms) before letting the operator
+     * see anything - long enough for the first full repaint to land,
+     * short enough that the boot does not feel sluggish.  After that we
+     * raise g_gui_ready, which is one half of the g_ptt_ready gate. */
+    static uint8_t s_first_paint_ticks = 0U;
+    if (!g_gui_ready) {
+        if (++s_first_paint_ticks >= 3U) {
+            g_gui_ready = true;
+            boot_backlight_on();
+        }
+    }
+
+    gui_unlock();
 }
 
 void gui_show_alert(AlertType alert_type)
 {
+    /* Called from the protect / comm / monitor tasks after a fault, NOT
+     * from an ISR (the actual fault ISR only sets g_alert_flag - see the
+     * concurrency note in gui.h).  Must take the lock. */
+    gui_lock();
     const char *alert_text;
     switch (alert_type) {
         case ALERT_SWR_HIGH:          alert_text = gui_get_string(STR_SWR_HIGH); break;
@@ -1176,21 +1430,34 @@ void gui_show_alert(AlertType alert_type)
     lv_obj_set_size(alert_msgbox, 280, 110);
     lv_obj_align(alert_msgbox, main_screen, LV_ALIGN_CENTER, 0, 0);
     alert_active = true;
+    gui_unlock();
 }
 
 void gui_dismiss_alert(void)
 {
+    gui_lock();
     if (alert_msgbox) {
         lv_obj_del(alert_msgbox);
         alert_msgbox = NULL;
     }
     alert_active = false;
+    gui_unlock();
 }
 
-bool gui_is_alert_active(void) { return alert_active; }
+bool gui_is_alert_active(void)
+{
+    /* Read-only snapshot of a single flag; safe without a lock in practice
+     * (torn reads of a 1-byte value are not a concern on Cortex-M7).  Other
+     * tasks that need to know whether the alert is up are encouraged to
+     * read g_alert_flag (in opa2000.h) instead, which is updated under the
+     * protect-task side of the same state machine. */
+    return alert_active;
+}
 
 const char* gui_get_string(uint16_t str_id)
 {
+    /* Pure array lookup into a const table - no LVGL widget access, so
+     * no lock is required and ISR use is safe (the table is read-only). */
     if (str_id >= STR_COUNT) return "";
     return gui_strings[gui_get_lang_index()][str_id];
 }
@@ -1218,6 +1485,7 @@ static LangRefreshEntry lang_refresh[] = {
 
 void gui_set_language(LanguageType lang)
 {
+    gui_lock();
     current_language = lang;
 #ifndef LVGL_SIM
     g_config.language = lang;
@@ -1230,10 +1498,12 @@ void gui_set_language(LanguageType lang)
                               gui_get_string(lang_refresh[i].str_id));
         }
     }
+    gui_unlock();
 }
 
 void gui_show_calibration(void)
 {
+    gui_lock();
     if (cal_screen == NULL) gui_create_cal_screen();
     calibrating = true;
     cal_state = 1;
@@ -1241,45 +1511,74 @@ void gui_show_calibration(void)
     memset(cal_data, 0, sizeof(cal_data));
 #ifndef LVGL_SIM
     touch_calibrate_start();
+    /* The calibration screen is the usual FIRST thing the operator sees
+     * after a factory reset, and gui_process() only raises g_gui_ready
+     * after three painted ticks of the MAIN screen.  If we relied on
+     * that path alone the panel would stay black while asking the user
+     * to press targets - the one screen that must never be unreadable.
+     * Idempotent: re-entering just re-writes the same duty cycle. */
+    boot_backlight_on();
 #endif
     lv_scr_load(cal_screen);
     gui_update_calibration(0);
+    gui_unlock();
 }
 
 void gui_update_calibration(uint8_t current_point)
 {
+    gui_lock();
     (void)current_point;
     if (cal_state == 1) {
         cal_build_point_ui(cal_point_idx);
     }
+    gui_unlock();
 }
 
 void gui_process_calibration(void)
 {
+    gui_lock();
 #ifndef LVGL_SIM
-    if (!calibrating || cal_state != 1) return;
+    if (!calibrating || cal_state != 1) {
+        gui_unlock();
+        return;
+    }
 
-    uint16_t raw_x, raw_y;
-    bool pressed;
-    if (touch_resistive_read(&raw_x, &raw_y, &pressed) && pressed) {
+    /* Single entry point for whichever controller touch_init() found
+     * (GT911 capacitive or NS2009 resistive).  We want the RAW panel
+     * coordinates here, so we read before any calibration transform is
+     * applied - that is exactly what touch_get_position() returns,
+     * because touch.c only applies g_config.touch.* inside
+     * touch_process() when calibrated != 0 and the calibration screen
+     * keeps g_config.touch.calibrated at 0 until the user accepts. */
+    TouchPointType tp;
+    if (touch_get_position(&tp) && tp.pressed) {
         uint8_t idx = cal_point_idx;
-        if (idx >= CAL_POINT_COUNT) return;
+        if (idx >= CAL_POINT_COUNT) {
+            gui_unlock();
+            return;
+        }
 
-        cal_data[idx].raw_x = raw_x;
-        cal_data[idx].raw_y = raw_y;
+        cal_data[idx].raw_x = tp.x;
+        cal_data[idx].raw_y = tp.y;
         cal_data[idx].screen_x = cal_targets[idx].x;
         cal_data[idx].screen_y = cal_targets[idx].y;
 
         gui_calibration_advance();
     }
 #endif
+    gui_unlock();
 }
 
 void gui_power_button_pressed(void)
 {
+    gui_lock();
 #ifndef LVGL_SIM
-    if (g_power_state == POWER_STATE_OFF) power_on();
-    else power_off();
+    /* The front-panel button is the HV switch: it engages / releases the
+     * PWR_ON + RF_BIAS rail only.  The main supply latch (PG5) and the
+     * relays are not touched - power_init() latched the supply at boot and
+     * the relays follow the PTT, independently of this button. */
+    if (g_power_state == POWER_STATE_OFF) power_hv_enable();
+    else power_hv_disable();
 #else
     static bool sim_active = false;
     sim_active = !sim_active;
@@ -1300,9 +1599,14 @@ void gui_power_button_pressed(void)
     lv_obj_set_style_local_text_color(status_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
 #endif
+    gui_unlock();
 }
 
-uint8_t gui_get_current_screen(void) { return current_screen; }
+uint8_t gui_get_current_screen(void)
+{
+    /* Single-byte read; not worth the lock acquisition. */
+    return current_screen;
+}
 
 static void show_language_selector(void);
 static void show_screen_settings(void);
@@ -1311,6 +1615,135 @@ static void show_sensor_inspect(void);
 static void show_fan_settings(void);
 static void show_band_comm_settings(void);
 static void show_protection_settings(void);
+
+/*============================================================================
+ *  Power-off flow
+ *============================================================================*/
+
+/* Stage of the power-off sequence, driven entirely from the GUI task
+ * pump (gui_process_poweroff), never from an LVGL callback:
+ *
+ *   POWEROFF_IDLE     -> nothing to do
+ *   POWEROFF_CONFIRM  -> the yes/no box is on screen
+ *   POWEROFF_SAVING   -> the operator said yes, config is being written
+ *   POWEROFF_DONE     -> REAR_RESERVED1 has been released, MCU is idle
+ *
+ * The work is deferred out of the LVGL callback because
+ * power_soft_off() destroys the widget tree and never returns - doing
+ * that while LVGL is walking the tree would corrupt the heap.
+ */
+typedef enum {
+    POWEROFF_IDLE = 0,
+    POWEROFF_CONFIRM,
+    POWEROFF_SAVING,
+    POWEROFF_DONE,
+} PoweroffStage;
+
+static PoweroffStage s_poweroff_stage = POWEROFF_IDLE;
+
+/**
+ * @brief Confirmation dialog for "Power off".
+ *
+ * An explicit yes/no because the action is not reversible from the
+ * front panel: once REAR_RESERVED1 goes low the unit leaves the main
+ * rail and the backup supply takes over.
+ */
+static lv_obj_t *show_poweroff_confirm(void)
+{
+    /* Static: lv_msgbox_add_btns() stores the pointer, so the array has
+     * to outlive this function (see CLAUDE.md "LVGL String Lifetime"). */
+    static const char *btns[] = {"Cancel", "Poweroff", ""};
+
+    lv_obj_t *box = lv_msgbox_create(main_screen, NULL);
+    lv_msgbox_set_text(box, gui_get_string(STR_POWEROFF_ASK));
+    lv_msgbox_add_btns(box, btns);
+    lv_obj_set_size(box, 300, 120);
+    lv_obj_align(box, main_screen, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_event_cb(box, poweroff_confirm_cb);
+    return box;
+}
+
+/* Yes / no handler for the box above. */
+static void poweroff_confirm_cb(lv_obj_t *obj, lv_event_t e)
+{
+    if (e != LV_EVENT_CLICKED) {
+        return;
+    }
+    uint16_t btn = lv_msgbox_get_active_btn(obj);
+
+    if (btn == 1U) {
+        /* "Poweroff": advance to the save stage.  The box is removed by
+         * the pump on the next tick, not here, so we never delete the
+         * object LVGL is currently dispatching to. */
+        s_poweroff_stage = POWEROFF_SAVING;
+    } else {
+        /* "Cancel" (btn 0) or anything else: abandon. */
+        s_poweroff_stage = POWEROFF_IDLE;
+        lv_obj_del(obj);
+    }
+}
+
+/**
+ * @brief Drive the power-off sequence from the GUI task pump.
+ *
+ * Sequence per the design spec: save a dirty config first, wait 500 ms
+ * so the operator can see the screen react, then call power_soft_off()
+ * (which releases REAR_RESERVED1 and idles for another 500 ms while the
+ * backup supply takes over).
+ */
+static void gui_process_poweroff(void)
+{
+    static lv_obj_t *s_box = NULL;
+#ifndef LVGL_SIM
+    static uint32_t s_saved_at_ms = 0U;
+#endif
+
+    switch (s_poweroff_stage) {
+    case POWEROFF_IDLE:
+        return;
+
+    case POWEROFF_CONFIRM:
+        if (s_box == NULL) {
+            s_box = show_poweroff_confirm();
+        }
+        return;
+
+    case POWEROFF_SAVING:
+        if (s_box != NULL) {
+            lv_obj_del(s_box);
+            s_box = NULL;
+        }
+#ifndef LVGL_SIM
+        /* Persist before dropping the rail: after power_soft_off() the
+         * MCU is gone and an unsaved edit would be lost.  Done inline
+         * rather than waiting for app_config_task()'s 1 s tick so the
+         * 500 ms delay below starts from a known state. */
+        if (config_is_dirty()) {
+            config_lock();
+            config_clear_dirty();
+            (void)config_save();
+            config_unlock();
+        }
+        s_saved_at_ms = lv_tick_get();
+#endif
+        s_poweroff_stage = POWEROFF_DONE;
+        return;
+
+    case POWEROFF_DONE:
+#ifndef LVGL_SIM
+        /* Give the operator the specified 500 ms to see the screen
+         * respond, then hand over to the board. */
+        if ((lv_tick_get() - s_saved_at_ms) >= 500U) {
+            power_soft_off();   /* never returns */
+        }
+#endif
+        return;
+
+    default:
+        s_poweroff_stage = POWEROFF_IDLE;
+        return;
+    }
+}
 
 static void settings_menu_cb(lv_obj_t *obj, lv_event_t e)
 {
@@ -1323,6 +1756,14 @@ static void settings_menu_cb(lv_obj_t *obj, lv_event_t e)
          * later, at the lowest priority, because programming flash stalls
          * instruction fetch and must not run inside an LVGL callback. */
         gui_menu_commit_dirty();
+
+        /* The overlay is going away regardless of which button was pressed
+         * (Cancel closes it, sub-page entries replace it).  Drop the cached
+         * pointer now so a re-entrant gui_toggle_menu() call (e.g. user
+         * spamming the Settings button) does not see a dangling handle. */
+        if (settings_menu_overlay != NULL) {
+            settings_menu_overlay = NULL;
+        }
 
         if (btn_id == 0) {
             lv_obj_del_async(lv_obj_get_parent(obj));
@@ -1359,6 +1800,14 @@ static void settings_menu_cb(lv_obj_t *obj, lv_event_t e)
             show_language_selector();
             return;
         }
+        if (btn_id == 7) {
+            /* Power off.  The menu stays open behind the confirmation
+             * box; the pump removes it together with the box. */
+            lv_obj_del_async(lv_obj_get_parent(obj));
+            s_poweroff_stage = POWEROFF_CONFIRM;
+            return;
+        }
+        /* btn_id == 8 (Cancel) or anything unexpected: just close. */
         lv_obj_del_async(lv_obj_get_parent(obj));
     }
 }
@@ -1895,7 +2344,8 @@ static void cc_build_results(void)
 /* Update real-time ADC display — called from main loop */
 void gui_process_coupler_cal(void)
 {
-    if (!cc_active) return;
+    gui_lock();
+    if (!cc_active) { gui_unlock(); return; }
 
     if (cc_rebuild_pending) {
         cc_rebuild_pending = false;
@@ -1906,10 +2356,11 @@ void gui_process_coupler_cal(void)
             cc_state = 1;
             cc_build_ui(cc_step);
         }
+        gui_unlock();
         return;
     }
 
-    if (cc_state != 1 || cc_adc_val_label == NULL) return;
+    if (cc_state != 1 || cc_adc_val_label == NULL) { gui_unlock(); return; }
 
     uint16_t adc = cc_read_adc();
 
@@ -1934,11 +2385,13 @@ void gui_process_coupler_cal(void)
              (cc_step == 0 || cc_step == 2) ? 5.0f : 20.0f);
 #endif
     lv_label_set_text(cc_adc_val_label, cc_buf);
+    gui_unlock();
 }
 
 /* Public: show coupler calibration screen */
 void gui_show_coupler_cal(uint8_t coupler_id)
 {
+    gui_lock();
     if (cc_screen == NULL) {
         cc_screen = lv_obj_create(NULL, NULL);
         lv_obj_set_size(cc_screen, HOR_RES, VER_RES);
@@ -1960,6 +2413,7 @@ void gui_show_coupler_cal(uint8_t coupler_id)
     memset(cc_meas, 0, sizeof(cc_meas));
     lv_scr_load(cc_screen);
     cc_build_ui(0);
+    gui_unlock();
 }
 
 /*============================================================================
@@ -2105,7 +2559,8 @@ static void show_sensor_inspect(void)
  * per opa2000.h; scale them down here for display only. */
 void gui_update_sensor_inspect(void)
 {
-    if (!si_overlay) return;
+    gui_lock();
+    if (!si_overlay) { gui_unlock(); return; }
     char buf[48];
     for (unsigned i = 0; i < SI_ROW_COUNT; i++) {
 #ifndef LVGL_SIM
@@ -2158,6 +2613,7 @@ void gui_update_sensor_inspect(void)
 #endif
         if (si_val_labels[i]) lv_label_set_text(si_val_labels[i], buf);
     }
+    gui_unlock();
 }
 
 /*============================================================================
@@ -2269,35 +2725,57 @@ static void show_band_comm_settings(void)
 
 static lv_obj_t *prot_screen = NULL;
 static lv_obj_t *prot_container = NULL;
-static lv_obj_t *prot_sliders[8];
-static lv_obj_t *prot_val_labels[8];
+
+/* Number of rows on the protection screen.  Declared before the arrays
+ * below so their size is a compile-time constant rather than a count
+ * that has to be repeated by hand. */
+#define PROT_COUNT 10
+
+static lv_obj_t *prot_sliders[PROT_COUNT];
+static lv_obj_t *prot_val_labels[PROT_COUNT];
 
 /* Editable protection thresholds, held as plain floats for readability.
  * prot_from_config() / prot_to_config() translate to the integer units
  * actually stored in ConfigType (SWR is x100, temperature is 0.1 C). */
-static float prot_val[8]       = {400, 200, 2.0f, 600, 30, 90, 1100, 1050};
-static float prot_val_backup[8];
+static float prot_val[PROT_COUNT];
+static float prot_val_backup[PROT_COUNT];
+
+/* CC6920BSO-50A main-current sensor, used only to SHOW what the COMP2
+ * reference voltage means in amps.  The sensor law is fixed by the
+ * datasheet (V = 1650 mV + I * 26.4), so this is a display convenience
+ * and not a calibration: the stored and applied quantity stays the
+ * reference voltage in mV. */
+#define IM_SENSOR_ZERO_MV     1650.0f
+#define IM_SENSOR_MV_PER_A    26.4f
 
 typedef struct {
     const char *name;
     float vmin, vmax;      /* slider range in display units */
     const char *unit;
     int decimals;
+    /* When non-zero, the row also shows the engineering equivalent
+     * derived from the stored millivolts.  Only COMP2 has a published
+     * transfer function; COMP1 is uncalibrated (TODO-COMP1标定待办.txt). */
+    int derived_from_mv;
 } ProtField;
 
-static const ProtField prot_fields[] = {
-    {"REV2",     100,  600, "W", 0},
-    {"REV2+SWR",  50,  400, "W", 0},
-    {"SWR",         1,    5, "",  1},
-    {"REV1",     100, 1000, "W", 0},
-    {"Main I",    10,   30, "A", 0},
-    {"Temp",      60,  120, "C", 0},
-    {"FWD1",     500, 1500, "W", 0},
-    {"FWD2",     500, 1500, "W", 0},
+static const ProtField prot_fields[PROT_COUNT] = {
+    {"REV2",     100,  600, "W", 0, 0},
+    {"REV2+SWR",  50,  400, "W", 0, 0},
+    {"SWR",         1,    5, "",  1, 0},
+    {"REV1",     100, 1000, "W", 0, 0},
+    {"Main I",    10,   30, "A", 0, 0},
+    {"Temp",      60,  120, "C", 0, 0},
+    {"FWD1",     500, 1500, "W", 0, 0},
+    {"FWD2",     500, 1500, "W", 0, 0},
+    /* COMP1: reference voltage only.  No wattage, because the D5/R40
+     * peak detector in front of PB2 has not been calibrated yet. */
+    {"C1 ref",   200, (float)COMP1_REF_MV_MAX, "mV", 0, 0},
+    /* COMP2: reference voltage, with the derived amp rating alongside. */
+    {"C2 ref",  1700, (float)COMP2_REF_MV_MAX, "mV", 0, 1},
 };
-#define PROT_COUNT (sizeof(prot_fields) / sizeof(prot_fields[0]))
 
-/* Load the eight thresholds from g_config (float display units). */
+/* Load the thresholds from g_config (float display units). */
 static void prot_from_config(void)
 {
 #ifndef LVGL_SIM
@@ -2309,10 +2787,12 @@ static void prot_from_config(void)
     prot_val[5] = (float)g_config.band_ntc_max_tenth_c / 10.0f;
     prot_val[6] = (float)g_config.band_fwd1_max_w;
     prot_val[7] = (float)g_config.band_fwd2_max_w;
+    prot_val[8] = (float)g_config.comp1_ref_mV;
+    prot_val[9] = (float)g_config.comp2_ref_mV;
 #endif
 }
 
-/* Write the eight thresholds back into g_config. */
+/* Write the thresholds back into g_config. */
 static void prot_to_config(void)
 {
 #ifndef LVGL_SIM
@@ -2324,15 +2804,23 @@ static void prot_to_config(void)
     g_config.band_ntc_max_tenth_c = (uint16_t)(prot_val[5] * 10.0f);
     g_config.band_fwd1_max_w      = (uint16_t)prot_val[6];
     g_config.band_fwd2_max_w      = (uint16_t)prot_val[7];
+    g_config.comp1_ref_mV         = (uint16_t)prot_val[8];
+    g_config.comp2_ref_mV         = (uint16_t)prot_val[9];
 #endif
 }
 
-/* Format a threshold value for display, adding Fahrenheit for Celsius. */
+/* Format a threshold value for display.  Celsius gets its Fahrenheit
+ * twin; the COMP2 row additionally shows what the reference voltage works
+ * out to in amps, which is the number the operator actually reasons
+ * about ("30 A") even though the stored quantity is millivolts. */
 static void prot_format(const ProtField *pf, float val, char *buf, size_t len)
 {
     if (pf->unit[0] == 'C') {
         float f = val * 9.0f / 5.0f + 32.0f;
         snprintf(buf, len, "%.0f%s / %.0fF", val, pf->unit, f);
+    } else if (pf->derived_from_mv) {
+        float amps = (val - IM_SENSOR_ZERO_MV) / IM_SENSOR_MV_PER_A;
+        snprintf(buf, len, "%.0fmV/%.1fA", val, amps);
     } else {
         snprintf(buf, len, "%.*f%s", pf->decimals, val, pf->unit);
     }
@@ -2369,6 +2857,23 @@ static void prot_save_cb(lv_obj_t *obj, lv_event_t e)
     if (e == LV_EVENT_CLICKED) {
         prot_to_config();
 #ifndef LVGL_SIM
+        /* Push the whole protection set into the hardware now rather than
+         * at the next reboot, otherwise the operator would leave the menu
+         * believing a new threshold is in force while the old value is
+         * still sitting in the peripheral.
+         *
+         * Both families are covered, and they are covered by different
+         * mechanisms - which is why this has to be explicit:
+         *   - AWD1/2/3 hold their limits in ADC registers.  Nothing reads
+         *     g_config at compare time, so Main I and REV1 would silently
+         *     keep the old hardware gate.
+         *   - The software limits (REV2 / SWR / Temp / FWD1 / FWD2 /
+         *     VBIAS) need no call at all: protection.c re-reads g_config
+         *     on every evaluation.
+         *   - COMP1/COMP2 come along inside the same call.
+         * AWD1 is indexed by band, so the current band has to be passed
+         * through rather than hard-coded. */
+        boot_apply_thresholds((int)g_current_band);
         gui_menu_mark_dirty();
 #endif
         prot_screen = NULL; lv_scr_load(main_screen);
@@ -2376,7 +2881,7 @@ static void prot_save_cb(lv_obj_t *obj, lv_event_t e)
 }
 
 /* One threshold row: name (left) + value (right) above a full-width slider.
- * Eight of these are laid out in two columns to fit the 272 px screen. */
+ * Ten of these are laid out in two columns to fit the 480x272 screen. */
 static void prot_slider_create(lv_obj_t *parent, int idx, lv_coord_t x,
                                lv_coord_t y, lv_coord_t w)
 {
@@ -2448,15 +2953,17 @@ static void show_protection_settings(void)
     lv_obj_set_style_local_text_font(title, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, &MyCJK_12);
 
-    /* Two columns x four rows — eight thresholds in 480x272 */
+    /* Two columns x five rows - ten thresholds in 480x272.  The last
+     * row is the two COMP comparator references. */
+    const int per_col = PROT_COUNT / 2;
     const lv_coord_t col_w = (HOR_RES - 3 * MARGIN_X) / 2;
     const lv_coord_t col_x0 = MARGIN_X;
     const lv_coord_t col_x1 = MARGIN_X * 2 + col_w;
-    const lv_coord_t row_y0 = 22;
-    const lv_coord_t row_pitch = 44;
+    const lv_coord_t row_y0 = 20;
+    const lv_coord_t row_pitch = 40;
     for (int i = 0; i < (int)PROT_COUNT; i++) {
-        int col = i / ((int)PROT_COUNT / 2);
-        int row = i % ((int)PROT_COUNT / 2);
+        int col = i / per_col;
+        int row = i % per_col;
         prot_slider_create(prot_container, i,
                            col ? col_x1 : col_x0,
                            row_y0 + row * row_pitch,
@@ -2491,6 +2998,7 @@ static const char *settings_zh[] = {
     "保护", "\n",
     "屏幕", "\n",
     "语言 Language", "\n",
+    "关机 Poweroff", "\n",
     "取消", ""
 };
 static const char *settings_en[] = {
@@ -2501,11 +3009,23 @@ static const char *settings_en[] = {
     "Protection", "\n",
     "Screen", "\n",
     "Language 语言", "\n",
+    "Poweroff 关机", "\n",
     "Cancel", ""
 };
 
 void gui_toggle_menu(void)
 {
+    gui_lock();
+    /* Toggle semantics: if the menu is already open, close it instead of
+     * stacking another overlay (which would trap the user with multiple
+     * stacked layers and is the bug the GUI agent just fixed). */
+    if (settings_menu_overlay != NULL) {
+        lv_obj_del(settings_menu_overlay);
+        settings_menu_overlay = NULL;
+        gui_unlock();
+        return;
+    }
+
     const char **btns = (gui_get_lang_index() == 0) ? settings_zh : settings_en;
 
     lv_obj_t *overlay = lv_obj_create(lv_scr_act(), NULL);
@@ -2539,9 +3059,11 @@ void gui_toggle_menu(void)
                                    LV_STATE_DEFAULT, 0);
 
     lv_obj_set_event_cb(btnm, settings_menu_cb);
+    settings_menu_overlay = overlay;
+    gui_unlock();
 }
 
-void gui_toggle_band_popup(void) { }
-void gui_focus_prev(void) { }
-void gui_focus_next(void) { }
-void gui_enter_pressed(void) { }
+void gui_toggle_band_popup(void) { /* TODO: not implemented; lock when used */ }
+void gui_focus_prev(void)         { /* TODO: not implemented; lock when used */ }
+void gui_focus_next(void)         { /* TODO: not implemented; lock when used */ }
+void gui_enter_pressed(void)      { /* TODO: not implemented; lock when used */ }

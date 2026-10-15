@@ -30,19 +30,41 @@
  *
  *          中断里只有指针算术、内存搬运和一次 HAL 调用，无解析、无动态
  *          分配、无阻塞等待。
+ *
+ *          ===================== ISR 与任务的分工 =====================
+ *
+ *          中断**不接触协议层**。协议识别（判断 ICOM / Kenwood / Yaesu、
+ *          BCD 解码、是否切波段）逻辑不短，放进中断会拉长 UART4_IRQn 的
+ *          占用时间，而保护相关的中断优先级更高，一旦被挤占就吃掉保护的
+ *          响应余量。
+ *
+ *          所以 IDLE 中断只做三件事：
+ *            1. 把本段字节 memcpy 进 s_staged[]（.bss，DMA 不参与）
+ *            2. 切换乒乓缓冲并重启 ReceiveToIdle —— DMA 立刻继续收下一帧
+ *            3. osSemaphoreRelease() 唤醒电台任务
+ *
+ *          协议推断与执行全在 app_comm_task() 里，经
+ *          radio_uart_wait_frame() 取出后调用 radio_band_feed() 完成。
+ *          这样"收"与"解析"彻底解耦：中断永不阻塞，任务的处理时长也
+ *          不再影响接收。
  */
 
 #include "radio_uart.h"
 #include "stm32h7xx_hal.h"
 #include <string.h>
+#ifndef LVGL_SIM
+#include "cmsis_os.h"
+#endif
 
 extern UART_HandleTypeDef huart4;
 
 /*============================================================================
  *  双缓冲
  *
- *  放 DTCMRAM：H7 的 D-cache 会让 DMA 与 CPU 看到的内容不一致，而
- *  CAT 缓冲很小很热，牺牲一点 DTCM 容量换零一致性最划算。
+ *  放在 AXI SRAM 的不可缓存窗口（app.ld 的 .dma_no_cache，0x24040000 起，
+ *  由 MPU 标为 non-cacheable）。注意：H7 的 DMA1/DMA2 无法访问 DTCM/ITCM
+ *  （只有 MDMA 可以），所以 DMA 缓冲绝不能放 DTCM；放进非缓存 SRAM 后
+ *  DMA 与 CPU 看到的内容天然一致，无需手动 cache maintenance。
  *==========================================================================*/
 #if defined(__GNUC__)
 #define RADIO_UART_BUF_SECTION  __attribute__((section(".dma_buffer"), aligned(32)))
@@ -68,6 +90,35 @@ static volatile uint32_t s_started;   /*!< init 是否成功 */
 static volatile RadioUartStatsType s_stats;
 
 /*============================================================================
+ *  ISR -> 任务 交接
+ *
+ *  中断不碰协议层，只把这一段字节搬到这里，然后 osSemaphoreRelease()
+ *  叫醒任务。任务在 radio_uart_wait_frame() 里取走并喂给 radio_band。
+ *
+ *  为什么不用 radio_band_push_isr() 的逐字节环形缓冲：那个接口是为
+ *  "UART 中断逐字节喂"设计的，而这里是 DMA 整段搬运，一次 memcpy 比
+ *  逐字节入环更快，也让中断与任务的边界更清晰。
+ *
+ *  为什么交接缓冲要放在 .bss 而不像 s_buf_a/b 那样放 .dma_buffer：
+ *  DMA 永远不会访问它，只有 CPU 写（中断）和读（任务），所以不需要
+ *  non-cacheable 窗口，也就不必占用紧邻的 DMA 内存。
+ *
+ *  单槽 + 长度字段：radio_band_feed() 吃的是"一段字节"，天然适配。
+ *  s_staged_len 必须在中断里先写、长度有效，再释放信号量——任务被唤醒
+ *  时读到的必然是完整的这一段。volatile 保证两次访问不会被优化掉或
+ *  重排。帧率极低（最多 100 ms 一帧）而任务 10 ms 一轮，单槽足够。
+ *==========================================================================*/
+
+static uint8_t  s_staged[RADIO_UART_BUF_SIZE];
+static volatile uint16_t s_staged_len;
+static volatile bool       s_staged_full;
+
+/* 中断与任务共享，延迟创建：radio_uart_init() 在 osKernelInitialize()
+ * 之后、osKernelStart() 之前被调用，那时 osSemaphoreNew 已经可用，
+ * 但信号量必须在有任务运行时创建才安全，所以放到第一次 wait 时懒创建。 */
+static osSemaphoreId_t s_rx_sem;
+
+/*============================================================================
  *  钩子实现
  *==========================================================================*/
 
@@ -85,7 +136,11 @@ void radio_uart_tx(const uint8_t *data, uint16_t len)
     }
 }
 
-/* radio_band 通过这个接收字节。HAL 回调与协议层都汇聚到这里。 */
+/* radio_band 通过这个接收字节。HAL 回调与协议层都汇聚到这里。
+ *
+ * 注意：这是一个**任务上下文**接口，由 radio_uart_wait_frame() 调用。
+ * 中断绝不能直接调用它 —— 那会把协议识别（BCD 解码、帧结构校验、
+ * 换波段）搬进中断里。ISR 走的是 radio_uart_stage()。 */
 void radio_uart_rx(const uint8_t *data, uint16_t len)
 {
     if (data == NULL || len == 0U) {
@@ -98,26 +153,66 @@ void radio_uart_rx(const uint8_t *data, uint16_t len)
  *  内部
  *==========================================================================*/
 
+/* ISR 侧的唯一职责：把这一段字节放进交接缓冲，然后叫醒任务。
+ * 无解析、无浮点、无阻塞，只有一次 memcpy 和一次信号量操作。
+ *
+ * 任务优先级低于本中断，所以释放信号量不会立刻抢占，ISR 的尾部开销
+ * 就是一次 memcpy（最多 32 字节）加 osSemaphoreRelease() 内部的置位，
+ * 通常在 2 us 以内。 */
+static void radio_uart_stage(const uint8_t *src, uint16_t len)
+{
+    if (src == NULL || len == 0U) {
+        return;
+    }
+    if (len > RADIO_UART_BUF_SIZE) {
+        len = RADIO_UART_BUF_SIZE;
+    }
+
+    /* 上一次还没被取走就又来一帧：记一笔并覆盖。CAT 每 100 ms 最多一帧，
+     * 任务 10 ms 一轮，理论上不会发生；真发生了说明任务被长时间阻塞，
+     * 宁可丢掉一帧也不能在这里阻塞中断。 */
+    if (s_staged_full) {
+        s_stats.frame_dropped++;
+    }
+
+    memcpy(s_staged, src, len);
+
+    /* 顺序重要：先写长度和标志，再释放信号量。这样任务被唤醒时一定
+     * 能读到完整且长度有效的一段。 */
+    s_staged_len  = len;
+    s_staged_full = true;
+    s_stats.handoffs++;
+
+#ifndef LVGL_SIM
+    if (s_rx_sem != NULL) {
+        (void)osSemaphoreRelease(s_rx_sem);
+    }
+#endif
+}
+
 static inline uint8_t *active_buf(void)
 {
     return (s_active == 0U) ? s_buf_a : s_buf_b;
 }
 
-/* 把当前缓冲里已收到的 len 字节交给协议层，然后把两个缓冲对调，
+/* 把当前缓冲里已收到的 len 字节放进交接缓冲，然后把两个 DMA 缓冲对调，
  * 并用另一个缓冲重新启动 DMA 接收。
  *
  * 调用时机：Normal 模式下 DMA 已经停下，当前缓冲的内容是稳定完整的，
  * 所以此刻读它不会与 DMA 竞争——这是双缓冲相对"边收边读同一块内存"的
- * 关键优势。 */
+ * 关键优势。
+ *
+ * 顺序也有讲究：先交接数据（任务可以开始解析了），再切缓冲重启 DMA。
+ * 这样"重启 DMA"的重活落在任务已经拿到数据的时刻之后，两者不互相等待。 */
 static void radio_uart_flip_and_restart(uint16_t len)
 {
     if (len > RADIO_UART_BUF_SIZE) {
         len = RADIO_UART_BUF_SIZE;
     }
 
-    /* 1) 先把收到的数据交出去（纯内存操作）。 */
+    /* 1) 交给任务：只搬运，解析留给任务上下文。 */
     if (len > 0U) {
-        radio_uart_rx(active_buf(), len);
+        radio_uart_stage(active_buf(), len);
     }
 
     /* 2) 对调：另一个缓冲成为新的 DMA 目标。
@@ -143,9 +238,12 @@ static void radio_uart_flip_and_restart(uint16_t len)
 
 /*============================================================================
  *  HAL 回调
+ *
+ *  入口名不是 HAL_UARTEx_RxEventCallback —— 那个 HAL 弱符号由 comm.c 独占，
+ *  它按实例把 UART4 的事件转到这里。见 radio_uart.h 的说明。
  *==========================================================================*/
 
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
+void radio_uart_rx_event(UART_HandleTypeDef *huart, uint16_t size)
 {
     if (huart != &huart4 || s_started == 0U) {
         return;
@@ -236,6 +334,8 @@ static void radio_uart_clear_stats(void)
     s_stats.restart_fail = 0U;
     s_stats.uart_errors  = 0U;
     s_stats.dup_idle     = 0U;
+    s_stats.handoffs     = 0U;
+    s_stats.frame_dropped = 0U;
 }
 
 bool radio_uart_init(void)
@@ -250,6 +350,7 @@ bool radio_uart_init(void)
     radio_uart_clear_stats();
     memset(s_buf_a, 0, sizeof s_buf_a);
     memset(s_buf_b, 0, sizeof s_buf_b);
+    radio_uart_flush_pending();
 
     s_active     = 0U;      /* A 先收 */
     s_active_len = 0U;
@@ -274,6 +375,7 @@ void radio_uart_deinit(void)
     s_started = 0U;
     (void)HAL_UART_AbortReceive(&huart4);
     s_active_len = 0U;
+    radio_uart_flush_pending();
 }
 
 void radio_uart_get_stats(RadioUartStatsType *out)
@@ -282,4 +384,73 @@ void radio_uart_get_stats(RadioUartStatsType *out)
         return;
     }
     *out = s_stats;
+}
+
+void radio_uart_flush_pending(void)
+{
+    s_staged_len  = 0U;
+    s_staged_full = false;
+}
+
+bool radio_uart_wait_frame(uint32_t timeout_ms)
+{
+#ifdef LVGL_SIM
+    /* No RTOS on the PC simulator: the "ISR" path does not run there
+     * anyway, so report "nothing waiting" rather than pretending. */
+    (void)timeout_ms;
+    return false;
+#else
+    /* 懒创建：radio_uart_init() 可能在 osKernelStart() 之前被调用，
+     * 那时创建信号量不安全（还没有任务在跑，osSemaphoreNew 依赖内核
+     * 已初始化）。真正等待一定发生在任务里，所以放这里是安全的。 */
+    if (s_rx_sem == NULL) {
+        s_rx_sem = osSemaphoreNew(NULL);
+        if (s_rx_sem == NULL) {
+            return false;               /* 内存不足：放弃这一轮，不死循环 */
+        }
+        /* 中断可能在信号量建好之前就投递过数据，这里补一次检查，
+         * 免得那一份要等到下一个 CAT 帧才被处理。 */
+        if (s_staged_full) {
+            (void)osSemaphoreRelease(s_rx_sem);
+        }
+    }
+
+    /* 先看有没有现成的，省掉一次不必要的等待。 */
+    if (s_staged_full) {
+        goto take;
+    }
+
+    if (timeout_ms == 0U) {
+        return false;                   /* 非阻塞轮询模式 */
+    }
+
+    /* timeout_ms 是"最多等这么久"，不是"无限等"：comm task 还要按 10 ms
+     * 周期干别的事（收 PC 命令、推进 CAT 轮询累加器），无限等会让那两件事
+     * 饿死。osSemaphoreAcquire 只认 tick 数，所以先换算；亚 tick 的值向上
+     * 取整到 1，否则会变成永不超时。 */
+    {
+        uint32_t ticks = pdMS_TO_TICKS(timeout_ms);
+        if (ticks == 0U) {
+            ticks = 1U;
+        }
+        if (osSemaphoreAcquire(s_rx_sem, ticks) != osOK) {
+            return false;
+        }
+    }
+
+take:
+    /* 从这里开始不再有中断会改 s_staged_*（s_staged_full 在下面清零，
+     * 中断的写入条件就是它为真），所以下面的读取是安全的。 */
+    if (!s_staged_full) {
+        return false;                   /* 信号量醒了但数据已被取走 */
+    }
+
+    {
+        uint16_t len = s_staged_len;
+        s_staged_full = false;          /* 先清标志，让下一次 ISR 可以投递 */
+        s_staged_len  = 0U;
+        radio_uart_rx(s_staged, len);    /* 解析全在这一步，任务上下文 */
+    }
+    return true;
+#endif
 }

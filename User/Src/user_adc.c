@@ -38,9 +38,11 @@
  *  DMA buffer placement
  *============================================================================*/
 
-/* Place DMA buffers in DTCMRAM (non-cacheable) for cache-coherent DMA.
- * See STM32H7B0XX_FLASH.ld to ensure .dma_buffer section is in DTCMR.
- * The attribute is GCC-only; host builds ignore it. */
+/* DMA 缓冲放在 AXI SRAM 的不可缓存窗口（app.ld 的 .dma_no_cache，
+ * 0x24040000 起，由 MPU 标为 non-cacheable）。
+ * 注意：H7 的 DMA1/DMA2（ADC 经 DMAMUX 挂在其上）无法访问 DTCM/ITCM，
+ * 所以 .dma_buffer 不能放 DTCM——放到非缓存 SRAM 后 DMA 与 CPU 天然一致。
+ * 该属性仅 GCC 有效；host 测试构建会忽略它。 */
 #if defined(__GNUC__)
 #define DMA_BUFFER_SECTION  __attribute__((section(".dma_buffer"), aligned(4)))
 #else

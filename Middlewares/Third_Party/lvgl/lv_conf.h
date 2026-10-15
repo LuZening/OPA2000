@@ -179,7 +179,14 @@ typedef void * lv_group_user_data_t;
 
 /* 1: Enable GPU interface*/
 #define LV_USE_GPU              1   /*Only enables `gpu_fill_cb` and `gpu_blend_cb` in the disp. drv- */
-#define LV_USE_GPU_STM32_DMA2D  1   /*Accelerate fill/blend/copy with the STM32 DMA2D peripheral. Requires LV_COLOR_16_SWAP=0 and LV_COLOR_DEPTH 16 or 32. */
+/* Kept at 0: User/Src/lv_port_disp.c drives the DMA2D peripheral itself
+ * (HAL_DMA2D_Start_IT plus its own XferCpltCallback and dma2d_busy
+ * handshake).  Enabling LVGL's own DMA2D driver as well would give the
+ * peripheral two owners that both register completion callbacks on hdma2d,
+ * so they would fight over the same transfers.  The driver also refuses to
+ * compile here: its family guard tests for STM32H7, while this part defines
+ * STM32H7B0xx. */
+#define LV_USE_GPU_STM32_DMA2D  0   /*Accelerate fill/blend/copy with the STM32 DMA2D peripheral. Requires LV_COLOR_16_SWAP=0 and LV_COLOR_DEPTH 16 or 32. */
 
 /* 1: Enable file system (might be required for images */
 #define LV_USE_FILESYSTEM       1

@@ -1,12 +1,22 @@
 /**
  * @file touch.c
  * @brief Touch Screen Driver Implementation
+ *
+ * @details The driver probes the I2C buses at boot in a fixed order:
+ *   1. GT911 on I2C3 (capacitive, the original production touch)
+ *   2. NS2009 on I2C2 (resistive I2C, 0x48, the current resistive touch)
+ * The first one to ACK (within 100 ms) wins.  Both probes are
+ * single-threaded - they run in main() before osKernelStart(), so
+ * there is no I2C contention and no need for a mutex.
+ * The legacy XPT2046/TSC2046 SPI path was removed; SPI1 is no longer
+ * used by the touch driver.
  */
 
 #include "touch.h"
 #include "config.h"
 #include "stm32h7xx_hal.h"
 #include "main.h"
+#include "ns2009.h"
 
 /*============================================================================
  * Private Variables
@@ -14,6 +24,11 @@
 
 /* Current touch type */
 static TouchType detected_touch_type = TOUCH_NONE;
+
+/* True when the resistive panel is an NS2009 on I2C2.  Only one resistive
+ * controller is supported now - the legacy XPT2046/TSC2046 SPI path was
+ * dropped, so the resistive backend is always NS2009. */
+static bool s_resistive_is_ns2009 = false;
 
 /* Public view of the detected controller, so the GUI can skip drawing
  * capacitive-only affordances.  touch_init() is the only writer. */
@@ -24,10 +39,6 @@ static TouchPointType current_touch = {0, 0, false};
 
 /* Interrupt flag for capacitive touch */
 static volatile uint8_t touch_interrupt_flag = 0;
-
-/* Resistive touch SPI buffer */
-static uint8_t resistive_tx_buf[TOUCH_SPI_BUFFER_SIZE];
-static uint8_t resistive_rx_buf[TOUCH_SPI_BUFFER_SIZE];
 
 /* Calibration data */
 static bool calibrating = false;
@@ -40,18 +51,15 @@ static struct {
 } cal_data[CAL_POINT_COUNT];
 
 /* Screen dimensions - must match the LTDC layer in Core/Src/ltdc.c
- * (ImageWidth 480 / ImageHeight 272, RGB565). */
+ * (ImageWidth 480 / ImageHeight 272, RGB565).  Used to clamp the
+ * calibrated output in touch_apply_calibration(). */
 #define SCREEN_WIDTH    480
 #define SCREEN_HEIGHT   272
 
-/* Calibration screen positions (10% from edges + center) */
-static const CalPointType cal_points[CAL_POINT_COUNT] = {
-    {SCREEN_WIDTH / 10, SCREEN_HEIGHT / 10},           /* Top-left */
-    {SCREEN_WIDTH * 9 / 10, SCREEN_HEIGHT / 10},       /* Top-right */
-    {SCREEN_WIDTH / 10, SCREEN_HEIGHT * 9 / 10},       /* Bottom-left */
-    {SCREEN_WIDTH * 9 / 10, SCREEN_HEIGHT * 9 / 10},   /* Bottom-right */
-    {SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2}              /* Center */
-};
+/* Note: the calibration target positions live in gui.c (cal_targets[])
+ * because the red-dot widgets are an LVGL concept; touch.c only
+ * receives the screen coordinate from the GUI when a point is
+ * accepted.  There is deliberately no second copy here. */
 
 /* GT911 I2C address */
 #define GT911_I2C_ADDRESS     0xBA    /* 0x5D << 1 */
@@ -61,47 +69,30 @@ static const CalPointType cal_points[CAL_POINT_COUNT] = {
  *============================================================================*/
 
 /**
- * @brief Read resistive touch position via SPI
+ * @brief Read touch from NS2009 over I2C2.
+ *
+ * Returns true if the chip reported a press; false if the bus errored
+ * or the read was below the press threshold.
  */
-static bool touch_resistive_read_raw(uint16_t *x, uint16_t *y, bool *pressed)
+static bool touch_ns2009_read(uint16_t *x, uint16_t *y, bool *pressed)
 {
-    /* TCS2046 commands */
-    #define TCS_CMD_START     0x80
-    #define TCS_CMD_X_READ    0x50  /* 0xA0 | 0x10 */
-    #define TCS_CMD_Y_READ    0x70  /* 0xA0 | 0x30 */
-
-    uint8_t cmd;
-
-    /* Check pen interrupt - active low means pressed */
-    /* Assuming GPIO is configured for touch interrupt */
-    *pressed = (HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_11) == GPIO_PIN_RESET);
-
-    if (!*pressed) {
-        *x = 0;
-        *y = 0;
+    uint16_t raw_x, raw_y;
+    bool ok = ns2009_read(&raw_x, &raw_y);
+    if (!ok) {
+        *pressed = false;
         return false;
     }
-
-    /* Read X position */
-    cmd = TCS_CMD_X_READ;
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);  /* CS low */
-    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
-    HAL_SPI_Receive(&hspi1, resistive_rx_buf, 2, 100);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);    /* CS high */
-
-    *x = ((resistive_rx_buf[0] << 8) | resistive_rx_buf[1]) >> 4;
-
-    /* Read Y position */
-    cmd = TCS_CMD_Y_READ;
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
-    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
-    HAL_SPI_Receive(&hspi1, resistive_rx_buf, 2, 100);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);
-
-    *y = ((resistive_rx_buf[0] << 8) | resistive_rx_buf[1]) >> 4;
-
+    *x = raw_x;
+    *y = raw_y;
+    *pressed = true;
     return true;
 }
+
+/**
+ * @brief Initialize the NS2009 driver.  Nothing to do: the chip needs
+ * no configuration beyond power-on.  Probe is what decided we exist.
+ */
+static void touch_ns2009_init(void) { /* no-op */ }
 
 /**
  * @brief Read capacitive touch position via I2C
@@ -171,31 +162,51 @@ void touch_init(void)
     g_touch_type = detected_touch_type;
 
     if (detected_touch_type == TOUCH_RESISTIVE) {
-        touch_resistive_init();
+        s_resistive_is_ns2009 = true;
+        touch_ns2009_init();
     } else if (detected_touch_type == TOUCH_CAPACITIVE) {
+        s_resistive_is_ns2009 = false;
         touch_capacitive_init();
     }
 }
 
 /**
  * @brief Detect touch screen type
+ *
+ * Order:
+ *   1. GT911 on I2C3 (capacitive, original production).
+ *   2. NS2009 on I2C2 (resistive, 0x48, alt stocking).
+ *   3. SPI1 XPT2046 (resistive, legacy).  We always end up here if
+ *      neither I2C chip ACK'd, so the existing SPI path stays the
+ *      "I have nothing on the I2C buses" fallback.
+ *
+ * The 100 ms per-I2C-transaction budget is enforced by
+ * NS2009_I2C_TIMEOUT_MS (100) and the GT911 read below (50 ms).  A chip
+ * that does not ACK within that is treated as absent.
  */
 TouchType touch_detect_type(void)
 {
-    /* Try to read from GT911 - if successful, it's capacitive */
-    uint8_t test_byte = 0;
-
-    /* Try I2C read from GT911 */
-    if (HAL_I2C_Mem_Read(&hi2c3, GT911_I2C_ADDRESS,
-                         0x0000, I2C_MEMADD_SIZE_16BIT,
-                         &test_byte, 1, 50) == HAL_OK) {
-        /* Check for GT911 product ID "911" */
-        if (test_byte == '9' || test_byte == '1') {
-            return TOUCH_CAPACITIVE;
+    /* Step 1: GT911 over I2C3 (capacitive). */
+    {
+        uint8_t test_byte = 0;
+        if (HAL_I2C_Mem_Read(&hi2c3, GT911_I2C_ADDRESS,
+                             0x0000, I2C_MEMADD_SIZE_16BIT,
+                             &test_byte, 1, 50) == HAL_OK) {
+            if (test_byte == '9' || test_byte == '1') {
+                return TOUCH_CAPACITIVE;
+            }
         }
     }
 
-    /* Default to resistive */
+    /* Step 2: NS2009 over I2C2 (resistive, I2C). */
+    if (ns2009_probe()) {
+        return TOUCH_RESISTIVE;
+    }
+
+    /* Neither I2C controller answered.  Fall back to resistive so the
+     * GUI at least comes up; the read path will simply never report a
+     * press.  This keeps a board with a broken I2C bus from bricking
+     * the whole unit. */
     return TOUCH_RESISTIVE;
 }
 
@@ -222,17 +233,18 @@ void touch_process(void)
     uint16_t x, y;
 
     if (detected_touch_type == TOUCH_RESISTIVE) {
-        if (touch_resistive_read(&x, &y, &pressed)) {
-            if (pressed && g_config.touch.calibrated) {
-                /* Apply calibration */
-                touch_apply_calibration(x, y, &x, &y);
-            }
-            current_touch.x = x;
-            current_touch.y = y;
-            current_touch.pressed = pressed;
-        } else {
-            current_touch.pressed = false;
+        if (s_resistive_is_ns2009) {
+            touch_ns2009_read(&x, &y, &pressed);
         }
+        if (pressed && g_config.touch.calibrated) {
+            /* Apply calibration.  NS2009 reports the panel raw
+             * coordinates 0..4095, so the gain/offset transform from
+             * the 5-point calibration maps that to screen pixels. */
+            touch_apply_calibration(x, y, &x, &y);
+        }
+        current_touch.x = x;
+        current_touch.y = y;
+        current_touch.pressed = pressed;
     } else if (detected_touch_type == TOUCH_CAPACITIVE) {
         if (touch_capacitive_read(&x, &y, &pressed)) {
             /* Capacitive touch usually doesn't need calibration */
@@ -269,8 +281,10 @@ bool touch_calibrate_add_point(uint16_t screen_x, uint16_t screen_y)
         return false;
     }
 
-    /* Wait for touch */
-    if (!touch_resistive_read_raw(&raw_x, &raw_y, &pressed) || !pressed) {
+    /* Wait for touch.  Only the resistive (NS2009) path has a
+     * calibration screen; the capacitive panel needs none. */
+    bool got = touch_ns2009_read(&raw_x, &raw_y, &pressed);
+    if (!got || !pressed) {
         return false;
     }
 
@@ -395,23 +409,6 @@ void touch_apply_calibration(uint16_t raw_x, uint16_t raw_y,
 /*============================================================================
  * Touch Type Specific Functions
  *============================================================================*/
-
-/**
- * @brief Initialize resistive touch
- */
-void touch_resistive_init(void)
-{
-    /* Chip select pin should already be configured */
-    /* Additional initialization if needed */
-}
-
-/**
- * @brief Read resistive touch
- */
-bool touch_resistive_read(uint16_t *x, uint16_t *y, bool *pressed)
-{
-    return touch_resistive_read_raw(x, y, pressed);
-}
 
 /**
  * @brief Initialize capacitive touch

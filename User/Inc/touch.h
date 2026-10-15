@@ -77,10 +77,6 @@ bool touch_is_pressed(void);
 void touch_apply_calibration(uint16_t raw_x, uint16_t raw_y,
                              uint16_t *cal_x, uint16_t *cal_y);
 
-/* Resistive touch specific functions */
-void touch_resistive_init(void);
-bool touch_resistive_read(uint16_t *x, uint16_t *y, bool *pressed);
-
 /* Capacitive touch specific functions */
 void touch_capacitive_init(void);
 bool touch_capacitive_read(uint16_t *x, uint16_t *y, bool *pressed);

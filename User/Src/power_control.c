@@ -17,6 +17,7 @@
  */
 
 #include "power_control.h"
+#include "boot.h"
 #include "stm32h7xx_hal.h"
 #include <stddef.h>
 
@@ -44,6 +45,24 @@
 #define FAN_SPEED_OFF          0U
 
 /*============================================================================
+ *  HV rail sequencing
+ *
+ *  RF_BIAS and PWR_ON must never switch simultaneously: the PA bias
+ *  network needs the supply rail to be settled first, otherwise the bias
+ *  step and the supply step overlap and the device sees a transient no
+ *  power-up sequence tolerates.  So the rail is sequenced:
+ *
+ *      ON :  PWR_ON -> 10 ms -> RF_BIAS_ON
+ *      OFF:  RF_BIAS_OFF -> 10 ms -> PWR_ON_OFF
+ *
+ *  The 10 ms is a FreeRTOS task delay, never a busy wait or HAL_Delay -
+ *  this runs from the monitor task and must not stall the other tasks.
+ *  power_rail_step() is that non-blocking driver: call it often (10 ms
+ *  tick) and it advances one stage per call.
+ *==========================================================================*/
+#define HV_STAGE_DELAY_MS       10U
+
+/*============================================================================
  *  Private state (volatile for ISR / task sharing)
  *============================================================================*/
 
@@ -58,6 +77,27 @@ static volatile bool  relay_timer_close  = false; /* true=close RELAY1 */
 /* FAN hysteresis state (task context only). */
 static FanSpeedType   fan_current_speed  = FAN_SPEED_LOW;
 
+/*============================================================================
+ *  HV rail sequencing state
+ *
+ *  Declared in this private-state block rather than next to the functions
+ *  that use it, because power_init_outputs() also has to cancel a pending
+ *  stage and it appears earlier in the file.
+ *
+ *  volatile: the fault ISR clears it via power_rail_abort(), while the
+ *  monitor task is otherwise the only writer/reader.
+ *==========================================================================*/
+
+/* IDLE is the settled state (both switches at their target); the two WAIT
+ * states are the HV_STAGE_DELAY_MS gaps between the two switches. */
+typedef enum {
+    HV_STAGE_IDLE = 0,   /*!< nothing pending                        */
+    HV_STAGE_ON_WAIT,    /*!< PWR_ON is up, waiting for RF_BIAS_ON  */
+    HV_STAGE_OFF_WAIT    /*!< RF_BIAS is down, waiting for PWR_OFF  */
+} HvStageType;
+
+static volatile HvStageType s_hv_stage = HV_STAGE_IDLE;
+
 /* g_tx_active is polled by the protection task, the frequency detector
  * and the GUI, so it has to follow the relay state machine exactly. */
 static void ptt_enter_tx(void)
@@ -69,10 +109,10 @@ static void ptt_enter_tx(void)
 static void ptt_leave_tx(void)
 {
     g_tx_active = false;
-    /* Back to standby if the supply is still engaged, off otherwise.
-     * ptt_leave_tx() also runs from power_psu_off(), which clears
-     * g_psu_on right after, so re-check the flag rather than assume. */
-    g_power_state = g_psu_on ? POWER_STATE_STANDBY : POWER_STATE_OFF;
+    /* Back to standby while the HV rail is still up, off once it is not.
+     * ptt_leave_tx() also runs from power_hv_off(), which clears g_hv_on
+     * right after, so re-check the flag rather than assume. */
+    g_power_state = g_hv_on ? POWER_STATE_STANDBY : POWER_STATE_OFF;
 }
 
 /*============================================================================
@@ -152,11 +192,31 @@ void power_init_fan_pwm(void)
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
     HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
 
-    /* TIM4_CH3 = BL_PWM (PD14).  Start at 100 % (default brightness). */
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, PWM_TIM4_PERIOD + 1U);
+    /* TIM4_CH3 = BL_PWM (PD14).  Start at 0 % - the screen stays black
+     * until the GUI has rendered its first frame (boot_backlight_on()).
+     * Showing a half-initialised frame on a cold boot looks like a
+     * fault, and the operator cannot tell a blank panel from a crashed
+     * one. */
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0U);
     HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
 
     fan_current_speed = FAN_SPEED_LOW;
+}
+
+/**
+ * @brief Set the LCD backlight duty cycle.
+ * @param percent 0..100
+ *
+ * TIM4 CH3 drives BL_PWM (PD14) into the U8 (AP3019) FB pin through the
+ * R2/R4 divider, so the duty cycle IS the brightness.  Kept separate from
+ * power_set_fan/pump_speed because the backlight has its own "blanked
+ * during boot" state.
+ */
+void power_set_backlight_duty(uint8_t percent)
+{
+    if (percent > 100U) percent = 100U;
+    uint32_t pulse = ((uint32_t)percent * (PWM_TIM4_PERIOD + 1U) + 50U) / 100U;
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, pulse);
 }
 
 void power_set_fan_speed(uint8_t speed_percent)
@@ -219,6 +279,11 @@ void power_update_fan(int16_t temperature_tenth_c)
 
 void power_init_outputs(void)
 {
+    /* Cancel any HV sequencing that may still have been pending: the pins
+     * below are about to be forced to a known state, and a queued stage
+     * would otherwise fire later and override them. */
+    s_hv_stage = HV_STAGE_IDLE;
+
     /* PSU on (PG5) = inactive (LOW). */
     PSU_ON_PWR_OFF();
     /* PWR_ON_SIG (PG7) = off (LOW). */
@@ -241,8 +306,11 @@ void power_init_outputs(void)
     /* Default band = 15-10 m (per design spec for config-fault fallback). */
     switch_band(BAND_15M_10M);
 
-    /* LCD backlight on. */
-    power_set_lcd_backlight(true);
+    /* LCD backlight is deliberately NOT enabled here.  It is driven from
+     * TIM4 CH3 and starts at 0 % (power_init_fan_pwm); the panel only
+     * comes up once the GUI task reports it has painted a frame
+     * (boot_backlight_on).  Turning it on here would show a blank or
+     * half-drawn screen during the ~200 ms the GUI needs to settle. */
 
     /* Keying feedback to the radio starts released. */
     power_ptt_out_set(false);
@@ -257,34 +325,181 @@ void power_init_outputs(void)
 }
 
 /*============================================================================
- *  PSU + RF_BIAS + RELAY sequence
- *============================================================================*/
+ *  HV rail (PWR_ON + RF_BIAS) sequence
+ *
+ *  The rail is sequenced, not switched in one shot - see the
+ *  HV_STAGE_DELAY_MS note above.  power_hv_on() / power_hv_off() only
+ *  *request* the transition; power_rail_step() does the actual GPIO writes
+ *  as the monitor task calls in.
+ *==========================================================================*/
 
-void power_psu_on(void)
+/**
+ * @brief Request the HV rail up.  THROWS THE FIRST SWITCH ONLY.
+ *
+ *  Raises PWR_ON (PG7), then returns.  RF_BIAS (PG2) is deliberately NOT
+ *  enabled here - power_rail_step() raises it one 10 ms tick later, once the
+ *  supply has settled.  See power_control.h for the full contract.
+ *
+ *  SCOPE: the HV rail ONLY - PWR_ON + RF_BIAS.  It does NOT touch:
+ *    - PSU_ON (PG5)   main supply latch, owned by power_psu_on()
+ *    - RELAY1/2       the RF path, owned by power_relays_tx_on/off()
+ *    - REAR_RESERVED1 whole-unit rail, owned by power_soft_off()
+ *  Those are separate subsystems with their own triggers; mixing them here
+ *  would make a "high voltage off" request drop the antenna relay and the
+ *  main supply, which is not what the operator asked for.
+ *
+ *  Idempotent: already settled on -> return without re-triggering the
+ *  sequence, so a repeated power_hv_on() cannot keep re-arming it.
+ *
+ *  @note Deliberately does NOT check g_ptt_ready / g_alert_flag.  Those
+ *        gates live in power_hv_enable() and in ptt_apply_level(); calling
+ *        this directly bypasses the "is it allowed to power up" decision.
+ */
+void power_hv_on(void)
 {
-    /*PG5 -> high = Q9 latches PC13 LOW -> PSU turn-on latch active. */
-    PSU_ON_PWR_ON();
-    /* Main PSU enable via PG7. */
+    if (g_hv_on && s_hv_stage == HV_STAGE_IDLE) {
+        return;                     /* already settled on */
+    }
+    /* Main HV enable via PG7.  PSU_ON (PG5) is NOT part of this rail. */
     PWR_ON_ENABLE();
-    /* PA bias enable. */
-    RF_BIAS_ENABLE();
-    g_psu_on = true;
+    /* PA bias is deliberately NOT enabled here - it waits one task tick so
+     * the supply has settled first.  power_rail_step() raises it. */
+    s_hv_stage = HV_STAGE_ON_WAIT;
+    g_hv_on = true;
     /* Not TX: keying goes through power_relays_tx_on(). */
     g_power_state = POWER_STATE_STANDBY;
 }
 
+/**
+ * @brief Request the HV rail down.  THROWS THE FIRST SWITCH ONLY.
+ *
+ *  SCOPE: the HV rail ONLY - see power_hv_on().  Drops RF_BIAS (PG2) and
+ *  returns; PWR_ON (PG7) follows one 10 ms tick later in power_rail_step().
+ *  Neither PSU_ON (PG5) nor RELAY1 / RELAY2 is touched.
+ *
+ *  @note The RF path is NOT opened here.  If the amplifier happens to be
+ *        keyed at this moment, the relays stay closed and the PA comes down
+ *        live.  That is the front-panel button's explicit intent - the
+ *        operator asked to kill the HV, not to unkey.  The protection path
+ *        does both, at zero latency and with no sequencing.
+ *
+ *  @note The protection shutdown does NOT come through here: that path needs
+ *        zero latency, pulls the pins itself, and calls power_rail_abort() so
+ *        this queued stage cannot fire afterwards and re-assert the rail.
+ */
+void power_hv_off(void)
+{
+    /* Only the bias comes off now.  PWR_ON follows one task tick later in
+     * power_rail_step(), so the 10 ms gap between the two switches actually
+     * happens. */
+    s_hv_stage = HV_STAGE_OFF_WAIT;
+    g_hv_on = false;
+    g_power_state = POWER_STATE_OFF;
+}
+
+/*============================================================================
+ *  Main supply latch (PSU_ON, PG5)
+ *
+ *  PSG = Power Supply Unit: an EXTERNAL device, not part of this board.
+ *  PG5 is only the MCU's control line into it.  The chain is
+ *
+ *      PG5 ---> NPN Q9 (inverting) ---> PC13 = PWR_WKUP4
+ *
+ *  and because Q9 inverts, the MCU-side polarity is:
+ *
+ *      PG5 HIGH  ->  Q9 conducts  ->  PC13 pulled to GND  ->  PSU powers ON
+ *      PG5 LOW   ->  Q9 cut off   ->  PC13 back to pull-up ->  PSU powers OFF
+ *
+ *  i.e. HIGH = on, LOW = off, from the GPIO's point of view.  That matches
+ *  the design spec (section 6) and hw_pinmap.h.
+ *
+ *  Who calls this today:
+ *    power_soft_off()  turns the PSU OFF at shutdown - the only firmware-
+ *                      initiated transition.
+ *    Nothing else.     The PSU is normally switched by the operator, so
+ *                      power_init() deliberately leaves PG5 at the off level
+ *                      rather than powering it up unprompted.  Remote control
+ *                      over the CAT link is a skeleton only - the protocol is
+ *                      not defined yet (see comm.c CMD_PSU_* TODO).
+ *==========================================================================*/
+
+/*! Turn the external PSU on (PG5 high).  Idempotent.
+ *
+ *  Currently only reachable from the CAT skeleton and from operator code;
+ *  power_init() does NOT call it.  Does not touch the HV rail, the relays or
+ *  REAR_RESERVED1.
+ */
+void power_psu_on(void)
+{
+    if (g_psu_on) {
+        return;
+    }
+    PSU_ON_PWR_ON();
+    g_psu_on = true;
+}
+
+/*! Turn the external PSU off (PG5 low).  Idempotent.
+ *
+ *  Does NOT touch the HV rail, the relays or REAR_RESERVED1 - use
+ *  power_hv_off() for the HV rail and power_soft_off() to shut the unit down.
+ */
 void power_psu_off(void)
 {
-    /* Disable relays BEFORE disabling HV supply. */
-    power_relays_tx_off();
-    PWR_ON_DISABLE();
-    RF_BIAS_DISABLE();
+    if (!g_psu_on) {
+        return;
+    }
     PSU_ON_PWR_OFF();
     g_psu_on = false;
-    /* power_relays_tx_off() above already ran ptt_leave_tx() and picked
-     * STANDBY because the supply was still on at that point; the supply
-     * is gone now, so restate the final state. */
-    g_power_state = POWER_STATE_OFF;
+}
+
+/**
+ * @brief Advance the non-blocking HV rail sequence by one stage.
+ *
+ * Call from a ~10 ms task tick (app_monitor_task does).  Returns true while
+ * the rail was mid-sequence, so the caller can skip its slower per-tick work
+ * until the rail settles.  No HAL_Delay, no busy wait - the sequencing is
+ * spread across task ticks exactly as the design requires.
+ */
+bool power_rail_step(void)
+{
+    switch (s_hv_stage) {
+
+    case HV_STAGE_ON_WAIT:
+        /* Supply has had HV_STAGE_DELAY_MS to settle: now bias the PA. */
+        RF_BIAS_ENABLE();
+        s_hv_stage = HV_STAGE_IDLE;
+        return true;
+
+    case HV_STAGE_OFF_WAIT:
+        /* Bias is down and has had HV_STAGE_DELAY_MS: now drop the rail.
+         * PSU_ON (PG5) is not part of this sequence. */
+        PWR_ON_DISABLE();
+        s_hv_stage = HV_STAGE_IDLE;
+        return true;
+
+    case HV_STAGE_IDLE:
+    default:
+        return false;
+    }
+}
+
+/** @brief true while the HV rail is mid-sequence (bias/supply not settled). */
+bool power_rail_busy(void)
+{
+    return s_hv_stage != HV_STAGE_IDLE;
+}
+
+/**
+ * @brief Drop any pending HV sequencing without touching the pins.
+ *
+ * ISR-safe (one volatile store, no FreeRTOS API) so the protection path
+ * can call it: protection drops PWR_ON / RF_BIAS itself with zero delay,
+ * and without this the queued stage would fire a moment later and
+ * re-assert a rail that the fault had just cut.
+ */
+void power_rail_abort(void)
+{
+    s_hv_stage = HV_STAGE_IDLE;
 }
 
 void power_relays_tx_on(void)
@@ -350,16 +565,24 @@ void switch_band(BandType band)
     HAL_GPIO_WritePin(port, pin, GPIO_PIN_SET);
 
     g_current_band = band;
+
+    /* AWD1 watches the RF input against band_rf_in_max_w[], which is a
+     * per-band table, so the watchdog has to be re-programmed whenever the
+     * band changes - otherwise the limit stays at whatever the previous
+     * band (or the boot default, 15-10 m) happened to select.  Called
+     * after g_current_band is updated so the index resolution below sees
+     * the new band.  AWD2 / AWD3 and the COMP references are band
+     * independent, so this call leaves them alone in practice. */
+    boot_apply_thresholds((int)band);
 }
 
 /*============================================================================
- *  LCD backlight - simple GPIO control (PWM dimming in TIM4 task)
+ *  LCD backlight - PWM dimming on TIM4 CH3
  *============================================================================*/
 
 void power_set_lcd_backlight(bool enable)
 {
-    HAL_GPIO_WritePin(BL_PWM_GPIO_Port, BL_PWM_Pin,
-                       enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    power_set_backlight_duty(enable ? 100U : 0U);
 }
 
 /*============================================================================
@@ -434,10 +657,35 @@ static void ptt_force_release(void)
     ptt_out_sync();
 }
 
-/* Reconcile the state machine against the live PTT_INX level. */
+/* Reconcile the state machine against the live PTT_INX level.
+ *
+ * This is the single chokepoint every PTT path funnels through: the
+ * EXTI5 ISR (power_control_ptt_isr), the TIM7 poll fallback
+ * (power_ptt_poll) and the CAT/serial request (power_tx_enable ->
+ * power_relays_tx_on).  The boot gate therefore lives HERE, so a pedal
+ * press during the ~1 s while the ADC calibration is still running
+ * cannot key the amplifier no matter which path noticed it.
+ */
 static void ptt_apply_level(bool ptt_pressed)
 {
-    if (!g_allow_rf || g_alert_flag) {
+    /* g_ptt_ready = (IM zero-offset done) && (GUI painted a frame).
+     * Until both hold, the protection chain is not trustworthy. */
+    if (!g_ptt_ready || !g_allow_rf || g_alert_flag) {
+        ptt_force_release();
+        return;
+    }
+    /* The HV rail is mid-sequence (PWR_ON and RF_BIAS not yet both at
+     * their target).  Keying a PA whose bias is still settling is exactly
+     * the transient the HV_STAGE_DELAY_MS gap exists to prevent, so the
+     * request is refused here - at the single chokepoint all three PTT
+     * paths funnel through, which covers the pedal, the CAT link and the
+     * front-panel key alike.  The operator simply presses again a few
+     * milliseconds later, exactly as before the rail was sequenced.
+     *
+     * Note this is a *sequencing* interlock, not a power-policy one: it
+     * never checks g_psu_on / g_hv_on, because whether the PA is energised
+     * is not the firmware's call to make at request time. */
+    if (s_hv_stage != HV_STAGE_IDLE) {
         ptt_force_release();
         return;
     }
@@ -481,6 +729,23 @@ void power_control_ptt_isr(void)
  */
 void power_ptt_poll(void)
 {
+    /* Hard gate: until the ADC zero-offset calibration has finished AND
+     * the GUI has painted its first frame, the protection chain is not
+     * trustworthy yet and we must not key the amplifier.  g_ptt_ready is
+     * set by the ADC/GUI tasks once both conditions hold (see
+     * app_tasks.c).  This is the single place that decides "the
+     * operator may transmit"; every other entry point (power_tx_enable,
+     * the EXTI5 handler) goes through ptt_apply_level() which the gate
+     * below also covers. */
+    if (!g_ptt_ready) {
+        /* Make sure we are not stuck in a keyed state if the flag was
+         * cleared while transmitting (e.g. a protection event). */
+        if (ptt_state != PTT_STATE_IDLE) {
+            ptt_apply_level(false);
+        }
+        return;
+    }
+
     bool ptt_pressed = power_get_ptt_state();
 
     if (ptt_state == PTT_STATE_IDLE && ptt_pressed) {
@@ -518,32 +783,138 @@ void power_relay_timer_callback(void)
  *  Front-panel power (task context)
  *==========================================================================*/
 
+/**
+ * @brief One-time bring-up at boot.
+ *
+ *  Sets up the PWM timers and parks every output at its inactive level.
+ *
+ *  Deliberately does NOT latch the main supply (PG5): the PSU is an external
+ *  device the operator normally switches themselves, so the firmware must not
+ *  power it up behind their back.  power_init_outputs() leaves PG5 at the
+ *  power-off level, which is where it belongs.  The only firmware-initiated
+ *  PSU transition today is power_soft_off(), which turns it off at shutdown;
+ *  remote PSU-on/off over the CAT link is a skeleton pending the protocol
+ *  (see comm.c TODO and User/TODO-PSU远程控制.txt).
+ */
 void power_init(void)
 {
     power_init_outputs();
     power_init_fan_pwm();
 }
 
-void power_on(void)
+/**
+ * @brief Operator "HV on" - engage the high-voltage rail.
+ *
+ *  Idempotent: already on -> return.  Does not interrupt an in-flight
+ *  transmit.  Delegates the actual switching to power_hv_on(), which only
+ *  throws the first of the two stages - see power_control.h.
+ *
+ *  Touches PWR_ON (PG7) and RF_BIAS (PG2) only.  The main supply latch and
+ *  the relays are left exactly as they were.
+ *
+ *  Callers: the GUI top-banner button, the panel POWER key, CAT/SPI6.
+ */
+void power_hv_enable(void)
 {
-    if (g_psu_on) {
+    if (g_hv_on) {
         return;
     }
-    power_psu_on();
+    power_hv_on();
 }
 
+/**
+ * @brief Operator "drop back to ready" - RF path only, HV rail stays up.
+ *
+ *  Idempotent: already off -> return.  g_hv_on stays true so the operator
+ *  can key again immediately.  The 15 ms relay delay is asynchronous.
+ */
 void power_standby(void)
 {
-    if (!g_psu_on) {
+    if (!g_hv_on) {
         return;
     }
     /* Drop the RF path; the 15 ms delay opens RELAY2. */
     power_relays_tx_off();
 }
 
-void power_off(void)
+/**
+ * @brief Operator "HV off" - drop the high-voltage rail.
+ *
+ *  NOT the same as power_soft_off(), which kills the whole unit.  This one
+ *  touches PWR_ON and RF_BIAS only: the main supply latch and the relays are
+ *  left alone.  Always runs (no idempotency short-circuit), so repeated
+ *  calls are safe but each re-arms the two-stage sequence.
+ *
+ *  If the amplifier is keyed at this moment the relays stay closed and the
+ *  PA comes down live - the operator asked to kill the HV, not to unkey.
+ */
+void power_hv_disable(void)
 {
-    power_psu_off();          /* opens both relays before dropping HV */
+    power_hv_off();
+}
+
+/**
+ * @brief Soft power-off.
+ *
+ * Drops REAR_RESERVED1 (PF4) to LOW, which is the board's "hold the main
+ * rail up" line.  With it low the supply supervisor lets the unit go down
+ * and the backup supply takes over; the firmware then has 500 ms before
+ * the rail actually collapses, which is what we use to park everything in
+ * a safe state.
+ *
+ * Order matters: stop keying FIRST (relays + PTT_OUT), then blank the
+ * panel, then release the rail.  Releasing the rail while the relays are
+ * closed would leave the PA hot and the operator with no indication of
+ * why it died.
+ *
+ * Never returns.  Call it from task context only.
+ */
+void power_soft_off(void)
+{
+    /* 1. Unkey and drop the RF path (includes the 15 ms relay delay, so
+     *    we give the state machine a moment to settle). */
+    if (ptt_state != PTT_STATE_IDLE) {
+        ptt_force_release();
+        /* Let the TIM5 one-shot open RELAY2 before we cut the rail. */
+        HAL_Delay(RELAY_DELAY_MS + 5U);
+    }
+
+    /* 2. RF path and supplies off.  Bias goes before the HV rail, matching
+     *    the normal power_hv_off() ordering, then the main supply latch is
+     *    released last.  No HV_STAGE_DELAY_MS gap here: the supply is being
+     *    torn down for good, the rail is about to collapse anyway, and there
+     *    is no task left to step the sequence through - this path
+     *    deliberately does not return. */
+    RELAY1_OFF();
+    RELAY2_OFF();
+    RF_BIAS_DISABLE();
+    PWR_ON_DISABLE();
+    power_psu_off();           /* external PSU (PG5) */
+    PTT_OUT_OFF();
+    s_hv_stage = HV_STAGE_IDLE;
+    g_hv_on         = false;
+    g_tx_active     = false;
+    g_power_state   = POWER_STATE_OFF;
+
+    /* 3. Blank the panel so the operator sees it shut down cleanly
+     *    rather than a frozen last frame. */
+    power_set_backlight_duty(0U);
+
+    /* 4. Block further keying, then release the rail. */
+    g_ptt_ready = false;
+    HAL_GPIO_WritePin(REAR_RESERVED1_GPIO_Port, REAR_RESERVED1_Pin,
+                       GPIO_PIN_RESET);
+
+    /* 5. Stay alive for the 500 ms the backup supply needs to take over.
+     *    Nothing here touches the RTOS; we are already past the point of
+     *    no return. */
+    HAL_Delay(500U);
+
+    /* Belt and braces: if the rail is still up after 500 ms for any
+     * reason, park the CPU so it cannot re-enable anything. */
+    for (;;) {
+        __WFI();
+    }
 }
 
 /*============================================================================
@@ -552,8 +923,24 @@ void power_off(void)
 
 void power_tx_enable(void)
 {
-    /* Same interlocks the PTT EXTI path applies. */
-    if (!g_psu_on || !g_allow_rf || g_alert_flag) {
+    /* Same interlocks the PTT EXTI path applies, plus the boot gate:
+     * g_ptt_ready stays false until the ADC zero-offset calibration has
+     * finished and the GUI has painted a frame.
+     *
+     * NOTE: neither g_psu_on nor g_hv_on is checked here.  Whether the PA has
+     * power is not the firmware's business to second-guess at request time -
+     * the operator (or the PSU itself) may bring the rail up at any moment,
+     * and refusing to key would just be a nuisance.  The two remaining power
+     * related interlocks are kept:
+     *   - power_rail_busy() below, because keying into a bias that is still
+     *     settling is a real hardware transient, not a policy question;
+     *   - g_allow_rf / g_alert_flag, which block for safety reasons. */
+    if (!g_ptt_ready || !g_allow_rf || g_alert_flag) {
+        return;
+    }
+    /* Refuse while the HV rail is still sequencing: PWR_ON is already up but
+     * RF_BIAS is not, and the PA must not be keyed into that gap. */
+    if (s_hv_stage != HV_STAGE_IDLE) {
         return;
     }
     if (ptt_state == PTT_STATE_IDLE) {

@@ -67,8 +67,14 @@ add_executable(host_tests
 
     # algorithm under test
     ${USER_SRC}/opa2000.c
+    ${USER_SRC}/config.c
     ${USER_SRC}/adc_calibration.c
     ${USER_SRC}/user_adc.c
+    # boot.c is a real dependency now, not just something test_boot.c
+    # mirrors: power_control.c's switch_band() calls
+    # boot_apply_thresholds() so AWD1 tracks the band.  Without this line
+    # the host link fails on the unresolved symbol.
+    ${USER_SRC}/boot.c
     ${USER_SRC}/power_control.c
     ${USER_SRC}/protection.c
     ${USER_SRC}/buzzer.c
@@ -84,6 +90,13 @@ add_executable(host_tests
     ${CMAKE_CURRENT_SOURCE_DIR}/test_protection.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_radio_band.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_flash_eeprom.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_cmsis_os_shim.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_config_mutex.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_boot.c
+
+    # Windows-backed CMSIS-RTOS2 mutex shim (host test only; firmware
+    # uses the real FreeRTOS implementation in Middlewares/...).
+    ${STUB_DIR}/cmsis_os_shim.c
 )
 
 # Math library: only the test reference implementation uses log() to
@@ -92,6 +105,15 @@ include(CheckLibraryExists)
 check_library_exists(m log "" HAVE_LIBM)
 if(HAVE_LIBM)
     target_link_libraries(host_tests PRIVATE m)
+endif()
+
+# Windows kernel32 backs the CMSIS-RTOS2 mutex shim (CreateMutexW /
+# WaitForSingleObject / _beginthreadex).  No-op on non-MSVC platforms
+# because the shim itself is guarded for Windows builds only and is
+# not part of the firmware image.
+if(MSVC)
+    target_link_libraries(host_tests PRIVATE kernel32)
+    target_compile_definitions(host_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # -----------------------------------------------------------------------------

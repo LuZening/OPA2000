@@ -183,15 +183,49 @@ ioc 现状没有 ADC1_2/COMP/EXTI15_10 的 NVIC 行 → **必须打开 CubeMX �
 
 组合规则：`REV2 > 200 W 且 SWR > 2.0` 也报 `ALERT_SWR_HIGH`。
 耦合器编号约定：coupler 1 = PA→LPF，coupler 2 = LPF→天线；**GUI 上显示的是 coupler 2**。
-另有 COMP1（RF 过驱）/ COMP2（主电流过流）走 `protection_comp1_isr()` / `protection_comp2_isr()`。
+所有门限都存在 `g_config`，`protection.c` 内不得出现硬编码常量。
+COMP1 / COMP2 两路比较器的中断入口是 `protection_comp1_isr()` / `protection_comp2_isr()`，
+由 `HAL_COMP_TriggerCallback()`（注意不是 `..._RawCpltCallback`，HAL 里没有后者）
+按 `hcomp->Instance` 分派 —— `MX_COMPx_Init()` 只配置外设，必须另外调
+`HAL_COMP_Start_IT()` 比较器才会工作。
 最后 `protection_check()`（Control task 100 ms tick）把所有比较再兜一遍底。
+
+### 5.1a COMP 比较器与 DAC 参考电压
+
+COMP1 / COMP2 的门限是 **DAC1 输出的参考电压**，存在 config 里由用户在
+Settings → 保护 页调整，改完立即生效（`prot_save_cb()` →
+`boot_apply_comp_thresholds()`）。
+
+硬件事实（勿凭印象改）：
+
+| 项 | 值 |
+|---|---|
+| COMP 可选 DAC 源 | **只有 DAC1_CH1 / DAC1_CH2**。DAC2 仅能经 `TPSENS_DAC2CH1` 进 COMP，那是温度传感器专用通路，**不是**通用参考源 —— 所以「一路用 DAC1、一路用 DAC2」在硬件上不成立，两路都取自 DAC1 |
+| 分辨率 | 12 位，满码 4095 |
+| 参考电压 | **VDDA = 3.3 V**，1 LSB = 0.806 mV |
+| ⚠ 与 ADC 不同 | ADC 用 VREFBUF **2.5 V**，DAC 用 VDDA **3.3 V**，两条轨不同不可混用 |
+| 换算 | `dac_code = ref_mV * 4095 / 3300` |
+| 输出配置 | 缓冲关闭 + `DAC_CHIPCONNECT_INTERNAL`（缓冲关闭时 HAL 不允许 `..._BOTH`） |
+
+| | COMP1 | COMP2 |
+|---|---|---|
+| 正输入（被测） | PB2 = ADC1_INP4 同节点，RF1 经 D5/R40 峰值检波 | PE9 = ADC1_INP5 同节点，主电流 IM（CC6920BSO-50A → U20-B 缓冲） |
+| 负输入（参考） | DAC1_OUT1 | DAC1_OUT2 |
+| config 字段 | `comp1_ref_mV` | `comp2_ref_mV` |
+| 出厂默认 | 1500 mV（**未标定**，兜底用） | 2442 mV（= 30 A 设计门限，上限即此值） |
+| 上限 | `COMP1_REF_MV_MAX` 3000 mV | `COMP2_REF_MV_MAX` 2442 mV |
+
+COMP2 可按 `V = 1650 + I*26.4` 换算显示电流（20A→2178mV，25A→2310mV，30A→2442mV）。
+**COMP1 的 mV↔W 换算未标定**，D5/R40 增益未知，禁止在代码里臆造；详见
+`User/TODO-COMP1标定待办.txt`。标定前 COMP1 只作兜底，精确的 RF 输入门限
+由 AWD1 在软件里承担。
 
 ### 5.2 保护动作（中断上下文执行，**0 延迟**，只有第一次触发生效）
 
-1. `RELAY1_OFF` + `RELAY2_OFF` + `PTT_OUT` 拉低（PC15，高有效）+ `ptt_state = IDLE`
-2. `PWR_ON_DISABLE()`（PG7，断高压）
-3. `RF_BIAS_DISABLE()`（PG2，断 PA 偏置）
-4. `RF_IN_PROTECT_RAISE()`（PB13 拉高，通知 RF 板执行自己的保护）
+1. `RF_IN_PROTECT_RAISE()`（PB13 拉高，**最先执行**，通知 RF 板执行自己的保护）
+2. `RELAY1_OFF` + `RELAY2_OFF` + `PTT_OUT` 拉低（PC15，高有效）+ `ptt_state = IDLE`
+3. `PWR_ON_DISABLE()`（PG7，断高压）
+4. `RF_BIAS_DISABLE()`（PG2，断 PA 偏置）
 5. `buzzer_start()`（TIM15 PWM 三音阶警示，循环播放）
 6. `g_alert_active = 原因`、`g_alert_flag = true`、`g_allow_rf = false`、`g_tx_active = false`
 
@@ -238,11 +272,44 @@ protection_clear();
 **解除后仍然不会自动恢复发射**，这是有意为之：
 
 - `g_allow_rf` 保持 `false`，必须让用户重新跑一次 IM 零点校准才重新允许发射。
-- `g_psu_on` **不会**被保护清掉，电源指示灯仍是"就绪"。如果你的"一键恢复"流程需要
-  重新上电，请显式调 `power_off()` → `power_on()`，不要去改 `g_psu_on`。
+- `g_hv_on` **不会**被保护清掉，电源指示灯仍是"就绪"。如果你的"一键恢复"流程需要
+  重新上高压，请显式调 `power_hv_disable()` → `power_hv_enable()`，不要去改 `g_hv_on`。
 
-**如果你要做"一键复位"**：只能在用户长按确认（防误触）后，先 `power_off()`、
+**如果你要做"一键复位"**：只能在用户长按确认（防误触）后，先 `power_hv_disable()`、
 再 `protection_clear()`、再引导用户重跑零点校准。顺序反了会留下 PB13 仍拉高的状态。
+
+### 5.4a 高压轨时序（**不要绕过**）
+
+**三条轨互不联动**，各有各的函数名：
+
+| 轨 | 引脚 | 函数 | 谁触发 |
+|---|---|---|---|
+| 主电源锁存 | PG5 `PSU_ON` | `power_psu_on()` / `power_psu_off()` | `power_init()` 启动时置位；`power_soft_off()` 关机时释放 |
+| **高压轨** | PG7 `PWR_ON` + PG2 `RF_BIAS` | `power_hv_enable()` / `power_hv_disable()`（操作员层）<br>`power_hv_on()` / `power_hv_off()`（底层）<br>`power_rail_step/busy/abort()`（时序） | GUI 顶部横幅电源按钮、面板 POWER 键、CAT 命令 |
+| 射频通路 | RELAY1 + RELAY2 | `power_relays_tx_on()` / `power_relays_tx_off()` | PTT |
+
+高压按钮**不会**断开继电器，**不会**动主电源；继电器动作**不会**碰高压。三者独立可分别控制。
+
+高压轨两条引脚**永远不同时切换**，中间强制 10 ms 间隔：
+
+```
+上高压：  PWR_ON(PG7) → [10 ms] → RF_BIAS(PG2)
+下高压：  RF_BIAS(PG2) → [10 ms] → PWR_ON(PG7)
+```
+
+实现方式是**非阻塞状态机**：`power_hv_on()` 抛完第一拍就返回（绝不 `HAL_Delay` 或忙等），第二拍由 `app_monitor_task` 每 10 ms 调一次 `power_rail_step()` 完成。所以调用后立刻返回时电路还没到终态——这期间发射被拒绝。
+
+状态标志是三个独立的：`g_psu_on`（主电源）、`g_hv_on`（高压轨，比偏置早一拍）、`g_tx_active`（继电器）。三者都成立才可能产生射频。判断"已到终态"请用 `power_rail_busy()`，不要用 `g_hv_on`。
+
+为什么 `app_monitor_task` 的 tick 从 100 ms 改成 10 ms：只有 10 ms 的分辨率才能兑现这 10 ms 间隔。PTT 边沿、风扇曲线、转速测量用 `slow_div` 分频回 100 ms，不受影响。
+
+**三条 PTT 路径都在 `power_rail_busy()` 时被拒绝**（`ptt_apply_level()` 是所有路径的汇合点），所以偏置未稳定时踩踏板无反应——这是刻意的，几十毫秒后再踩即可。
+
+**下高压时继电器保持原样**。若此刻正在发射，继电器仍吸合、PA 带射频直接掉高压——这是操作员按钮的明确意图（要断高压，不是要退发射）。
+
+**保护跳闸不走这条路**：`protection_trigger_locked()` 直接拉低引脚（0 延迟），并调 `power_rail_abort()` 清掉待执行阶段，否则排队中的阶段会在故障后把刚切断的轨重新拉起来。故障**不改** `g_hv_on`/`g_psu_on`，面板仍显示"就绪"，真正封锁射频的是 `g_allow_rf`/`g_alert_flag`。
+
+`power_soft_off()` 同样直落引脚（它不返回，且随后主轨就要塌落），顺序是继电器 → `RF_BIAS` → `PWR_ON` → 释放 `PSU_ON` 锁存 → 拉低 `REAR_RESERVED1`。
 
 ### 5.5 【Networking Agent 必做】CAT 串口 / SPI6 解除命令
 

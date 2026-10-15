@@ -9,6 +9,7 @@
 #include "power_control.h"
 #include "protection.h"
 #include "radio_band.h"
+#include "radio_uart.h"
 #include "opa2000.h"
 #include "string.h"
 #include "stdio.h"
@@ -21,12 +22,28 @@
  * Private Variables
  *============================================================================*/
 
+/* Remote PSU control over the CAT link is a skeleton: the packet format
+ * has not been decided, so comm_parse_command() recognises no PSU keyword
+ * and the CMD_PSU_ON / CMD_PSU_OFF branches are unreachable.  Flip this to
+ * 1 once the protocol is agreed - the call sites are already in place.
+ * See User/TODO-PSU远程控制.txt. */
+#define COMM_PSU_REMOTE_ENABLED   0
+
 /* RX Queue - shared between USB and LPUART */
 static CommQueueType comm_rx_queue;
 
-/* LPUART DMA Receive Buffer */
+/* LPUART DMA Receive Buffer
+ *
+ * LPUART1 在 D3 域，其 DMA 是 BDMA2；BDMA 只能访问 D3 的 SRAM4
+ * (0x38000000)/Backup SRAM，够不到 DTCM，也够不到 AXI SRAM。因此这块 DMA
+ * 缓冲必须落在 app.ld 的 .d3_dma_buffer（映射到 SRAM4，非缓存），32B 对齐。 */
 #define LPUART_RX_BUFFER_SIZE  256
-static uint8_t lpuart_rx_buffer[LPUART_RX_BUFFER_SIZE];
+#if defined(__GNUC__)
+#define LPUART_BUF_SECTION  __attribute__((section(".d3_dma_buffer"), aligned(32)))
+#else
+#define LPUART_BUF_SECTION
+#endif
+static uint8_t lpuart_rx_buffer[LPUART_RX_BUFFER_SIZE] LPUART_BUF_SECTION;
 
 
 /* Radio information */
@@ -147,7 +164,7 @@ static void comm_execute(CommandType cmd_type, const char *args)
         case CMD_GET_STATUS:
             snprintf(comm_response_buffer, sizeof(comm_response_buffer),
                 "PWR=%s,Band=%d,Freq=%lu,Power=%.1f,Reflect=%.1f,SWR=%.1f,Volt=%.1f,Current=%.1f,Temp=%.1f,Alert=%d",
-                g_psu_on ? (g_tx_active ? "TX" : "STBY") : "OFF",
+                g_hv_on ? (g_tx_active ? "TX" : "STBY") : "OFF",
                 g_current_band,
                 g_radio_frequency,
                 (double)g_adc_data.fwd2_mW / 1000.0,
@@ -348,6 +365,38 @@ static void comm_execute(CommandType cmd_type, const char *args)
             }
             break;
 
+        /* ------------------------------------------------------------------
+         *  Remote PSU control - SKELETON ONLY.
+         *
+         *  TODO(PROTOCOL): the CAT packet format for these is not defined
+         *  yet, so comm_parse_command() recognises no keyword that reaches
+         *  here and both branches below are unreachable.  They are written
+         *  out so the call site and the reply convention are settled once the
+         *  framing is agreed, and so the intent is greppable.
+         *
+         *  Nothing else in the firmware drives the PSU: power_init() leaves
+         *  it off, and power_soft_off() is the only path that switches it.
+         *  See User/TODO-PSU远程控制.txt.
+         * ---------------------------------------------------------------- */
+        case CMD_PSU_ON:
+        case CMD_PSU_OFF:
+            /* The body is compiled but the feature stays off until the
+             * protocol is agreed: flip COMM_PSU_REMOTE_ENABLED then.  Using a
+             * macro rather than a literal false keeps the compiler from
+             * warning about unreachable code while the skeleton sits here. */
+            if (COMM_PSU_REMOTE_ENABLED) {
+                if (cmd_type == CMD_PSU_ON) {
+                    power_psu_on();
+                    comm_send_string("PSU ON");
+                } else {
+                    power_psu_off();
+                    comm_send_string("PSU OFF");
+                }
+            } else {
+                comm_send_string("ERROR: PSU control not implemented");
+            }
+            break;
+
         default:
             comm_send_string("ERROR: Unknown command");
             break;
@@ -509,11 +558,19 @@ void comm_lpuart_rx_callback(uint16_t size)
 /**
  * @brief HAL UART Rx Event Callback override (called on IDLE line detection)
  * This overrides the __weak default in stm32h7xx_hal_uart.c
+ *
+ * This is the ONLY definition of this symbol in the project.  HAL declares it
+ * once, weakly, for all UART instances, so a second definition in radio_uart.c
+ * was a link error (multiple definition).  Instead this callback dispatches by
+ * instance: LPUART1 is handled here, everything else (i.e. UART4, the radio CAT
+ * link) is forwarded to radio_uart.c.
  */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == LPUART1) {
         comm_lpuart_rx_callback(Size);
+    } else {
+        radio_uart_rx_event(huart, Size);
     }
 }
 

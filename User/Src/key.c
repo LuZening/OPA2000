@@ -277,15 +277,18 @@ void key_power_action(KeyEventType event)
 {
     switch (event) {
         case KEY_EVENT_SHORTPRESS:
+            /* Same three-state cycle as the GUI banner button, and the same
+             * semantics: it toggles the HV rail (PWR_ON + RF_BIAS), not the
+             * main supply latch and not the relays. */
             if (g_tx_active) {
                 /* Transmitting, drop back to ready */
                 power_standby();
-            } else if (g_psu_on) {
-                /* Already in standby, power off */
-                power_off();
+            } else if (g_hv_on) {
+                /* High voltage already up, take it down */
+                power_hv_disable();
             } else {
-                /* Powered down, power on to standby */
-                power_on();
+                /* High voltage down, bring it up to standby */
+                power_hv_enable();
             }
             break;
 

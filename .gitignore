@@ -11,6 +11,26 @@ cmake-build-*/
 *.hex
 *.bin
 
+# Host unit-test build trees (the ARM preset only covers build/)
+User/Tests/build*/
+
+# Screenshots and captured images
+#
+# Throwaway verification artefacts: simulator screen grabs under
+# User/gui_shots/ and ad-hoc captures.  They are regenerated in seconds by
+# the simulator sweep, so tracking them only bloats the repo and creates
+# merge noise on every re-capture.
+#
+# Note: the LVGL test fixtures under Middlewares/Third_Party/lvgl/tests/ were
+# tracked before this rule existed and stay tracked - .gitignore does not
+# apply retroactively.  They are upstream sources, not captures.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+
 # Tooling caches (do not track)
 .trae/
 .claude/

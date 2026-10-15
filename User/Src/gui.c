@@ -369,13 +369,18 @@ static void gui_update_debug_overlay(void)
         return;
     }
 
-    /* Map TouchType to a 6-8 char tag.  Keep it short. */
+    /* Map TouchType to a 6-8 char tag.  Keep it short.
+     * The simulator has no I2C bus, so touch.c (which owns
+     * g_touch_type) is not part of that build - report "none" from a
+     * compile-time constant rather than dragging the driver in. */
     const char *touch_tag = "none";
+#ifndef LVGL_SIM
     switch ((TouchType)g_touch_type) {
         case TOUCH_CAPACITIVE: touch_tag = "GT911";  break;
         case TOUCH_RESISTIVE:  touch_tag = "resist"; break;
         default:                touch_tag = "none";   break;
     }
+#endif
 
     /* config_init result - main() does not pass its return value down
      * to the GUI through a function call.  Use the indirect hint:
@@ -638,7 +643,13 @@ static void gui_create_main_screen(void)
      * of the banner so it inherits the banner background and so
      * lv_scr_load(main_screen) keeps it alive. */
     debug_label = lv_label_create(banner, NULL);
+    /* LONG_DOT shrinks the string with "..." when it does not fit.  Without
+     * an explicit width the label sizes itself from the first text it ever
+     * saw ("TOUCH:...") and then clips every later, longer update - which is
+     * exactly what a status line must never do.  Give it the full banner
+     * width so the whole string is either visible or honestly truncated. */
     lv_label_set_long_mode(debug_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(debug_label, HOR_RES - 8, 14);
     lv_obj_set_style_local_text_color(debug_label, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(debug_label, LV_LABEL_PART_MAIN,
@@ -1335,10 +1346,12 @@ void gui_init(void)
 {
     /* gui_init runs in the GUI task context; RTOS is already up so the
      * mutex can be created here.  No lock needed - the GUI task is the
-     * only one that has a handle to this code at boot. */
-#ifndef LVGL_SIM
+     * only one that has a handle to this code at boot.
+     *
+     * The simulator needs this too: gui_lock() there is a Windows
+     * CRITICAL_SECTION, and EnterCriticalSection on an uninitialised one
+     * faults.  Skipping it was an outright crash, not just a no-op. */
     gui_mutex_init();
-#endif
 
     lv_init();
 
@@ -1401,7 +1414,11 @@ void gui_update_display(void)
     if (!g_gui_ready) {
         if (++s_first_paint_ticks >= 3U) {
             g_gui_ready = true;
+#ifndef LVGL_SIM
+            /* No backlight PWM on the PC simulator, but keep g_gui_ready
+             * above unguarded so the sim exercises the same handshake. */
             boot_backlight_on();
+#endif
         }
     }
 

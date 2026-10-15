@@ -189,9 +189,15 @@ uint32_t eeprom_header_len(const uint32_t *words);
  *        payload, which is what eeprom_load() is avoiding.  A record that
  *        passes here but fails its CRC is caught by eeprom_decode().
  *
- * @param words First word of the slot, i.e. the header
+ * @param words       First word of the slot, i.e. the header
+ * @param avail_words Number of 16-byte words from @p words to the end of
+ *                    the enclosing sector.  The length field is untrusted
+ *                    flash content, so this ceiling is what stops the
+ *                    commit-word read below from running off the sector.
+ *                    Pass EEPROM_WORDS_PER_SECTOR only when the slot is
+ *                    known to start at a sector boundary.
  */
-bool eeprom_record_is_intact(const uint32_t *words);
+bool eeprom_record_is_intact(const uint32_t *words, uint32_t avail_words);
 
 #ifdef __cplusplus
 }

@@ -291,7 +291,7 @@ TEST_CASE(a_good_record_is_intact)
     eeprom_encode(11U, payload, sizeof(payload), 0U, words,
                   EEPROM_MAX_RECORD_WORDS);
 
-    ASSERT_TRUE(eeprom_record_is_intact(words));
+    ASSERT_TRUE(eeprom_record_is_intact(words, EEPROM_WORDS_PER_SECTOR));
 }
 
 TEST_CASE(an_erased_slot_is_not_intact)
@@ -300,7 +300,7 @@ TEST_CASE(an_erased_slot_is_not_intact)
     for (unsigned i = 0; i < EEPROM_MAX_RECORD_WORDS; i++) {
         words[i] = ERASED_WORD;
     }
-    ASSERT_FALSE(eeprom_record_is_intact(words));
+    ASSERT_FALSE(eeprom_record_is_intact(words, EEPROM_WORDS_PER_SECTOR));
 }
 
 TEST_CASE(a_missing_commit_word_is_not_intact)
@@ -317,7 +317,7 @@ TEST_CASE(a_missing_commit_word_is_not_intact)
                                EEPROM_MAX_RECORD_WORDS);
     words[n - 1U] = ERASED_WORD;
 
-    ASSERT_FALSE(eeprom_record_is_intact(words));
+    ASSERT_FALSE(eeprom_record_is_intact(words, EEPROM_WORDS_PER_SECTOR));
 }
 
 TEST_CASE(a_disagreeing_commit_is_not_intact)
@@ -330,7 +330,7 @@ TEST_CASE(a_disagreeing_commit_is_not_intact)
                                EEPROM_MAX_RECORD_WORDS);
     words[n - 1U] = EEPROM_RECORD_MAGIC | (0x00FF0000U);   /* wrong id */
 
-    ASSERT_FALSE(eeprom_record_is_intact(words));
+    ASSERT_FALSE(eeprom_record_is_intact(words, EEPROM_WORDS_PER_SECTOR));
 }
 
 TEST_CASE(intact_and_decode_never_disagree)
@@ -345,12 +345,12 @@ TEST_CASE(intact_and_decode_never_disagree)
     memset(payload, 0x7E, sizeof(payload));
     uint32_t n = eeprom_encode(20U, payload, sizeof(payload), 0U, words,
                                EEPROM_MAX_RECORD_WORDS);
-    ASSERT_TRUE(eeprom_record_is_intact(words));
+    ASSERT_TRUE(eeprom_record_is_intact(words, EEPROM_WORDS_PER_SECTOR));
     ASSERT_TRUE(eeprom_decode(words, n, out, sizeof(out)) != 0U);
 
     /* break it one way at a time */
     words[0] = 0xDEADBEEF;
-    ASSERT_FALSE(eeprom_record_is_intact(words));
+    ASSERT_FALSE(eeprom_record_is_intact(words, EEPROM_WORDS_PER_SECTOR));
     ASSERT_FALSE(eeprom_decode(words, n, out, sizeof(out)) != 0U);
 }
 

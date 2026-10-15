@@ -294,18 +294,21 @@ static void comm_execute(CommandType cmd_type, const char *args)
             break;
 
         case CMD_GET_CONFIG:
+            /* Cast to (unsigned int), not (uint32_t): on ARM uint32_t *is*
+             * unsigned long, which does not match %u.  Both are 32 bits so
+             * it happens to work, but it is a format mismatch and gcc says so. */
             snprintf(comm_response_buffer, sizeof(comm_response_buffer),
                 "CONFIG: PC_BAUD=%lu, RADIO=%s, RADIO_BAUD=%lu, "
                 "REV2=%u, REV2_SWR=%u, SWR=%u.%02u, REV1=%u, IM=%u",
                 (unsigned long)g_config.pc_baud_rate,
                 config_get_radio_type_string(g_config.radio_type),
                 (unsigned long)g_config.radio_baud_rate,
-                (uint32_t)g_config.band_rev2_max_w,
-                (uint32_t)g_config.band_rev2_swr_w,
-                (uint32_t)(g_config.band_swr_max_x100 / 100U),
-                (uint32_t)(g_config.band_swr_max_x100 % 100U),
-                (uint32_t)g_config.band_rev1_max_w,
-                (uint32_t)g_config.band_im_max_mA);
+                (unsigned int)g_config.band_rev2_max_w,
+                (unsigned int)g_config.band_rev2_swr_w,
+                (unsigned int)(g_config.band_swr_max_x100 / 100U),
+                (unsigned int)(g_config.band_swr_max_x100 % 100U),
+                (unsigned int)g_config.band_rev1_max_w,
+                (unsigned int)g_config.band_im_max_mA);
             comm_send_string(comm_response_buffer);
             break;
 

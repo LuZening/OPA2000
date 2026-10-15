@@ -231,11 +231,19 @@ uint32_t eeprom_header_len(const uint32_t *words)
 /* Check just the framing: header magic, committed flag, and agreement
  * between the header and the commit word at the end of the record.
  *
+ * \p avail_words is how many 16-byte words remain between \p words and the
+ * end of the sector it lives in.  The length is stored in flash, so it is
+ * untrusted input: without that ceiling this function would happily read
+ * words[need-1] past the sector boundary to fetch the commit word, and on
+ * the last sector that runs off the end of the EEPROM area entirely.  The
+ * bound has to be enforced HERE rather than by the caller because this is
+ * the function that does the far read.
+ *
  * The payload CRC is deliberately NOT verified here - that would mean
  * reading the payload, which is exactly what the two-pass load avoids.
  * A record that passes this but fails its CRC is caught by the full
  * eeprom_decode() in pass 2. */
-bool eeprom_record_is_intact(const uint32_t *words)
+bool eeprom_record_is_intact(const uint32_t *words, uint32_t avail_words)
 {
     uint32_t len;
     uint32_t need;
@@ -249,8 +257,8 @@ bool eeprom_record_is_intact(const uint32_t *words)
 
     len  = words[1] & 0xFFFFU;
     need = eeprom_record_words(len);
-    if (need * EEPROM_WORD_BYTES > EEPROM_SECTOR_BYTES) {
-        return false;
+    if (need > avail_words) {
+        return false;       /*!< does not fit in what is left of the sector */
     }
 
     /* The commit word is programmed last, so an interrupted save leaves it
@@ -313,6 +321,7 @@ bool eeprom_load(void *out, uint32_t out_size)
         for (uint32_t w = 0U; w < EEPROM_WORDS_PER_SECTOR; w += 2U) {
             uint32_t addr = base + w * EEPROM_WORD_BYTES;
             const uint32_t *words = (const uint32_t *)addr;
+            uint32_t avail = EEPROM_WORDS_PER_SECTOR - w;
             uint32_t len;
             uint32_t need;
 
@@ -323,19 +332,17 @@ bool eeprom_load(void *out, uint32_t out_size)
             }
 
             /* Header and commit word only - never the payload between
-             * them.  This is the whole point of the two-pass split. */
-            if (!eeprom_record_is_intact(words)) {
+             * them.  This is the whole point of the two-pass split.
+             * `avail` is what keeps the commit-word fetch inside the
+             * sector: a length that would push it past the end is rejected
+             * before any far read happens, not after. */
+            if (!eeprom_record_is_intact(words, avail)) {
                 s_stats.loads_corrupt++;
                 continue;
             }
 
             len  = eeprom_header_len(words);
             need = eeprom_record_words(len);
-
-            if (need * EEPROM_WORD_BYTES > EEPROM_SECTOR_BYTES) {
-                s_stats.loads_corrupt++;
-                break;      /*!< nonsense length: the chain is untrustworthy */
-            }
 
             if (n_cand < EEPROM_MAX_RECORDS) {
                 s_cand[n_cand].addr  = addr;
@@ -344,7 +351,10 @@ bool eeprom_load(void *out, uint32_t out_size)
                 n_cand++;
             }
 
-            /* Jump past this record; the loop increments w by 2 on top. */
+            /* Jump past this record; the loop increments w by 2 on top.
+             * need <= avail is guaranteed by eeprom_record_is_intact() above,
+             * so w stays inside the sector and the next slot's header is
+             * still 16-byte aligned (both terms are even multiples of 2). */
             w += (need - 1U) * 2U;
         }
     }

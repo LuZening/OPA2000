@@ -90,8 +90,33 @@ extern volatile uint16_t g_touch_raw_x;
 extern volatile uint16_t g_touch_raw_y;
 extern volatile uint8_t  g_touch_raw_pressed;   /*!< 1 = pressed, 0 = released */
 extern volatile uint8_t  g_touch_raw_seq;       /*!< bumped per completed sample */
-/*!< Cumulative bus errors / aborted transactions.  Diagnostic only. */
+
+/*============================================================================
+ * Diagnostics - 排查 I2C 问题用
+ *============================================================================*/
+
+/*!< 累计错误回调次数（含被中止的事务）。 */
 extern volatile uint32_t g_touch_bus_faults;
+
+/*!< 最近一次 HAL_I2C_ErrorCallback() 里 hi2c->ErrorCode 的原始值。
+ *
+ *  用它区分故障性质，对照 stm32h7xx_hal_i2c.h 的定义：
+ *      0x00  NONE      正常
+ *      0x01  BERR      总线错误：START/STOP 出现在错误的位置
+ *      0x02  ARLO      仲裁丢失：总线上有第二个主机
+ *      0x04  AF        ACK 失败（NACK）——**通常不是总线故障**，
+ *                      而是从机没应答（器件没焊 / 地址不对 / 已复位）
+ *      0x08  OVR       溢出：CPU/DMA 没及时取走数据
+ *      0x10  DMA       DMA 传输错误
+ *      0x20  TIMEOUT   超时
+ *      0x40  SIZE      长度管理错误
+ *      0x80  DMA_PARAM DMA 参数错误
+ *  多个位可能同时置起。
+ */
+extern volatile uint32_t g_touch_last_error;
+
+/*!< 总线恢复（SCL 打拍 + 重新挂载）累计执行次数。 */
+extern volatile uint32_t g_touch_recoveries;
 
 /*============================================================================
  * Function Prototypes

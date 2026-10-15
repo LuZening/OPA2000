@@ -13,9 +13,10 @@
  *
  *          ==================== 运行期为什么不阻塞 ====================
  *
- *          原来 touch_process() 每 10 ms 同步读一次总线，芯片不应答时
- *          每次最多自旋 100 ms（HAL 的等待循环是纯轮询，不让出 CPU），
- *          屏幕刷新率会被拖到几 Hz。改成 DMA 之后：
+ *          原来 touch_process() 每 10 ms 同步读一次总线，而 HAL 的等待循环
+ *          是纯自旋（I2C_WaitOnFlagUntilTimeout 里 while 轮询，没有 osDelay
+ *          也没有 taskYIELD，不让出 CPU）。芯片不应答时每次最多自旋 100 ms，
+ *          GUI 任务这一圈就废掉，屏幕刷新率掉到几 Hz。改成 DMA 之后：
  *
  *            - 发起传输后立刻返回，数据由 DMA 搬进不可缓存缓冲；
  *            - 传输完成中断里解码，写 volatile 快照（见 touch.h）；
@@ -30,30 +31,38 @@
  *            然后 I2C 事件中断（I2C2_EV）收到 STOPF，才调用
  *              HAL_I2C_MemRxCpltCallback()。
  *
- *          所以 I2C2_EV / I2C2_ER 必须使能——见 OPA2000_h7.ioc 的
- *          NVIC.I2C2_EV_IRQn / NVIC.I2C2_ER_IRQn（本文件不定义中断处理
- *          函数，交给 CubeMX 生成的 stm32h7xx_it.c，避免重复定义）。
+ *          只开 DMA 流中断的话，传输会启动但回调一次都不来。本文件不定义
+ *          中断处理函数，交给 CubeMX 生成的 stm32h7xx_it.c（避免重复定义）。
  *
- *          ==================== 两个必须守住的约束 ====================
+ *          ==================== 三个必须守住的约束 ====================
  *
- *          1. 缓冲必须放 .dma_buffer（AXI SRAM 非缓存窗口）。DMA1/DMA2
- *             访问不到 DTCM，且缓存窗口需要手动 cache maintenance，本项目
- *             的 MPU region4 已把它标为不可缓存。
+ *          1. 缓冲必须放 .dma_buffer（AXI SRAM 非缓存窗口）。DMA1/DMA2 访问
+ *             不到 DTCM，缓存窗口则需要手动 cache maintenance，本项目的
+ *             MPU region4 已把它标为不可缓存。
  *
- *          2. DMA 版 HAL 函数没有超时参数——总线挂死时传输永不完成，
- *             回调一次都不来。所以必须有软件看门狗：touch_process()
- *             用 HAL_GetTick() 比对，超时则 HAL_I2C_Master_Abort_IT()
- *             中止并复位状态机。
+ *          2. DMA 版 HAL 函数没有超时参数——总线挂死时传输永不完成。所以有
+ *             软件看门狗：touch_process() 用 HAL_GetTick() 比对，超时则
+ *             HAL_I2C_Master_Abort_IT() 中止并复位状态机。
+ *
+ *          3. 中止不一定能把总线救回来（从机可能一直拉着 SDA 不放），所以
+ *             还要有总线恢复：把 SCL/SDA 临时改成 GPIO 开漏，手工打 9 个
+ *             时钟让从机把剩余的位发完，再补一个 STOP，最后重新挂载外设。
+ *             触发条件是"连续若干笔事务失败"或"句柄长时间回不到 READY"。
  */
 
 #include "touch.h"
 #include "config.h"
+#include "hw_pinmap.h"
 #include "stm32h7xx_hal.h"
 #include "main.h"
 #include "ns2009.h"
 
 /* CubeMX 在 Core/Src/i2c.c 里定义；这里前向声明就够（ns2009.c 同样做法）。 */
 extern I2C_HandleTypeDef hi2c2;
+
+/*! CubeMX 生成的 I2C2 初始化（含 MspInit：引脚 AF、DMA 链接、NVIC、滤波器）。
+ *  总线恢复时用它重新挂载外设——只调 HAL_I2C_Init() 会漏掉两个滤波器配置。 */
+extern void MX_I2C2_Init(void);
 
 /*============================================================================
  * 常量
@@ -81,6 +90,23 @@ extern I2C_HandleTypeDef hi2c2;
 
 /* 轮询周期：一轮样本落定后才发起下一轮，所以这是"最快"周期。 */
 #define TOUCH_POLL_PERIOD_MS  10U
+
+/* 连续这么多笔事务失败 → 判定总线需要恢复。 */
+#define TOUCH_RECOVER_AFTER_FAULTS   3U
+
+/* 恢复的最低间隔：避免器件缺失（每轮都 NACK）时每秒恢复上千次。 */
+#define TOUCH_RECOVER_MIN_INTERVAL_MS  1000U
+
+/* 句柄持续不回到 READY 超过这么久 → 中止也没生效，直接硬恢复。 */
+#define TOUCH_HAL_STUCK_MS    200U
+
+/* SCL 打拍的半周期。ST 建议恢复时钟频率 ≤ 100 kHz；280 MHz 下这个
+ * volatile 循环约 5 us，即 ≈ 100 kHz 以内。用循环而不是 DWT，避免依赖
+ * 调试单元是否使能。 */
+#define TOUCH_RECOVER_HALF_LOOPS  500U
+
+/* 恢复时手工打多少个 SCL 时钟。一个字节 8 位 + 1 个应答位 = 9。 */
+#define TOUCH_RECOVER_CLOCKS  9U
 
 /*============================================================================
  * DMA 缓冲
@@ -113,7 +139,14 @@ volatile uint16_t g_touch_raw_x       = 0U;
 volatile uint16_t g_touch_raw_y       = 0U;
 volatile uint8_t  g_touch_raw_pressed = 0U;
 volatile uint8_t  g_touch_raw_seq     = 0U;
+
+/*============================================================================
+ * 诊断量
+ *==========================================================================*/
+
 volatile uint32_t g_touch_bus_faults  = 0U;
+volatile uint32_t g_touch_last_error  = 0U;
+volatile uint32_t g_touch_recoveries  = 0U;
 
 /*============================================================================
  * 私有状态
@@ -166,8 +199,14 @@ static volatile uint32_t   s_stage_tick   = 0U;   /*!< 本阶段起始时刻    
 static volatile uint16_t   s_cur_addr     = 0U;   /*!< 在途事务的从机地址      */
 static volatile bool       s_abort_pending = false;
 
-/* 任务上下文专用，无需 volatile。 */
-static uint32_t s_last_poll_tick = 0U;
+/*!< 连续失败笔数（由中断自增、任务清零）。原子性足够：中断只做读改写，
+ *    任务只做一次 8 位写入，最坏情况丢一次自增，对启发式阈值无影响。 */
+static volatile uint8_t    s_consec_faults = 0U;
+
+/* 以下三个只在任务上下文访问，无需 volatile。 */
+static uint32_t s_last_poll_tick    = 0U;
+static uint32_t s_last_recover_tick = 0U;
+static uint32_t s_hal_busy_since    = 0U;
 
 /*============================================================================
  * 发布与解码（全部在中断上下文执行，不得调用任何 FreeRTOS API）
@@ -273,6 +312,88 @@ static bool touch_start_gt_clear(void)
 }
 
 /*============================================================================
+ * 总线恢复
+ *
+ * 中止一笔事务只能让主机停下来，救不回被从机拉着 SDA 不放的总线：
+ * 从机可能正好停在"发了一半的字节"上，它还在等第 N 个时钟沿，而主机已经
+ * 放手了。唯一的办法是主机继续把时钟打完，让从机把剩下的位吐完，再补一个
+ * STOP 让它回到空闲。
+ *
+ * 步骤（顺序有讲究，别调换）：
+ *   1. 摘掉外设（DeInit）：释放引脚、停掉 DMA 与中断，引脚回到复位态；
+ *   2. 把 SCL/SDA 临时配成开漏 GPIO：SDA 释放为高（靠上拉），SCL 由我们
+ *      自己驱动，这样才有"手工打拍"的能力；
+ *   3. SCL 打 9 个完整时钟（8 数据 + 1 应答），给从机机会把位发完；
+ *   4. 补一个 STOP 时序：SDA 低 → SCL 高 → SDA 高；
+ *   5. MX_I2C2_Init() 重新挂载外设，引脚回到 AF4、DMA 重新链接、NVIC 重新
+ *      使能、两个滤波器重新配置。
+ *
+ * 全程约 100 us，跑在任务上下文（touch_process），不构成阻塞问题。
+ *==========================================================================*/
+
+/** @brief 送回约 5 us 的忙等，用于 SCL 打拍（≤ 100 kHz）。 */
+static void touch_recover_half_delay(void)
+{
+    for (volatile uint32_t i = 0U; i < TOUCH_RECOVER_HALF_LOOPS; i++) {
+        __NOP();
+    }
+}
+
+/**
+ * @brief 从被从机拉死的总线里恢复出来，并重新挂载 I2C2。
+ * @note 只在任务上下文调用，且调用时不应有在途事务。
+ */
+static void touch_bus_recover(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    /* --- 1. 摘掉外设：释放引脚，停掉 DMA 与 NVIC --- */
+    (void)HAL_I2C_DeInit(&hi2c2);
+
+    /* --- 2. SCL / SDA 临时改成开漏 GPIO --- */
+    gpio.Mode  = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull  = GPIO_PULLUP;              /* 板上另有上拉，这里只是兜底 */
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+
+    gpio.Pin = I2C2_SCL_Pin;
+    HAL_GPIO_Init(I2C2_SCL_GPIO_Port, &gpio);
+    gpio.Pin = I2C2_SDA_Pin;
+    HAL_GPIO_Init(I2C2_SDA_GPIO_Port, &gpio);
+
+    /* SDA 释放（高），SCL 也先抬起：空闲态 */
+    HAL_GPIO_WritePin(I2C2_SDA_GPIO_Port, I2C2_SDA_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(I2C2_SCL_GPIO_Port, I2C2_SCL_Pin, GPIO_PIN_SET);
+    touch_recover_half_delay();
+
+    /* --- 3. 打 9 个 SCL 时钟 --- */
+    for (uint32_t i = 0U; i < TOUCH_RECOVER_CLOCKS; i++) {
+        HAL_GPIO_WritePin(I2C2_SCL_GPIO_Port, I2C2_SCL_Pin, GPIO_PIN_RESET);
+        touch_recover_half_delay();
+        HAL_GPIO_WritePin(I2C2_SCL_GPIO_Port, I2C2_SCL_Pin, GPIO_PIN_SET);
+        touch_recover_half_delay();
+    }
+
+    /* --- 4. 补一个 STOP：SCL 高电平期间 SDA 由低跳高 --- */
+    HAL_GPIO_WritePin(I2C2_SDA_GPIO_Port, I2C2_SDA_Pin, GPIO_PIN_RESET);
+    touch_recover_half_delay();
+    HAL_GPIO_WritePin(I2C2_SCL_GPIO_Port, I2C2_SCL_Pin, GPIO_PIN_SET);
+    touch_recover_half_delay();
+    HAL_GPIO_WritePin(I2C2_SDA_GPIO_Port, I2C2_SDA_Pin, GPIO_PIN_SET);
+    touch_recover_half_delay();
+
+    /* --- 5. 重新挂载外设 --- */
+    MX_I2C2_Init();
+
+    /* 状态机一并复位：DeInit 期间不可能有回调，任何在途痕迹都已失效。 */
+    s_stage         = TS_IDLE;
+    s_abort_pending = false;
+    s_consec_faults = 0U;
+    s_last_poll_tick = HAL_GetTick();
+
+    g_touch_recoveries++;
+}
+
+/*============================================================================
  * HAL 完成回调（中断上下文）
  *
  * 这些是 HAL 里的 __weak 定义，在这里给出强定义即可，与 CubeMX 生成
@@ -285,6 +406,9 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
     if (hi2c->Instance != I2C2) {
         return;
     }
+
+    /* 有一笔成功完成 → 总线是活的，清零连续失败计数。 */
+    s_consec_faults = 0U;
 
     switch (s_stage) {
 
@@ -334,6 +458,7 @@ void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
     if (hi2c->Instance != I2C2) {
         return;
     }
+    s_consec_faults = 0U;
     if (s_stage == TS_GT_CLEAR) {
         s_stage = TS_IDLE;
     }
@@ -345,11 +470,19 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
         return;
     }
 
+    /* HAL 已经在 I2C_IsErrorOccurred() 里清掉了 BERR / ARLO / OVR / AF
+     * 标志（见 stm32h7xx_hal_i2c.c 4680-4703、1516），所以这里不需要再清，
+     * 只把错误码留下来供排查：值到含义的对照表见 touch.h。 */
+    g_touch_last_error = (uint32_t)hi2c->ErrorCode;
+
     /* 失败安全：宁可报"未按下"也不留下幻影按压。这与原来的行为一致
      * （旧代码在读失败时也是把 pressed 置 false）。代价是总线抖动会让
      * 一次按压中断一拍，对控制面板来说这个方向是正确的。 */
     touch_publish(false, 0U, 0U);
 
+    if (s_consec_faults < 0xFFU) {
+        s_consec_faults++;
+    }
     s_abort_pending = false;
     s_stage         = TS_IDLE;
     g_touch_bus_faults++;
@@ -467,14 +600,16 @@ bool touch_get_position(TouchPointType *point)
 }
 
 /**
- * @brief Advance the DMA state machine and police the watchdog.
+ * @brief Advance the DMA state machine, police the watchdog, recover the bus.
  *
- * 由 GUI 任务每 10 ms 调用一次。三件事：
- *   1. 有在途事务且超时 → 中止并复位（DMA 版 HAL 没有超时，只能自己守）；
- *   2. 在途事务未结束 → 直接返回，绝不重复发起；
- *   3. 空闲且到点 → 发起下一轮轮询。
+ * 由 GUI 任务每 10 ms 调用一次。四件事，按优先级从上到下：
  *
- * 发起前检查 hi2c.State，避开"任务正要发起、中断刚完成上一笔"的窄窗口。
+ *   1. 有在途事务 → 看门狗（DMA 版 HAL 没有超时，只能自己守），然后返回；
+ *   2. 连续失败够多，或句柄长期不 READY → 总线恢复，然后返回；
+ *   3. 空闲且到点 → 发起下一轮轮询；
+ *   4. 发起前检查 hi2c.State，避开"任务正要发起、中断刚完成上一笔"的窄窗口。
+ *
+ * 全程无等待，唯一可能耗时的是恢复（约 100 us，见 touch_bus_recover）。
  */
 void touch_process(void)
 {
@@ -500,16 +635,33 @@ void touch_process(void)
         return;
     }
 
-    /* --- 2. 到点才发起新一轮 --- */
+    /* --- 2a. 句柄长期回不到 READY：中止没生效，只能硬恢复 --- */
+    if (hi2c2.State != HAL_I2C_STATE_READY) {
+        if (s_hal_busy_since == 0U) {
+            s_hal_busy_since = now;
+        } else if ((now - s_hal_busy_since) > TOUCH_HAL_STUCK_MS &&
+                   (now - s_last_recover_tick) >= TOUCH_RECOVER_MIN_INTERVAL_MS) {
+            s_hal_busy_since    = 0U;
+            s_last_recover_tick = now;
+            touch_bus_recover();
+        }
+        return;
+    }
+    s_hal_busy_since = 0U;
+
+    /* --- 2b. 连续失败够多：总线多半被从机拉住了 --- */
+    if (s_consec_faults >= TOUCH_RECOVER_AFTER_FAULTS &&
+        (now - s_last_recover_tick) >= TOUCH_RECOVER_MIN_INTERVAL_MS) {
+        s_last_recover_tick = now;
+        touch_bus_recover();
+        return;
+    }
+
+    /* --- 3. 到点才发起新一轮 --- */
     if ((now - s_last_poll_tick) < TOUCH_POLL_PERIOD_MS) {
         return;
     }
     s_last_poll_tick = now;
-
-    /* --- 3. HAL 必须就绪，否则这轮跳过 --- */
-    if (hi2c2.State != HAL_I2C_STATE_READY) {
-        return;
-    }
 
     if (detected_touch_type == TOUCH_RESISTIVE) {
         (void)touch_start_ns_read(NS2009_REG_XH, s_ns_rx, 2U, TS_NS_X);

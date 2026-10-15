@@ -7,21 +7,20 @@
  *          of registers on a fixed 7-bit I2C address (0x48 with A0
  *          tied low; 0x49 with A0 high - we default to 0x48 here).
  *
- *          The driver is intentionally minimal: the GUI calibration
- *          screen calls ns2009_read() each tick, the I2C transaction
- *          finishes in < 100 us, and the chip is alive-but-not-pressed
- *          state is reported by ns2009_read() returning false.
- *
  *          Pin assignment on OPA2000 H7: NS2009 sits on I2C2
  *          (PF0/SDA, PF1/SCL), alongside the GT911.  The GT911 (CTOUCH,
  *          capacitive) answers at 7-bit 0x14 and this chip (RTOUCH,
- *          resistive) at 7-bit 0x48, so the two coexist on one bus and
- *          touch.c probes them in turn at boot.
+ *          resistive) at 7-bit 0x48, so the two coexist on one bus.
+ *
+ *          本文件只保留"探测 + 寄存器定义 + 解码宏"。坐标读取已经搬到
+ *          touch.c 的 DMA 状态机里：I2C2 的完成回调是全局唯一的
+ *          （HAL_I2C_MemRxCpltCallback 只认句柄不认从机），两个控制器
+ *          必须共用同一个状态机，否则无法区分是谁的回调。
  *
  *          Author note: this driver follows the standard NS2009
  *          register layout that every published reference uses; if
  *          a different revision of the chip exposes a different
- *          register map, only ns2009_read() needs to be updated.
+ *          register map, only the decode in touch.c needs updating.
  */
 #ifndef NS2009_H
 #define NS2009_H
@@ -39,16 +38,18 @@ extern "C" {
 #define NS2009_ADDR            (0x48U << 1)   /* HAL expects 8-bit addr */
 #endif
 
-/* I2C timeout per transaction.  Per project rule, every I2C op on the
- * touch probe path must be <= 100 ms; the chip is small and slow, but
+/* I2C timeout for the boot-time probe.  Per project rule, every I2C op on
+ * the touch probe path must be <= 100 ms; the chip is small and slow, but
  * not THAT slow.  If the I2C bus is hung, 100 ms is long enough to
- * prove the device is not there. */
+ * prove the device is not there.  (The runtime read path does not use a
+ * HAL timeout at all - it has a software watchdog in touch.c, because a
+ * DMA transfer never times out on its own.) */
 #define NS2009_I2C_TIMEOUT_MS  100U
 
-/* Raw register map.  Reading REG_XH then REG_XL as two separate I2C
- * reads (with repeated-START) is the convention every reference uses,
- * but a single I2C read starting at REG_XH with length 2 also works
- * on the chip we sampled - we use the latter to halve the bus load. */
+/* Raw register map.  XH/XL and YH/YL are contiguous (0x82..0x85), but
+ * touch.c still issues two separate reads: each read starts a fresh
+ * coordinate conversion, so one 4-byte burst would not give two
+ * independent samples. */
 #define NS2009_REG_XH          0x82U   /*!< X  high 4 bits + flags        */
 #define NS2009_REG_XL          0x83U   /*!< X  low  4 bits                 */
 #define NS2009_REG_YH          0x84U   /*!< Y  high 4 bits + flags        */
@@ -77,15 +78,6 @@ extern "C" {
  *  NACK or timeout.  Safe to call from boot, single-threaded, before
  *  any FreeRTOS task starts. */
 bool ns2009_probe(void);
-
-/** Read a single touch sample.
- *  @param x  out, raw X (0..4095) if pressed
- *  @param y  out, raw Y (0..4095) if pressed
- *  @return    true if a touch is in progress, false otherwise.
- *
- *  The implementation does two I2C reads (XH+XL, YH+YL).  Worst-case
- *  latency on the bus is 2 * NS2009_I2C_TIMEOUT_MS. */
-bool ns2009_read(uint16_t *x, uint16_t *y);
 
 #ifdef __cplusplus
 }

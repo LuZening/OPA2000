@@ -13,8 +13,10 @@
  *          state is reported by ns2009_read() returning false.
  *
  *          Pin assignment on OPA2000 H7: NS2009 sits on I2C2
- *          (PF0/SDA, PF1/SCL).  I2C3 still hosts GT911; both buses
- *          are independent and probed in turn by touch.c at boot.
+ *          (PF0/SDA, PF1/SCL), alongside the GT911.  The GT911 (CTOUCH,
+ *          capacitive) answers at 7-bit 0x14 and this chip (RTOUCH,
+ *          resistive) at 7-bit 0x48, so the two coexist on one bus and
+ *          touch.c probes them in turn at boot.
  *
  *          Author note: this driver follows the standard NS2009
  *          register layout that every published reference uses; if

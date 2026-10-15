@@ -2,14 +2,23 @@
  * @file touch.c
  * @brief Touch Screen Driver Implementation
  *
- * @details The driver probes the I2C buses at boot in a fixed order:
- *   1. GT911 on I2C3 (capacitive, the original production touch)
- *   2. NS2009 on I2C2 (resistive I2C, 0x48, the current resistive touch)
- * The first one to ACK (within 100 ms) wins.  Both probes are
- * single-threaded - they run in main() before osKernelStart(), so
- * there is no I2C contention and no need for a mutex.
- * The legacy XPT2046/TSC2046 SPI path was removed; SPI1 is no longer
- * used by the touch driver.
+ * @details Both controllers sit on the SAME bus - I2C2 (PF0/SDA,
+ *          PF1/SCL) - and are told apart by their 7-bit I2C address:
+ *
+ *   1. NS2009  RTOUCH, resistive, 7-bit 0b1001000 = 0x48
+ *   2. GT911   CTOUCH, capacitive, 7-bit 0b0010100 = 0x14
+ *
+ *          The first one to ACK (within its timeout) wins.  Probing is
+ *          single-threaded - it runs in main() before osKernelStart(),
+ *          so there is no I2C contention and no need for a mutex.
+ *
+ *          The capacitive probe is tried FIRST because the GT911 is the
+ *          production panel and the NS2009 is the alternative stocking
+ *          option; on a board that has both fitted the capacitive one is
+ *          the one wired to the FPC connector.
+ *
+ *          The legacy XPT2046/TSC2046 SPI path was removed; SPI1 is no
+ *          longer used by the touch driver.
  */
 
 #include "touch.h"
@@ -61,8 +70,17 @@ static struct {
  * receives the screen coordinate from the GUI when a point is
  * accepted.  There is deliberately no second copy here. */
 
-/* GT911 I2C address */
-#define GT911_I2C_ADDRESS     0xBA    /* 0x5D << 1 */
+/* GT911 (CTOUCH) 7-bit I2C address 0b0010100 = 0x14.  HAL wants the
+ * address shifted left by one so the R/W bit lands in bit 0.  Note this is
+ * NOT the 0x5D / 0x14 pair quoted in some GT911 datasheets for the
+ * alternative address-selection strap: on this board the controller
+ * answers at 0x14. */
+#define GT911_I2C_ADDRESS     (0x14U << 1)   /* 0x28, HAL expects 8-bit */
+
+/* Both controllers are on I2C2 (PF0/SDA, PF1/SCL), configured by
+ * MX_I2C2_Init().  I2C3 exists in the .ioc (PA8/PC9, with DMA) but has
+ * nothing on it - see touch.c's header comment. */
+extern I2C_HandleTypeDef hi2c2;
 
 /*============================================================================
  * Private Functions
@@ -99,7 +117,7 @@ static void touch_ns2009_init(void) { /* no-op */ }
  */
 static bool touch_capacitive_read_raw(uint16_t *x, uint16_t *y, bool *pressed)
 {
-    /* GT911 touch controller */
+    /* GT911 touch controller, on I2C2 alongside the NS2009. */
     /* Status register: 0x814E */
     /* Points: 0x8150 - up to 5 points */
 
@@ -108,7 +126,7 @@ static bool touch_capacitive_read_raw(uint16_t *x, uint16_t *y, bool *pressed)
     HAL_StatusTypeDef ret;
 
     /* Read status */
-    ret = HAL_I2C_Mem_Read(&hi2c3, GT911_I2C_ADDRESS,
+    ret = HAL_I2C_Mem_Read(&hi2c2, GT911_I2C_ADDRESS,
                            0x814E, I2C_MEMADD_SIZE_16BIT,
                            &status, 1, 100);
 
@@ -121,14 +139,14 @@ static bool touch_capacitive_read_raw(uint16_t *x, uint16_t *y, bool *pressed)
     if (!*pressed) {
         /* Clear buffer */
         status = 0;
-        HAL_I2C_Mem_Write(&hi2c3, GT911_I2C_ADDRESS,
+        HAL_I2C_Mem_Write(&hi2c2, GT911_I2C_ADDRESS,
                          0x814E, I2C_MEMADD_SIZE_16BIT,
                          &status, 1, 100);
         return false;
     }
 
     /* Read first touch point */
-    ret = HAL_I2C_Mem_Read(&hi2c3, GT911_I2C_ADDRESS,
+    ret = HAL_I2C_Mem_Read(&hi2c2, GT911_I2C_ADDRESS,
                            0x8150, I2C_MEMADD_SIZE_16BIT,
                            point_data, 7, 100);
 
@@ -142,7 +160,7 @@ static bool touch_capacitive_read_raw(uint16_t *x, uint16_t *y, bool *pressed)
 
     /* Clear status */
     status = 0;
-    HAL_I2C_Mem_Write(&hi2c3, GT911_I2C_ADDRESS,
+    HAL_I2C_Mem_Write(&hi2c2, GT911_I2C_ADDRESS,
                      0x814E, I2C_MEMADD_SIZE_16BIT,
                      &status, 1, 100);
 
@@ -173,23 +191,25 @@ void touch_init(void)
 /**
  * @brief Detect touch screen type
  *
- * Order:
- *   1. GT911 on I2C3 (capacitive, original production).
- *   2. NS2009 on I2C2 (resistive, 0x48, alt stocking).
- *   3. SPI1 XPT2046 (resistive, legacy).  We always end up here if
- *      neither I2C chip ACK'd, so the existing SPI path stays the
- *      "I have nothing on the I2C buses" fallback.
+ * Both controllers hang off I2C2 and are distinguished purely by address:
  *
- * The 100 ms per-I2C-transaction budget is enforced by
+ *   1. GT911 on I2C2, 7-bit 0x14 (capacitive, production panel).
+ *   2. NS2009 on I2C2, 7-bit 0x48 (resistive, RTOUCH).
+ *
+ * Capacitive is probed first because that is the production panel; the
+ * NS2009 is the alternative stocking option.  Neither I2C bus is shared
+ * with anything else, so a NACK means "not fitted" rather than "bus busy".
+ *
+ * The 100 ms per-transaction budget is enforced by
  * NS2009_I2C_TIMEOUT_MS (100) and the GT911 read below (50 ms).  A chip
  * that does not ACK within that is treated as absent.
  */
 TouchType touch_detect_type(void)
 {
-    /* Step 1: GT911 over I2C3 (capacitive). */
+    /* Step 1: GT911 over I2C2 (capacitive). */
     {
         uint8_t test_byte = 0;
-        if (HAL_I2C_Mem_Read(&hi2c3, GT911_I2C_ADDRESS,
+        if (HAL_I2C_Mem_Read(&hi2c2, GT911_I2C_ADDRESS,
                              0x0000, I2C_MEMADD_SIZE_16BIT,
                              &test_byte, 1, 50) == HAL_OK) {
             if (test_byte == '9' || test_byte == '1') {
@@ -198,12 +218,12 @@ TouchType touch_detect_type(void)
         }
     }
 
-    /* Step 2: NS2009 over I2C2 (resistive, I2C). */
+    /* Step 2: NS2009 over I2C2 (resistive, RTOUCH). */
     if (ns2009_probe()) {
         return TOUCH_RESISTIVE;
     }
 
-    /* Neither I2C controller answered.  Fall back to resistive so the
+    /* Neither controller answered.  Fall back to resistive so the
      * GUI at least comes up; the read path will simply never report a
      * press.  This keeps a board with a broken I2C bus from bricking
      * the whole unit. */
@@ -415,13 +435,13 @@ void touch_apply_calibration(uint16_t raw_x, uint16_t raw_y,
  */
 void touch_capacitive_init(void)
 {
-    /* GT911 initialization sequence */
-    /* This typically includes configuring interrupt and reset pins */
-
-    /* Reset GT911 */
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_RESET);  /* Reset pin */
+    /* GT911 power-on reset.  CTouch_RSTX is PF3 per the .ioc (CTouch_RSTX);
+     * this used to be a hardcoded PD10, which is LTDC_B3 - an LCD data
+     * line - so the "reset" was pulling the panel bus down instead of the
+     * touch controller. */
+    HAL_GPIO_WritePin(CTouch_RSTX_GPIO_Port, CTouch_RSTX_Pin, GPIO_PIN_RESET);
     HAL_Delay(10);
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(CTouch_RSTX_GPIO_Port, CTouch_RSTX_Pin, GPIO_PIN_SET);
     HAL_Delay(100);
 }
 

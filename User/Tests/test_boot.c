@@ -153,13 +153,19 @@ TEST_CASE(boot_band_index_mapping)
 }
 
 /*============================================================================
- *  Test 3: band_rf_in_max_w[] must hold exactly 5 entries
+ *  Test 3: band_rf_in_max_w[] must cover every index ref_band_index() emits
  *  boot_apply_thresholds() indexes it with the value above, so a shorter
  *  array would be an out-of-bounds read on hardware.
- *============================================================================*/
+ *==========================================================================*/
 TEST_CASE(boot_rf_limit_array_size)
 {
-    ASSERT_EQ(BAND_COUNT >= 5 ? 1 : 0, 1);
+    /* Six slots (BAND_160M .. BAND_15M_10M, plus BAND_FAULT which shares
+     * the last safe entry).  If the array is ever shortened this fails
+     * rather than letting boot_apply_thresholds() index past the end. */
+    ASSERT_EQ((int)BAND_FAULT, 6);
+    ASSERT_EQ(sizeof(g_config.band_rf_in_max_w) / sizeof(g_config.band_rf_in_max_w[0]),
+              6U);
+
     /* The array is indexed 0..4; make sure we can legally read index 4. */
     uint16_t probe = g_config.band_rf_in_max_w[4];
     (void)probe;

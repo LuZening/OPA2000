@@ -97,6 +97,12 @@ add_executable(host_tests
     # Windows-backed CMSIS-RTOS2 mutex shim (host test only; firmware
     # uses the real FreeRTOS implementation in Middlewares/...).
     ${STUB_DIR}/cmsis_os_shim.c
+
+    # flash_eeprom.c compiles its hardware half out of the host build, but
+    # config.c calls eeprom_load / eeprom_save / eeprom_current_id
+    # unconditionally - these stand-ins satisfy that link and give the host
+    # run the documented "empty store" semantics config_init() expects.
+    ${STUB_DIR}/flash_eeprom_host_stub.c
 )
 
 # Math library: only the test reference implementation uses log() to

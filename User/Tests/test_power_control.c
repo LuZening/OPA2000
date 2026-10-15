@@ -60,6 +60,10 @@ static void ptt_establish_idle_outputs(void)
     ptt_state    = PTT_STATE_IDLE;
     g_allow_rf   = true;
     g_alert_flag = false;
+    /* Boot gate: the IM zero-offset calibration has run and the GUI has
+     * painted a frame.  Without it ptt_apply_level() force-releases and
+     * every test below would be measuring the gate, not the relays. */
+    g_ptt_ready  = true;
 }
 
 /*============================================================================
@@ -691,6 +695,7 @@ TEST_CASE(power_hv_disable_drops_the_rail_but_leaves_supply_and_relays)
 TEST_CASE(power_standby_keeps_the_hv_rail_but_drops_the_rf_path)
 {
     power_init();
+    g_ptt_ready = true;
     power_hv_enable();
     (void)power_rail_step();        /* settle HV: PWR_ON up, then bias */
     power_tx_enable();
@@ -713,6 +718,7 @@ TEST_CASE(ptt_is_refused_while_the_hv_rail_is_still_sequencing)
     ptt_state    = PTT_STATE_IDLE;
     g_allow_rf   = true;
     g_alert_flag = false;
+    g_ptt_ready  = true;
 
     /* HV rail on, bias not yet raised: keying now would put the PA into
      * service during the very settling window the gap exists to protect.
@@ -1064,6 +1070,7 @@ TEST_CASE(poll_force_releases_when_the_alert_latched)
 
 TEST_CASE(hv_on_sequences_pwr_on_then_bias)
 {
+    power_init_outputs();
     stub_gpio_reset_counters();
     power_psu_on();                   /* main supply latch first */
     stub_gpio_reset_counters();
@@ -1096,6 +1103,7 @@ TEST_CASE(hv_on_sequences_pwr_on_then_bias)
 
 TEST_CASE(hv_off_sequences_bias_then_pwr_on)
 {
+    power_init_outputs();
     stub_gpio_reset_counters();
     ptt_state = PTT_STATE_IDLE;
     power_psu_on();

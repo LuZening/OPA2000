@@ -54,6 +54,7 @@
 #include <string.h>
 #ifndef LVGL_SIM
 #include "cmsis_os.h"
+#include "FreeRTOS.h"   /* pdMS_TO_TICKS */
 #endif
 
 extern UART_HandleTypeDef huart4;
@@ -404,7 +405,10 @@ bool radio_uart_wait_frame(uint32_t timeout_ms)
      * 那时创建信号量不安全（还没有任务在跑，osSemaphoreNew 依赖内核
      * 已初始化）。真正等待一定发生在任务里，所以放这里是安全的。 */
     if (s_rx_sem == NULL) {
-        s_rx_sem = osSemaphoreNew(NULL);
+        /* Binary semaphore: max_count 1, initially empty.  CMSIS-RTOS2
+         * takes (max_count, initial_count, attr), not the single-attr
+         * form RTOS v1 used. */
+        s_rx_sem = osSemaphoreNew(1U, 0U, NULL);
         if (s_rx_sem == NULL) {
             return false;               /* 内存不足：放弃这一轮，不死循环 */
         }

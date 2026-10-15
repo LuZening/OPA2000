@@ -1006,6 +1006,7 @@ static bool cal_calculate(float *x_slope, float *x_off,
                           float *residual);
 static void cal_build_results_ui(void);
 static void gui_calibration_advance(void);
+static void gui_process_poweroff(void);
 
 /* Cancel button callback
  *
@@ -1615,6 +1616,7 @@ static void show_sensor_inspect(void);
 static void show_fan_settings(void);
 static void show_band_comm_settings(void);
 static void show_protection_settings(void);
+static void poweroff_confirm_cb(lv_obj_t *obj, lv_event_t e);
 
 /*============================================================================
  *  Power-off flow
@@ -2275,8 +2277,8 @@ static void cc_build_results(void)
     /* cc_calculate() returns Watts per raw code.  Store the slope as
      * micro-Watt per ADC code so it stays an exact integer, and the
      * intercept in milli-Watt. */
-    coupler_t *fwd_c = (cc_coupler_id == 1) ? &g_config.fwd1 : &g_config.fwd2;
-    coupler_t *ref_c = (cc_coupler_id == 1) ? &g_config.rev1 : &g_config.rev2;
+    volatile coupler_t *fwd_c = (cc_coupler_id == 1) ? &g_config.fwd1 : &g_config.fwd2;
+    volatile coupler_t *ref_c = (cc_coupler_id == 1) ? &g_config.rev1 : &g_config.rev2;
     fwd_c->gain_uW_per_code = (int32_t)(fwd_slope * 1000000.0f);  /* W -> uW */
     fwd_c->offset_mW        = (int32_t)(fwd_off * 1000.0f);
     ref_c->gain_uW_per_code = (int32_t)(ref_slope * 1000000.0f);
@@ -2370,7 +2372,7 @@ void gui_process_coupler_cal(void)
 #ifndef LVGL_SIM
     /* Apply the stored coupler fit:
      *   power_mW = raw * gain_uW_per_code / 1000 + offset_mW */
-    const coupler_t *cal;
+    const volatile coupler_t *cal;
     if (cc_step < 2)
         cal = (cc_coupler_id == 1) ? &g_config.fwd1 : &g_config.fwd2;
     else

@@ -56,7 +56,7 @@ ADC_HandleTypeDef hadc2;
  * boot_apply_comp_thresholds().  The registers behind it are here so a
  * test can assert the DAC code that a config threshold produced. */
 static DAC_TypeDef s_dac1;
-DAC_HandleTypeDef hdac1 = { &s_dac1, 0, 0, "DAC1", 0, 0 };
+DAC_HandleTypeDef hdac1 = { &s_dac1, 0, 0, "DAC1" };
 
 /* Fake ADC instances - tests inspect LTR/HTR after the AWD setters run. */
 static ADC_TypeDef s_adc1;
@@ -338,10 +338,14 @@ HAL_StatusTypeDef HAL_ADCEx_InjectedStop(ADC_HandleTypeDef *hadc)
 
 static uint32_t s_tick_ms    = 0U;
 static uint32_t s_tick_calls = 0U;
+/* How many times a test drove the core into its parking loop.  Reset with
+ * the fake clock so a test can assert power_soft_off() reached it. */
+static uint32_t s_wfi_count  = 0U;
 
-void test_wall_clock_reset(void)   { s_tick_ms = 0U; s_tick_calls = 0U; }
+void test_wall_clock_reset(void)   { s_tick_ms = 0U; s_tick_calls = 0U; s_wfi_count = 0U; }
 void test_wall_clock_advance(uint32_t ms) { s_tick_ms += ms; s_tick_calls++; }
 uint32_t test_wall_clock_call_count(void) { return s_tick_calls; }
+uint32_t test_wfi_count(void)     { return s_wfi_count; }
 
 uint32_t HAL_GetTick(void) { return s_tick_ms; }
 
@@ -349,6 +353,15 @@ void HAL_Delay(uint32_t ms)
 {
     /* Tests never really sleep; just move the fake clock forward. */
     s_tick_ms += ms;
+}
+
+void __WFI(void)
+{
+    /* The firmware's __WFI parks the core forever; here it just returns so
+     * a test that reaches power_soft_off()'s parking loop can observe the
+     * shutdown sequence and carry on.  Count it so a test can assert the
+     * sequence really did get as far as parking the CPU. */
+    s_wfi_count++;
 }
 
 void Error_Handler(void)

@@ -297,9 +297,9 @@ static void comm_execute(CommandType cmd_type, const char *args)
             snprintf(comm_response_buffer, sizeof(comm_response_buffer),
                 "CONFIG: PC_BAUD=%lu, RADIO=%s, RADIO_BAUD=%lu, "
                 "REV2=%u, REV2_SWR=%u, SWR=%u.%02u, REV1=%u, IM=%u",
-                g_config.pc_baud_rate,
+                (unsigned long)g_config.pc_baud_rate,
                 config_get_radio_type_string(g_config.radio_type),
-                g_config.radio_baud_rate,
+                (unsigned long)g_config.radio_baud_rate,
                 (uint32_t)g_config.band_rev2_max_w,
                 (uint32_t)g_config.band_rev2_swr_w,
                 (uint32_t)(g_config.band_swr_max_x100 / 100U),

@@ -237,11 +237,21 @@ HAL_StatusTypeDef HAL_ADCEx_InjectedStop (ADC_HandleTypeDef *hadc);
 
 uint32_t HAL_GetTick(void);
 void     HAL_Delay(uint32_t ms);
+
+/* CMSIS core intrinsic.  power_soft_off() parks the CPU with this after
+ * dropping REAR_RESERVED1; on the host it must simply return so the test
+ * can observe that the sequence ran.  The real one is an inline asm that
+ * does not come back. */
+void __WFI(void);
 void     Error_Handler(void);
 
 void     test_wall_clock_reset(void);
 void     test_wall_clock_advance(uint32_t ms);
 uint32_t test_wall_clock_call_count(void);
+
+/*!< Times __WFI() was called, i.e. how far power_soft_off() got.  Reset by
+ *   test_wall_clock_reset(). */
+uint32_t test_wfi_count(void);
 
 #ifdef __cplusplus
 }

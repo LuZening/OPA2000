@@ -49,6 +49,16 @@ bool config_sdcard_ready(void);    /*!< FatFS mounted and usable              */
  * decide whether to start the GUI on the calibration screen. */
 bool config_touch_needs_calibration(void);
 
+/* Human-readable name of a RadioType ("ICOM" / "KENWOOD" / ...), for the
+ * CAT CONFIG query and the GUI link caption.  Out-of-range values fall
+ * back to the UNKNOWN entry rather than indexing past the table. */
+const char *config_get_radio_type_string(RadioType type);
+
+/* Inverse of the above: parse a name back into a RadioType.  Exact match
+ * first, then case-insensitive, then a few partial aliases ("civ" ->
+ * ICOM).  Returns RADIO_TYPE_UNKNOWN when nothing matches. */
+RadioType config_set_radio_type_from_string(const char *str);
+
 /*==============================================================================
  *  Deferred saving
  *

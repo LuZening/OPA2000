@@ -318,9 +318,13 @@ void power_init_outputs(void)
     /* Fan default 50% (timer-driven fan_update_fan() may override). */
     power_set_fan_speed(FAN_SPEED_DEFAULT);
 
-    /* Everything is wired to the inactive state above. */
-    g_psu_on    = false;
-    g_tx_active = false;
+    /* Everything is wired to the inactive state above, so every software
+     * flag has to follow: leaving g_hv_on true here would make
+     * power_hv_on() / power_hv_enable() treat a dead rail as live and
+     * skip the switch-on sequence entirely. */
+    g_psu_on     = false;
+    g_hv_on      = false;
+    g_tx_active  = false;
     g_power_state = POWER_STATE_OFF;
 }
 
@@ -392,6 +396,7 @@ void power_hv_off(void)
     /* Only the bias comes off now.  PWR_ON follows one task tick later in
      * power_rail_step(), so the 10 ms gap between the two switches actually
      * happens. */
+    RF_BIAS_DISABLE();
     s_hv_stage = HV_STAGE_OFF_WAIT;
     g_hv_on = false;
     g_power_state = POWER_STATE_OFF;

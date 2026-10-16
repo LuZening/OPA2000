@@ -89,6 +89,13 @@ void boot_apply_comp_thresholds(void);
  */
 void boot_backlight_on(void);
 
+/*!< Panel off: drives TFT_DISP low to put the LTDC panel into standby.
+ *   Called from power_soft_off() so the panel darkens in step with the
+ *   supply, and ordered BEFORE the backlight PWM is killed so the LCD
+ *   does not flash a frozen frame at full brightness during collapse.
+ *   No-op on the LVGL simulator. */
+void boot_panel_off(void);
+
 /*!< Backlight duty used for every "panel is awake" path.  90 % rather
  *   than 100 %: the calibration screen is often the first thing the
  *   operator sees, and full brightness on a panel that has just woken is

@@ -214,7 +214,20 @@ int main(void)
     Error_Handler();
   }
 
-  /* --- Step 5: hand over to the scheduler (below) --------------------- */
+  /* --- Step 5: USB device bring-up (moved out of the deleted defaultTask) - */
+  /* MX_USB_DEVICE_Init() is safe to call here: it does not depend on
+   * FreeRTOS primitives, only registers the USB device descriptors and
+   * starts the OTG_FS peripheral.  USB interrupt handlers stay dormant
+   * until the NVIC is globally enabled (which happens at the first
+   * context switch inside osKernelStart()), so no race exists.
+   *
+   * Previously this lived in freertos.c's defaultTask, which was a 512 B
+   * idle task whose only job was to call MX_USB_DEVICE_Init() once and
+   * then spin on osDelay(1).  Folding that one call into the boot
+   * sequence retires the task and reclaims 512 B of stack + its TCB. */
+  MX_USB_DEVICE_Init();
+
+  /* --- Step 6: hand over to the scheduler (below) --------------------- */
   /* From here on g_gui_ready / g_ptt_ready take over: the GUI task opens
    * the backlight after its first repaint, and app_adc_task raises
    * g_ptt_ready once the IM zero-offset calibration has finished.  Until
@@ -418,10 +431,35 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
   * @brief Injected conversion complete callback (ADC2: NTC + die temp)
   * @param hadc ADC handle
   * @retval None
+  *
+  * @details
+  *  Reads the three JDR registers (JDR1=NTC core, JDR2=NTC aux,
+  *  JDR3=internal temp sensor) and publishes them to the volatile
+  *  buffers in user_adc.c.  Even though this callback fires at
+  *  JEOS (because EOCSelection=ADC_EOC_SEQ_CONV), JDRx is updated
+  *  per single conversion so the read order is rank 1/2/3
+  *  regardless.  Reading must happen here - the task side can't,
+  *  because task reading vs ISR writing would race without a lock.
+  *
+  *  Then runs the NTC over-temperature check.  Core NTC has no
+  *  analog watchdog, so the over-temperature comparison lives here
+  *  rather than in the 100 ms backstop.
   */
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-  (void)hadc;
+  if (hadc->Instance == ADC2) {
+    /* Order matches user_adc.c's three volatile slots and the ioc
+     * InjectedChannel rows:
+     *   Rank 1 = ADC_CHANNEL_2          -> adc2_inj_ntc_core_raw
+     *   Rank 2 = ADC_CHANNEL_6          -> adc2_inj_ntc_aux_raw
+     *   Rank 3 = ADC_CHANNEL_TEMPSENSOR -> adc2_inj_tsense_raw
+     *
+     * HAL_ADCEx_InjectedGetValue() reads the JDRx register of the
+     * rank argument (1-based) - same convention as the ioc fields. */
+    adc2_inj_ntc_core_raw = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+    adc2_inj_ntc_aux_raw  = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_2);
+    adc2_inj_tsense_raw   = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_3);
+  }
   /* Core NTC has no analog watchdog, so the over-temperature comparison
      lives here rather than in the 100 ms backstop. */
   protection_check_ntc();

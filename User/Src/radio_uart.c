@@ -379,6 +379,55 @@ void radio_uart_deinit(void)
     radio_uart_flush_pending();
 }
 
+/* 改 UART4 波特率并立即生效。任务上下文调用。
+ *
+ * HAL_UART_Init() 不是"幂等地重新配一遍"——它会先把外设彻底关掉再按
+ * 新的 InitStruct 重新打开。AbortReceive 是为了让"还没处理完的当前
+ * DMA 传输"停下来，避免它在我们修改 InitStruct 期间把外设状态机搅
+ * 乱。Abort 完成后再改 InitStruct、Init、最后重启 ReceiveToIdle。
+ *
+ * 失败的回滚策略：保留原 InitStruct 不动。调用方可以再读
+ * g_config.radio_baud_rate 来确认实际生效的值是否就是用户要的。 */
+bool radio_uart_set_baud(uint32_t baud)
+{
+    if (s_started == 0U) {
+        return false;
+    }
+    if (baud == 0U) {
+        return false;
+    }
+
+    (void)HAL_UART_AbortReceive(&huart4);
+
+    uint32_t prev_baud = huart4.Init.BaudRate;
+    huart4.Init.BaudRate = baud;
+
+    if (HAL_UART_Init(&huart4) != HAL_OK) {
+        /* 回滚：把 InitStruct 改回旧值再 Init 一次，确保外设至少能用。 */
+        huart4.Init.BaudRate = prev_baud;
+        if (HAL_UART_Init(&huart4) != HAL_OK) {
+            s_stats.restart_fail++;
+            return false;
+        }
+        s_stats.restart_fail++;
+        return false;
+    }
+
+    /* 切到 A 缓冲重新启动。Init 之后 DMA 句柄 huart4.hdmarx 仍在
+     * （MX 把它放在外设 handle 里），所以可以直接 ReceiveToIdle。 */
+    s_active     = 0U;
+    s_active_len = 0U;
+    radio_uart_flush_pending();
+    if (HAL_UARTEx_ReceiveToIdle_DMA(&huart4, s_buf_a,
+                                     RADIO_UART_BUF_SIZE) != HAL_OK) {
+        s_started = 0U;
+        s_stats.restart_fail++;
+        return false;
+    }
+    s_stats.restarts++;
+    return true;
+}
+
 void radio_uart_get_stats(RadioUartStatsType *out)
 {
     if (out == NULL) {

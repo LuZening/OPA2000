@@ -42,6 +42,7 @@
 #include "buzzer.h"
 #include "adc_calibration.h"
 #include "config.h"
+#include "comm.h"        /* comm_post_alert_evt() */
 #include "stm32h7xx_hal.h"
 
 /*============================================================================
@@ -101,6 +102,7 @@ static void protect_limits_get(protect_limits_t *lim)
 
 static volatile bool     s_protection_active = false;
 static volatile AlertType s_last_fault        = ALERT_NONE;
+static volatile AlertSeverity s_last_severity = ALERT_SEV_NONE;
 
 /*============================================================================
  *  Initialisation
@@ -110,8 +112,10 @@ void protection_init(void)
 {
     s_protection_active = false;
     s_last_fault        = ALERT_NONE;
+    s_last_severity     = ALERT_SEV_NONE;
     g_alert_active      = ALERT_NONE;
     g_alert_flag        = false;
+    g_alert_severity    = ALERT_SEV_NONE;
     /* Idle state: no fault latched, so the RF board must be told "no fault".
      * Doing this once here also means a protection_clear() before any fault
      * cannot leave PB13 in whatever state the pin came up in. */
@@ -121,6 +125,16 @@ void protection_init(void)
 
 /*============================================================================
  *  Atomic shutdown (ISR-safe, no FreeRTOS API)
+ *
+ *  P0 (emergency): 7-step hard shutdown.  RF board notified, relays open,
+ *      PWR_ON + RF_BIAS cut, buzzer 3-tone 10 s, g_allow_rf latched low.
+ *      Dismiss re-arms g_allow_rf.
+ *  P1 (mild, e.g. NTC overheat): nothing on the RF side except refusing
+ *      PTT.  PWR_ON / RF_BIAS stay up, RELAYs stay where they were
+ *      (IDLE), the RF board protection bus is not driven, and g_allow_rf
+ *      is untouched - the IMain zero offset is unaffected by PA
+ *      temperature, and the operator should be able to key again as soon
+ *      as they dismiss.  Only the PTT gate (g_alert_flag) blocks keying.
  *==========================================================================*/
 
 void protection_trigger_locked(AlertType cause)
@@ -131,51 +145,77 @@ void protection_trigger_locked(AlertType cause)
     }
     s_protection_active = true;
     s_last_fault        = cause;
+    s_last_severity     = alert_severity(cause);
 
-    /* 1. raise hardware fault latch FIRST (PB13 -> D7 -> RF_IN_PROTECT_MIXED)
-     *    so the RF board starts its own protection and latches the hardware
-     *    bus at the earliest possible moment - every other step below is
-     *    local to this MCU and can afford to follow. */
-    RF_IN_PROTECT_RAISE();
-    /* 2. drop both RELAYs and the keying feedback immediately */
-    RELAY1_OFF();
-    RELAY2_OFF();
+    if (s_last_severity == ALERT_SEV_P0) {
+        /* 1. raise hardware fault latch FIRST (PB13 -> D7 ->
+         *    RF_IN_PROTECT_MIXED) so the RF board starts its own
+         *    protection and latches the hardware bus at the earliest
+         *    possible moment.  Every other step below is local to this
+         *    MCU and can afford to follow. */
+        RF_IN_PROTECT_RAISE();
+        /* 2. drop both RELAYs and the keying feedback immediately.
+         *    RF may be live at the antenna port. */
+        RELAY1_OFF();
+        RELAY2_OFF();
+        /* 3. cut high voltage. */
+        PWR_ON_DISABLE();
+        /* 4. cut PA bias. */
+        RF_BIAS_DISABLE();
+        /* 5a. Abandon any HV sequencing that was in flight.  This path
+         *     drops PWR_ON / RF_BIAS directly with zero delay - deliberately
+         *     not via power_hv_off(), whose 10 ms bias-before-rail gap
+         *     would be the wrong thing to do to a fault.  The pending
+         *     stage therefore has to be cleared, or power_rail_step()
+         *     would later re-assert a rail that protection just cut. */
+        power_rail_abort();
+        /* 5. start the 3-tone warning.  Hard-capped at 10 s by buzzer.c;
+         *    the operator is never forced to dismiss to silence the room. */
+        buzzer_start();
+        /* 7. block new PTT until the operator dismisses.  g_allow_rf is
+         *    the one knob ptt_apply_level() / power_tx_enable() check. */
+        g_allow_rf = false;
+    } else {
+        /* P1: thermal / fan / pump.  Refuse PTT, leave everything else
+         * alone.  The PA is still biased and ready to go as soon as the
+         * condition clears. */
+    }
+    /* PTT_OUT low + ptt_state IDLE applies to BOTH severities - it is the
+     * "stop keying right now" half of the gate, even if P1 lets the
+     * hardware stay armed. */
     power_ptt_out_set(false);
     ptt_state = PTT_STATE_IDLE;
-    /* 3. cut high voltage */
-    PWR_ON_DISABLE();
-    /* 4. cut PA bias */
-    RF_BIAS_DISABLE();
 
-    /* 5. start the 3-tone warning; it loops until protection_clear().
-     *    Done here rather than in the task so the alarm is audible even if
-     *    the fault happened while the scheduler was busy. */
-    buzzer_start();
-
-    /* 5a. Abandon any HV sequencing that was in flight.  This path drops
-     *     PWR_ON / RF_BIAS directly with zero delay - deliberately not via
-     *     power_hv_off(), whose 10 ms bias-before-rail gap would be the
-     *     wrong thing to do to a fault.  The pending stage therefore has
-     *     to be cleared, or power_rail_step() would later re-assert a rail
-     *     that protection just cut.
-     *
-     *     g_hv_on is left alone for the same reason g_psu_on was: the front
-     *     panel should keep reading "ready" so the operator is told to power
-     *     cycle rather than silently powered off.  What actually blocks RF is
-     *     g_allow_rf / g_alert_flag below. */
-    power_rail_abort();
+    /* 5b. start the P1 warning tone.  Hard-capped at 10 s. */
+    if (s_last_severity == ALERT_SEV_P1) {
+        buzzer_start_p1();
+    }
 
     /* 6. publish to cross-task state (volatiles already declared
      *    volatile in opa2000.c; reads on task side are atomic on M7). */
-    g_alert_active = cause;
-    g_alert_flag   = true;
-    /* 7. block new PTT until IM is re-calibrated or fault cleared */
-    g_allow_rf     = false;
-    g_tx_active    = false;
-    /* NOTE: g_hv_on and g_psu_on are deliberately left alone.  A fault
-     * drops the relays, PWR_ON and the bias, but the front panel still reads
-     * "ready" so the operator is told to power-cycle rather than silently
-     * powered off.  g_allow_rf above is what actually blocks RF. */
+    g_alert_active   = cause;
+    g_alert_severity = s_last_severity;
+    g_alert_flag     = true;
+    /* 7. P0 only: block new PTT until the operator dismisses.  P1 leaves
+     *    g_allow_rf alone so the same CC6920 zero-offset calibration
+     *    continues to gate keying as normal.  g_tx_active is cleared in
+     *    both cases so the GUI's status banner immediately reflects
+     *    "not transmitting". */
+    if (s_last_severity == ALERT_SEV_P0) {
+        g_allow_rf = false;
+    }
+    g_tx_active = false;
+    /* NOTE: g_hv_on and g_psu_on are deliberately left alone by both
+     * severities - a fault never silently powers the rig off; the
+     * operator has to do that explicitly.  P0 additionally cuts the
+     * HV rail so the PA cannot produce more RF or heat while latched;
+     * P1 leaves the rail up so the PA stays warm and ready.  What
+     * actually blocks RF is g_allow_rf (P0) or g_alert_flag (both). */
+
+    /* 8. Push the alert=ON event onto the LPUART1 comm ring so the host
+     *    sees it on the next pump, without waiting for the 100 ms status
+     *    cycle.  comm_post_alert_evt() is ISR-safe (no FreeRTOS API). */
+    comm_post_alert_evt(cause, s_last_severity, true);
 }
 
 /*============================================================================
@@ -274,6 +314,19 @@ void protection_check_adc1_dma(void)
     /* Coupler 2 forward. */
     if (g_adc_data.fwd2_mW > lim.fwd2_max_mW) {
         protection_trigger_locked(ALERT_REFLECT_POWER_HIGH);
+        return;
+    }
+    /* PA bias (INP14).  Lives here rather than in protection_check() so the
+     * response lands within one ADC1 DMA completion instead of waiting for
+     * the Control task tick - design spec section 7.5.1 requires every
+     * channel without an analog watchdog to be compared in the DMA
+     * interrupt.  VBIAS shares ADC1's regular group with the coupler
+     * channels, so the fresh g_adc_data.vbias_mV is already published by
+     * the time this runs.  The g_tx_active gate above covers "bias should
+     * be up", which is exactly the condition under which a reading means
+     * anything. */
+    if (g_adc_data.vbias_mV > g_config.band_vbias_max_mV) {
+        protection_trigger_locked(ALERT_VBIAS_FAULT);
     }
 }
 
@@ -329,15 +382,37 @@ void protection_check(void)
 
 void protection_clear(void)
 {
+    /* Capture the severity BEFORE we clobber s_last_severity, so the
+     * dismiss-time branch can decide whether to re-arm g_allow_rf. */
+    AlertSeverity sev = s_last_severity;
+
     s_protection_active = false;
     s_last_fault        = ALERT_NONE;
+    s_last_severity     = ALERT_SEV_NONE;
     g_alert_active      = ALERT_NONE;
     g_alert_flag        = false;
-    RF_IN_PROTECT_CLEAR();
+    g_alert_severity    = ALERT_SEV_NONE;
+    /* Only P0 driven the hardware fault latch; for P1 this is a no-op
+     * (the pin is still in its idle state). */
+    if (sev == ALERT_SEV_P0) {
+        RF_IN_PROTECT_CLEAR();
+    }
     buzzer_stop();
-    /* Note: g_allow_rf stays false until user re-runs the IM zero-offset
-     * calibration (adc_im_zero_offset_tick()).  That is intentional -
-     * the operator must explicitly re-arm the RF path. */
+
+    /* 主动通知 LPUART1 告警已解除。cause / sev 在 OFF 事件里忽略，
+     * 但要传入 s_last_fault 的值让 PC 端知道刚解的是哪个。 */
+    comm_post_alert_evt(s_last_fault, ALERT_SEV_NONE, false);
+    /* Re-arm the RF path:
+     *   P0  -> g_allow_rf had been cleared by the trigger; restore it.
+     *         The CC6920 zero offset is unaffected by the fault, so the
+     *         original calibration is still good.
+     *   P1  -> g_allow_rf was never touched by the trigger.  Nothing to
+     *         restore; the operator can key immediately on the next PTT
+     *         press (g_ptt_ready is also already true).
+     *   P0/NONE both also need g_allow_rf = true, because the CC6920
+     *     zero offset is the only reason it can be low at this point
+     *     and that was set at boot.  Conservative: always re-arm. */
+    g_allow_rf = true;
 }
 
 bool protection_is_active(void) { return s_protection_active; }
@@ -357,6 +432,7 @@ const char *protection_get_fault_string(AlertType a)
         case ALERT_FREQ_MISMATCH:       return "Frequency Mismatch";
         case ALERT_NTC_OVERHEAT:        return "Core Temperature High";
         case ALERT_VBIAS_FAULT:         return "PA Bias Fault";
+        case ALERT_FAN_FAULT:           return "Fan Fault";
         default:                        return "Unknown Fault";
     }
 }

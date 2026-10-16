@@ -80,9 +80,10 @@ extern void MX_I2C2_Init(void);
 #define GT911_STATUS_BYTES    1U
 #define GT911_POINT_BYTES     7U
 
-/* NS2009 的 XH,XL,YH,YL 是连续的（0x82..0x85），但仍分两笔读：
- * 芯片每次读触发一次坐标转换，一次读 4 字节拿不到两次独立转换的结果。 */
-#define NS_RX_BYTES           4U
+/* NS2009 每笔读事务只拿一个 12 位值（命令码见 ns2009.h），返回 2 字节。
+ * 所以一次采样 = 4 笔事务：Z1 → Z2 → X → Y，每笔都是独立的一次转换。
+ * 一次读多字节在这里不成立——那 2 字节就是"12 位 + 4 位冗余"的上限。 */
+#define NS_READ_BYTES         NS2009_READ_BYTES   /* 2 */
 
 /* 每笔事务的软件看门狗上限。400 kHz 下一笔 8 字节事务约 200 us，
  * 10 ms 已是 50 倍余量；再长只会让总线挂死时更晚被发现。 */
@@ -122,8 +123,13 @@ extern void MX_I2C2_Init(void);
 #define TOUCH_DMA_BUF
 #endif
 
-/*! NS2009 坐标载荷：[0..1] = XH,XL  [2..3] = YH,YL */
-static uint8_t s_ns_rx[NS_RX_BYTES]      TOUCH_DMA_BUF;
+/*! NS2009 的 2 字节读回：[0] = 12 位的高 8 位，[1] = 低 4 位 + 冗余 4 位。
+ *  四个值（Z1/Z2/X/Y）各用一份：它们分属不同的转换，DMA 搬完到回调
+ *  触发之间缓冲不能被下一笔覆写。 */
+static uint8_t s_ns_z1[NS_READ_BYTES]    TOUCH_DMA_BUF;
+static uint8_t s_ns_z2[NS_READ_BYTES]    TOUCH_DMA_BUF;
+static uint8_t s_ns_x[NS_READ_BYTES]     TOUCH_DMA_BUF;
+static uint8_t s_ns_y[NS_READ_BYTES]     TOUCH_DMA_BUF;
 /*! GT911 状态寄存器（1 字节） */
 static uint8_t s_gt_status[GT911_STATUS_BYTES] TOUCH_DMA_BUF;
 /*! GT911 第一个触摸点（7 字节） */
@@ -140,6 +146,20 @@ volatile uint16_t g_touch_raw_y       = 0U;
 volatile uint8_t  g_touch_raw_pressed = 0U;
 volatile uint8_t  g_touch_raw_seq     = 0U;
 
+/*!< "有一个新样本待取走"标志，由 I2C 中断置位、读者清零。
+ *
+ *  为什么需要它：LVGL 每 tick 调一次 indev 的 read_cb，而采样是 10 ms 一次
+ *  ——两个周期不同频，必然出现 LVGL 连续多帧读到同一个样本。LVGL 自己会去重
+ *  （坐标与状态都不变就不产生事件），所以功能上不出重复点击；但那是依赖 LVGL
+ *  内部实现的行为。OPA1000 用一个"取走即清"的标志（main.c 的 TS_touched）
+ *  来表达同一件事，不依赖下游的容忍度，这里照做。
+ *
+ *  与 g_touch_raw_seq 的分工：seq 是自增计数器，给 seqlock 校验用（判断快照
+ *  在读取过程中有没有被改写）；本标志是"取走即清"，给消费者判断"这是不是
+ *  新数据"。两者语义不同，不能互相替代——seqlock 的读者不会清 seq，而本标志
+ *  的消费者必须清，否则标志永远为真。 */
+volatile uint8_t  g_touch_new_sample   = 0U;
+
 /*============================================================================
  * 诊断量
  *==========================================================================*/
@@ -148,9 +168,13 @@ volatile uint32_t g_touch_bus_faults  = 0U;
 volatile uint32_t g_touch_last_error  = 0U;
 volatile uint32_t g_touch_recoveries  = 0U;
 
+/*!< NS2009 最近一次的压力原始值。0..8190；空闲时接近基线。
+ *  调试用：把阈值调准之前，先看这个数在按与不按时的实际范围。 */
+volatile uint32_t g_touch_raw_z       = 0U;
+
 /*============================================================================
  * 私有状态
- *==========================================================================*/
+ *============================================================================*/
 
 /* Current touch type */
 static TouchType detected_touch_type = TOUCH_NONE;
@@ -187,6 +211,8 @@ static struct {
 
 typedef enum {
     TS_IDLE = 0,     /*!< 没有在途事务                       */
+    TS_NS_Z1,        /*!< 等 NS2009 Z1 读（面板电压）          */
+    TS_NS_Z2,        /*!< 等 NS2009 Z2 读（触摸点电压）        */
     TS_NS_X,         /*!< 等 NS2009 X 读                     */
     TS_NS_Y,         /*!< 等 NS2009 Y 读                     */
     TS_GT_STATUS,    /*!< 等 GT911 状态读                     */
@@ -232,21 +258,28 @@ static void touch_publish(bool pressed, uint16_t x, uint16_t y)
     }
     /* 三个字段都落定之后才自增：读者据此判断快照是否一致。 */
     g_touch_raw_seq = (uint8_t)(g_touch_raw_seq + 1U);
+
+    /* 顺带通知"有新样本了"。放在最后，使它天然成为发布完成信号——
+     * 消费者若在清除本标志之前读快照，拿到的必然是这一次的完整数据。 */
+    g_touch_new_sample = 1U;
 }
 
 /**
  * @brief 发起一笔 NS2009 读。返回 false 表示没能启动，状态机已回 IDLE。
- * @note 可由任务上下文（首轮）或中断上下文（串联下一拍）调用。
+ *
+ * \p cmd 是**命令码**而非寄存器地址（0xC0/0xD0/0xE0/0xF0，见 ns2009.h）：
+ * NS2009 用命令码配置 ADC 的 MUX，一笔事务只能取一个 12 位值。
+ *
+ * @note 可由任务上下文（首笔）或中断上下文（串联下一笔）调用。
  */
-static bool touch_start_ns_read(uint16_t reg, uint8_t *dst, uint16_t len,
-                                TouchStage st)
+static bool touch_start_ns_read(uint8_t cmd, uint8_t *dst, TouchStage st)
 {
     s_cur_addr   = NS2009_ADDR;
     s_stage      = st;
     s_stage_tick = HAL_GetTick();
 
-    if (HAL_I2C_Mem_Read_DMA(&hi2c2, NS2009_ADDR, reg, I2C_MEMADD_SIZE_8BIT,
-                             dst, len) != HAL_OK) {
+    if (HAL_I2C_Mem_Read_DMA(&hi2c2, NS2009_ADDR, cmd, I2C_MEMADD_SIZE_8BIT,
+                             dst, NS_READ_BYTES) != HAL_OK) {
         /* HAL 在启动前就拒绝了（句柄忙 / 参数非法）：没有回调会来，
          * 必须自己收回状态，否则状态机会永远卡在这一拍。 */
         s_stage = TS_IDLE;
@@ -412,18 +445,53 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 
     switch (s_stage) {
 
+    case TS_NS_Z1:
+        /* Z1（面板电压）到手，接着取 Z2（触摸点电压）。两者合成压力，
+         * 顺序不能颠倒：手册把它们定义为两次独立转换，谁先谁后不影响
+         * 结果，但固定顺序便于排查哪一笔出错。 */
+        if (!NS2009_IS_VALID(s_ns_z1[1])) {
+            touch_publish(false, 0U, 0U);
+            s_stage = TS_IDLE;
+            break;
+        }
+        (void)touch_start_ns_read(NS2009_CMD_Z2_12BIT, s_ns_z2, TS_NS_Z2);
+        break;
+
+    case TS_NS_Z2:
+        if (!NS2009_IS_VALID(s_ns_z2[1])) {
+            touch_publish(false, 0U, 0U);
+            s_stage = TS_IDLE;
+            break;
+        }
+        /* 压力此刻已可算，先存下来供调试看；坐标读完后才决定按下与否，
+         * 因为无接触时 X/Y 是漂移的，没有参考价值。 */
+        g_touch_raw_z = NS2009_PRESSURE(NS2009_VALUE(s_ns_z1[0], s_ns_z1[1]),
+                                       NS2009_VALUE(s_ns_z2[0], s_ns_z2[1]));
+        (void)touch_start_ns_read(NS2009_CMD_X_12BIT, s_ns_x, TS_NS_X);
+        break;
+
     case TS_NS_X:
-        /* X 到手，接着读 Y。两笔分开是因为每次读都触发一次坐标转换。 */
-        (void)touch_start_ns_read(NS2009_REG_YH, &s_ns_rx[2], 2U, TS_NS_Y);
+        if (!NS2009_IS_VALID(s_ns_x[1])) {
+            touch_publish(false, 0U, 0U);
+            s_stage = TS_IDLE;
+            break;
+        }
+        (void)touch_start_ns_read(NS2009_CMD_Y_12BIT, s_ns_y, TS_NS_Y);
         break;
 
     case TS_NS_Y: {
-        uint16_t rx = NS2009_COORD_FROM_HL(s_ns_rx[0], s_ns_rx[1]);
-        uint16_t ry = NS2009_COORD_FROM_HL(s_ns_rx[2], s_ns_rx[3]);
-        /* 无触摸时两轴都接近 0，两轴都低于阈值才算"未按下"（与原逻辑一致）。 */
-        bool pressed = !((rx < NS2009_PRESS_THRESHOLD) &&
-                         (ry < NS2009_PRESS_THRESHOLD));
-        touch_publish(pressed, rx, ry);
+        /* 失败安全：任何一个值的冗余位非 0 都当作"未按下"。宁可漏掉一次
+         * 点击，也不要发出一次位置错误的点击——对面板而言这个方向是安全
+         * 的。注意这种失败不计入 g_touch_bus_faults（总线本身是好的，
+         * 是数据无效），要发现它得看 g_touch_raw_z 有没有异常值。 */
+        if (!NS2009_IS_VALID(s_ns_y[1])) {
+            touch_publish(false, 0U, 0U);
+            s_stage = TS_IDLE;
+            break;
+        }
+        touch_publish(g_touch_raw_z > NS2009_Z_PRESS_THRESHOLD,
+                      NS2009_VALUE(s_ns_x[0], s_ns_x[1]),
+                      NS2009_VALUE(s_ns_y[0], s_ns_y[1]));
         s_stage = TS_IDLE;
         break;
     }
@@ -560,22 +628,18 @@ TouchType touch_detect_type(void)
 }
 
 /**
- * @brief Get the latest touch position, calibrated for the resistive panel.
+ * @brief 读快照并填 \p point。返回 point->pressed。
  *
- * 只读 volatile 快照，永不碰总线，所以不会阻塞。seqlock 校验保证拿到的是
- * 一致的三元组；极少数情况下快照正在被中断改写，重试几次即可，失败则
- * 用最后读到的值（对触摸而言一帧的偏差无感）。
+ * seqlock 校验保证拿到的是一致的三元组；极少数情况下快照正在被中断改写，
+ * 重试几次即可，失败则用最后读到的值（对触摸而言一帧的偏差无感）。
+ * 两次公共 API（取状态 / 取新样本）共用它，免得标定变换走偏。
  */
-bool touch_get_position(TouchPointType *point)
+static bool touch_read_snapshot(TouchPointType *point)
 {
     uint16_t x;
     uint16_t y;
     uint8_t  pressed;
     uint8_t  tries = 4U;
-
-    if (point == NULL) {
-        return false;
-    }
 
     do {
         uint8_t s0 = g_touch_raw_seq;
@@ -597,6 +661,47 @@ bool touch_get_position(TouchPointType *point)
     point->y       = y;
     point->pressed = (pressed != 0U);
     return point->pressed;
+}
+
+/**
+ * @brief Get the latest touch position, calibrated for the resistive panel.
+ *
+ * 只读 volatile 快照，永不碰总线，所以不会阻塞。返回的是**当前状态**——
+ * 同一个样本会被读到多次（LVGL 每 tick 一次，采样 10 ms 一次）。要只处理
+ * 新样本，用 touch_take_sample()。
+ */
+bool touch_get_position(TouchPointType *point)
+{
+    if (point == NULL) {
+        return false;
+    }
+    return touch_read_snapshot(point);
+}
+
+/**
+ * @brief 取走一个新样本（OPA1000 的 TS_touched 标志的封装）。
+ *
+ * 有新样本才填 point 并返回 true，并清掉"取走即清"标志；没有则返回 false
+ * 且不碰 point。适合 LVGL 的 indev read_cb 这种"事件驱动"的消费者。
+ *
+ * 清除与中断置位可能相邻发生；这里读-清一次就收工，最多漏掉恰好落在这一
+ * 瞬间的样本，下个周期会补上。不需要临界区。
+ */
+bool touch_take_sample(TouchPointType *point)
+{
+    if (point == NULL) {
+        return false;
+    }
+
+    if (g_touch_new_sample == 0U) {
+        return false;           /* 上一份已经被取走了 */
+    }
+    g_touch_new_sample = 0U;   /* 取走即清 */
+
+    /* 这一次是真的新样本，但 pressed 可能为 0（抬手）。两种情况都算
+     * "有新数据"，返回的是 pressed 的值，由调用方判断。 */
+    touch_read_snapshot(point);
+    return true;
 }
 
 /**
@@ -664,7 +769,9 @@ void touch_process(void)
     s_last_poll_tick = now;
 
     if (detected_touch_type == TOUCH_RESISTIVE) {
-        (void)touch_start_ns_read(NS2009_REG_XH, s_ns_rx, 2U, TS_NS_X);
+        /* 从 Z1 开始：压力决定"按没按"，而 X/Y 在无接触时是漂移的，
+         * 没有参考价值。 */
+        (void)touch_start_ns_read(NS2009_CMD_Z1_12BIT, s_ns_z1, TS_NS_Z1);
     } else {
         (void)touch_start_gt_status();
     }

@@ -151,6 +151,7 @@ extern const test_entry_t g_suite_adc_calibration[];
 extern const test_entry_t g_suite_power_control[];
 extern const test_entry_t g_suite_protection[];
 extern const test_entry_t g_suite_radio_band[];
+extern const test_entry_t g_suite_freq_detect[];
 extern const test_entry_t g_suite_cmsis_os_shim[];
 extern const test_entry_t g_suite_config_mutex[];
 extern const test_entry_t g_suite_boot[];
@@ -162,6 +163,7 @@ static const test_entry_t *const s_suites[] = {
     g_suite_power_control,
     g_suite_protection,
     g_suite_radio_band,
+    g_suite_freq_detect,
     g_suite_cmsis_os_shim,
     g_suite_config_mutex,
     g_suite_boot,

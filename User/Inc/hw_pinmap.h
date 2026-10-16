@@ -166,6 +166,22 @@ extern "C" {
 /* CPU_READY (PD8): GPIO output (status indication).
  * CPU_READY_GPIO_Port / CPU_READY_Pin come straight from main.h. */
 
+/* TFT_DISP (PE10): LTDC panel "display enable" line.  HIGH = the panel's
+ * source driver and gate driver come out of standby and accept the LTDC
+ * pixel stream.  LOW = blanked, no power wasted in the panel's row/col
+ * drivers.  Driven HIGH only once the GUI has painted its first frame
+ * (g_gui_ready), via boot_backlight_on() in boot.c.  Drawn LOW again on
+ * power_soft_off() so the panel darkens in step with the supply.
+ *
+ * TFT_DISP_GPIO_Port / TFT_DISP_Pin come straight from main.h (PE10), same
+ * as the other CubeMX-named pins above - no alias needed.
+ *
+ * Polarity assumption: HIGH enables.  This matches the ST RGB-LCD
+ * reference design and most third-party panels with a "DISP" pin.  If
+ * a particular panel uses active-low DISP, invert both macros. */
+#define TFT_DISP_ENABLE()    HAL_GPIO_WritePin(TFT_DISP_GPIO_Port, TFT_DISP_Pin, GPIO_PIN_SET)
+#define TFT_DISP_DISABLE()   HAL_GPIO_WritePin(TFT_DISP_GPIO_Port, TFT_DISP_Pin, GPIO_PIN_RESET)
+
 /* LIGHTNING_PROTECTION_A / B (PB9 / PD9): GPIO outputs, jumper pads.
  * CubeMX names them LIGHTNING_PROTECTION_A / _B; alias down. */
 #define LIGHTNING_A_GPIO_Port  LIGHTNING_PROTECTION_A_GPIO_Port

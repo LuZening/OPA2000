@@ -124,7 +124,6 @@ void app_tasks_create(void)
 void app_gui_task(void *argument)
 {
     TickType_t last_wake_time;
-    TouchPointType touch_point;
 
     (void)argument;
 
@@ -152,11 +151,11 @@ void app_gui_task(void *argument)
         /* Process LVGL tick */
         gui_tick();
 
-        /* Process touch */
+        /* Kick off the next touch poll.  The samples themselves arrive via
+         * the I2C2 DMA completion interrupt and are read by LVGL's indev
+         * read_cb inside gui_tick() above - the GUI never has to look at a
+         * touch sample itself. */
         touch_process();
-        if (touch_get_position(&touch_point) && touch_point.pressed) {
-            /* Input handled by LVGL indev */
-        }
 
         /* Process calibration input during calibration */
         gui_process_calibration();
@@ -166,9 +165,28 @@ void app_gui_task(void *argument)
         /* Update display values */
         gui_update_display();
 
-        /* Check alert status - if cleared from GUI */
-        if (!protection_is_active() && gui_is_alert_active()) {
-            gui_dismiss_alert();
+        /* ================= 保护告警弹窗 =================
+         *
+         * 故障路径（protection_trigger_locked()，中断上下文）不能碰 LVGL，
+         * 它只置 g_alert_flag；把标志变成弹窗是这里的事。
+         *
+         * 两个变量都是 volatile 且由中断侧写：g_alert_flag 是 bool（1 字节，
+         * 单字节访问在 M7 上原子），g_alert_active 是 AlertType（枚举，GCC
+         * 下 int = 4 字节，对齐访问同样原子）。所以直接读是安全的——不依赖
+         * 任何锁，也不依赖"读两次比对"这种技巧。
+         *
+         * 顺序很重要：先看"有没有弹窗"再看"要不要弹"，否则保护已解除而弹窗
+         * 还在时会被下面那个分支抢先关掉，弹窗就再也不会出现。 */
+        if (!gui_is_alert_active()) {
+            if (g_alert_flag) {
+                gui_show_alert(g_alert_active);
+            }
+        } else {
+            /* 弹窗还开着，但保护侧已经解除（CAT 下过 ALERT OFF，或故障条件
+             * 自行消失）——这时把残留的弹窗收掉。 */
+            if (!protection_is_active()) {
+                gui_dismiss_alert();
+            }
         }
 
         /* 10ms tick */
@@ -198,6 +216,26 @@ void app_adc_task(void *argument)
            path. */
         adc_process();
 
+        /* Drive the CC6920 IM zero-offset calibration.  This is the ONLY
+           writer of g_allow_rf = true (see adc_im_zero_offset_tick()), and
+           adc_init() deliberately clears both im_calibrated and g_allow_rf
+           on every boot, so without this call the amplifier could never
+           key at all - ptt_apply_level() refuses every request while
+           g_allow_rf is false.
+
+           It runs at the 50 ms task tick rather than the 10 ms the state
+           machine was dimensioned for, which stretches the 50-sample
+           window from ~500 ms to ~2.5 s.  That is fine: the window only has
+           to average out ADC noise while the PA draws no current, and at
+           boot the rail is still down.
+
+           Self-limiting: the state machine returns immediately once
+           g_config.im_calibrated is set, so after the first successful
+           pass this is a single load-and-branch per tick.  On failure it
+           retries up to 3 times and then raises ALERT_HARDWARE_FAULT by
+           itself (user_adc.c) - no operator action required either way. */
+        (void)adc_im_zero_offset_tick();
+
         /* Advance the coupler-2 peak holds for the GUI bar graphs.  Task
            context on purpose: the release step uses expf(), which must not
            run in the priority-0 DMA interrupt. */
@@ -220,16 +258,21 @@ void app_adc_task(void *argument)
 }
 
 /**
- * @brief Communication Task - handles USB and serial communication
+ * @brief Communication Task - handles USB / LPUART1 (PC CAT) and UART4 (radio CAT)
  */
 void app_comm_task(void *argument)
 {
     (void)argument;
 
+    /* 持有"上一帧生效的 radio_baud"。每次循环开头比较：若 PC 端已
+     * 改了 g_config.radio_baud_rate，就调 radio_uart_set_baud()
+     * 让 UART4 立即生效。值 0 = 未生效；>0 = 第一次比较。 */
+    uint32_t last_applied_radio_baud = 0U;
+
     /* No vTaskDelayUntil() anchor here: the loop blocks for an
      * unpredictable time in radio_uart_wait_frame(), so there is no
      * fixed grid left to "catch up" on.  The CAT poll accumulator keeps
-     * its own 100 ms cadence via radio_band_tick()'s internal counter,
+     * its own 200 ms cadence via radio_band_tick()'s internal counter,
      * which is unaffected by how often this loop runs. */
 
     /* Initialize communication */
@@ -240,33 +283,55 @@ void app_comm_task(void *argument)
      * protocol layer attached.  After this the task only has to pump the
      * poll accumulator and drain received bytes. */
     (void)radio_uart_init();
+    last_applied_radio_baud = g_config.radio_baud_rate;
 
     while (1) {
-        /* Process received commands */
+        /* 0) GUI 改 radio_baud 后，g_config 已经被写但 UART4 还在用
+         *    旧值。comm 任务拿到机会把它落实——这是用户要求"GUI 改
+         *    立即生效"的具体实现。最多每轮执行一次。 */
+        if (g_config.radio_baud_rate != 0U &&
+            g_config.radio_baud_rate != last_applied_radio_baud) {
+            (void)radio_uart_set_baud(g_config.radio_baud_rate);
+            last_applied_radio_baud = g_config.radio_baud_rate;
+        }
+
+        /* 1) PC CAT 接收：从 s_rx_pending 取一段，按行解析与执行。
+         *    LPUART1 的 IDLE 中断已 memcpy 到 s_rx_pending。 */
         comm_process_rx();
 
-        /* Radio CAT poll accumulator: ticked every 10 ms, sends a query
-         * every 100 ms.  Must run regardless of whether a CAT frame just
-         * arrived, otherwise an unanswered radio would stop being polled
-         * and we could never discover its protocol in the first place. */
+        /* 2) 100ms 主动上报一行 status 到 PC。comm_periodic_tick()
+         *    内部 10ms 累加到 10 次后发一行。 */
+        comm_periodic_tick();
+
+        /* 2a) 事件推送：comm_alert_pump() 把 alert=ON/OFF 事件 ring
+         *     里的内容写到 s_tx_ring。每次 comm 任务循环都做（10ms），
+         *     让保护事件在 < 10ms 内送达 PC，不必等 100ms status 周期。 */
+        comm_alert_pump();
+
+        /* 3) TX pump：把 s_tx_ring 里的数据搬到 s_tx_dma_buf 并
+         *    启动 DMA，DMA 完成后由 HAL_UART_TxCpltCallback 拉
+         *    s_tx_dma_busy = false，下一次 pump 继续从 ring 取。 */
+        comm_tx_pump();
+
+        /* 3) Radio CAT poll accumulator: ticked every 10 ms, sends a
+         *    query every 200 ms.  Must run regardless of whether a CAT
+         *    frame just arrived, otherwise an unanswered radio would
+         *    stop being polled and we could never discover its protocol. */
         radio_band_tick();
         radio_band_poll();
 
-        /* Block until the UART4 ISR hands over a frame, then let
-         * radio_band slice it, identify the protocol and switch band.
-         * This is what keeps frame parsing out of the ISR.
+        /* 4) Block until the UART4 ISR hands over a frame, then let
+         *    radio_band slice it, identify the protocol and switch band.
+         *    This is what keeps frame parsing out of the ISR.
          *
-         * Timeout is one poll interval rather than "forever" so the two
-         * calls above keep their 10 ms cadence even when the radio is
-         * silent - which is the normal state, since a CAT radio only
-         * answers when asked. */
+         *    Timeout is one poll interval (200 ms in 10 ms tick) rather
+         *    than "forever" so the three calls above keep their cadence
+         *    even when the radio is silent. */
         (void)radio_uart_wait_frame(RADIO_BAND_POLL_PERIOD_MS);
 
-        /* Re-anchor the delay: radio_uart_wait_frame() blocks for an
-         * unpredictable time, so vTaskDelayUntil() can no longer be used
-         * to hold the 10 ms grid (it would try to "catch up" by bursting
-         * iterations).  A plain delay is correct here and the tick above
-         * is what actually needs the grid. */
+        /* 5) Plain delay rather than vTaskDelayUntil(): radio_uart_wait_frame
+         *    blocks for an unpredictable time, so the "absolute deadline"
+         *    anchor no longer matches.  10 ms keeps the loop responsive. */
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

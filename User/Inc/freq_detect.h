@@ -53,6 +53,13 @@ void freq_detect_check(void);
 /* Latest measured frequency in Hz.  May be 0 if no signal. */
 uint32_t freq_detect_get_frequency(void);
 
+#ifdef HOST_TEST_NATIVE
+/* Test hooks for the sliding window.  idx in 0..2. */
+uint16_t freq_detect_test_window(uint8_t idx);
+uint8_t  freq_detect_test_window_fill(void);
+uint16_t freq_detect_test_accepted_lsb(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

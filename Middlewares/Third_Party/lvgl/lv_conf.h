@@ -178,7 +178,7 @@ typedef void * lv_group_user_data_t;
 #endif  /*LV_USE_GROUP*/
 
 /* 1: Enable GPU interface*/
-#define LV_USE_GPU              1   /*Only enables `gpu_fill_cb` and `gpu_blend_cb` in the disp. drv- */
+#define LV_USE_GPU              0   /*Only enables `gpu_fill_cb` and `gpu_blend_cb` in the disp. drv- */
 /* Kept at 0: User/Src/lv_port_disp.c drives the DMA2D peripheral itself
  * (HAL_DMA2D_Start_IT plus its own XferCpltCallback and dma2d_busy
  * handshake).  Enabling LVGL's own DMA2D driver as well would give the

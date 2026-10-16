@@ -77,6 +77,18 @@ static volatile bool  relay_timer_close  = false; /* true=close RELAY1 */
 /* FAN hysteresis state (task context only). */
 static FanSpeedType   fan_current_speed  = FAN_SPEED_LOW;
 
+/* Fan operating mode: AUTO (default, temperature-driven) or MANUAL
+ * (caller owns the duty via power_set_fan_speed()).  Single volatile
+ * because the GUI may read it from a different task to update the
+ * status display. */
+static volatile FanMode s_fan_mode = FAN_MODE_AUTO;
+
+/* NTC fault sticky flag.  Set true whenever the latest ADC reading is
+ * outside the physical range of the thermistor, and latched until a
+ * valid reading comes back.  Exposed through power_fan_ntc_fault() so
+ * the GUI can render a sensor-fault icon. */
+static volatile bool s_fan_ntc_fault = false;
+
 /*============================================================================
  *  HV rail sequencing state
  *
@@ -238,39 +250,135 @@ void power_set_pump_speed(uint8_t speed_percent)
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, pulse);
 }
 
-/**
- * @brief Hysteretic fan speed update.
+/*============================================================================
+ *  Fan control
+ *==========================================================================*/
+
+/* Continuous temperature -> duty curve, integer-only, with sticky
+ * hysteresis around each breakpoint so a noisy ADC reading doesn't
+ * make the fan dance.
  *
- * Speed rises at 60 C / 70 C, and falls back only after the temperature has
- * dropped a full FAN_HYSTERESIS below the rising threshold (i.e. 100 % holds
- * until <= 60 C, 80 % holds until <= 50 C).  Each level is evaluated in
- * sequence so a single call can traverse more than one level on a fast
- * temperature drop.
- */
+ *  Curve (3 segments):
+ *    <= 30 C        -> 30 %
+ *    30 C -> 50 C   -> linearly 30..60 %
+ *    50 C -> 70 C   -> linearly 60..100 %
+ *    >= 70 C        -> 100 %
+ *
+ *  Hysteresis: ± FAN_HYSTERESIS/2 (5 C) on each breakpoint, so the
+ *  fan speed only steps when the temperature has clearly moved past the
+ *  threshold.  Without hysteresis a ±1 LSB ADC wobble at 30.0 C
+ *  would step duty 0..30 % every 100 ms tick.
+ *
+ *  NTC fault: when g_adc_data.adc2_inj_ntc_core_raw is outside the
+ *  physical range (open: pull-up to VDD = 4095, short: pull-down to
+ *  GND = 0), the function forces 100 % and latches s_fan_ntc_fault
+ *  until a valid reading comes back.  This is the "if the sensor is
+ *  dead, run full speed" branch requested.
+ *
+ *  Manual mode: when s_fan_mode == FAN_MODE_MANUAL this function is a
+ *  no-op, so the operator's duty choice survives the temperature
+ *  loop.  Switch back to AUTO via power_set_fan_mode(FAN_MODE_AUTO). */
 void power_update_fan(int16_t temperature_tenth_c)
 {
-    const int16_t thr80  = (int16_t)FAN_TEMP_THRESHOLD_80 * 10;   /* 600 */
-    const int16_t thr100 = (int16_t)FAN_TEMP_THRESHOLD_100 * 10;  /* 700 */
-    const int16_t hys    = (int16_t)FAN_HYSTERESIS * 10;         /* 100 */
+    (void)temperature_tenth_c;  /* only used in AUTO branch below */
+    if (s_fan_mode == FAN_MODE_MANUAL) {
+        return;     /* operator owns the duty */
+    }
+
+    /* ---- NTC fault check ---- */
+    /* ad2_inj_ntc_core_raw is the raw 12-bit ADC code for the core NTC.
+     * 0 = short to GND, 4095 = open (pull-up to VDD).  Anything
+     * strictly inside [NTC_RAW_MIN, NTC_RAW_MAX] is a real
+     * resistance reading.  The bounds leave 5 LSB of margin for
+     * noise - tighter would chatter on borderline-good sensors. */
+    const uint16_t NTC_RAW_MIN = 5U;     /* below this = hard short */
+    const uint16_t NTC_RAW_MAX = 4090U;  /* above this = hard open */
+    uint16_t raw = g_adc_data.adc2_inj_ntc_core_raw;
+    bool sensor_broken = (raw < NTC_RAW_MIN) || (raw > NTC_RAW_MAX);
+    s_fan_ntc_fault = sensor_broken;
+
+    if (sensor_broken) {
+        /* Cannot trust temperature.  Run the fan flat out - the worst
+         * case (sensor open while PA is actually hot) costs a bit of
+         * acoustic noise; the alternative (run slow on a hot PA) is
+         * the failure mode the user wants to avoid. */
+        fan_current_speed = FAN_SPEED_HIGH;
+        power_set_fan_speed(FAN_SPEED_100_PERCENT);
+        return;
+    }
+
+    /* ---- Three-step ladder with rising/falling thresholds ----
+     *
+     * Two temperature thresholds (60 C and 70 C), each with its own
+     * rising and falling edge.  Design spec section 8: "转速升高后向下
+     * 回落的温度阈值要减少10摄氏度" - the release edge sits a full
+     * FAN_HYSTERESIS (10 C) below the rise edge, so a level holds until
+     * the temperature has clearly moved past the threshold instead of
+     * chattering around it.
+     *
+     *   LOW  50 %  ->  rise at 60 C, release at 50 C
+     *   MED  80 %  ->  rise at 70 C, release at 60 C
+     *   HIGH 100 % ->  (releases at 70 C into MED)
+     *
+     * Walk the chain in order, so a single call can step through more
+     * than one level on a fast temperature change.  Each step compares
+     * against the current level, so the hysteresis survives across
+     * power_update_fan() invocations. */
+    const int16_t thr_med_up   = 600;   /* 60.0 C */
+    const int16_t thr_high_up  = 700;   /* 70.0 C */
+    const int16_t hys          = 100;   /* 10.0 C */
+    const int16_t thr_med_dn   = thr_med_up  - hys;   /* 50.0 C */
+    const int16_t thr_high_dn  = thr_high_up - hys;   /* 60.0 C */
+
     FanSpeedType next = fan_current_speed;
 
-    if (next == FAN_SPEED_HIGH && temperature_tenth_c <= thr100 - hys) {
+    /* Fall: only if we're not already at LOW. */
+    if (next == FAN_SPEED_HIGH && temperature_tenth_c <= thr_high_dn) {
         next = FAN_SPEED_MED;
     }
-    if (next == FAN_SPEED_MED && temperature_tenth_c <= thr80 - hys) {
+    if (next == FAN_SPEED_MED && temperature_tenth_c <= thr_med_dn) {
         next = FAN_SPEED_LOW;
     }
-    if (next == FAN_SPEED_LOW && temperature_tenth_c >= thr80) {
+    /* Rise: only if we are below the target. */
+    if (next == FAN_SPEED_LOW  && temperature_tenth_c >= thr_med_up) {
         next = FAN_SPEED_MED;
     }
-    if (next == FAN_SPEED_MED && temperature_tenth_c >= thr100) {
+    if (next == FAN_SPEED_MED  && temperature_tenth_c >= thr_high_up) {
         next = FAN_SPEED_HIGH;
     }
 
     fan_current_speed = next;
-    power_set_fan_speed((next == FAN_SPEED_HIGH) ? FAN_SPEED_100_PERCENT
-                      : (next == FAN_SPEED_MED)  ? FAN_SPEED_80_PERCENT
-                                                 : FAN_SPEED_50_PERCENT);
+    switch (next) {
+    case FAN_SPEED_HIGH: power_set_fan_speed(FAN_SPEED_100_PERCENT); break;
+    case FAN_SPEED_MED:  power_set_fan_speed(FAN_SPEED_80_PERCENT);  break;
+    case FAN_SPEED_LOW:  power_set_fan_speed(FAN_SPEED_50_PERCENT);  break;
+    default:             power_set_fan_speed(FAN_SPEED_DEFAULT);    break;
+    }
+}
+
+void power_set_fan_mode(FanMode mode)
+{
+    s_fan_mode = mode;
+    /* When switching back to AUTO, don't snap the fan to the new duty
+     * until the next power_update_fan() tick (10 ms).  That keeps the
+     * transition gentle and matches how the rest of the firmware is
+     * driven by a 10 ms tick. */
+}
+
+void power_set_fan_manual(uint8_t speed_percent)
+{
+    s_fan_mode = FAN_MODE_MANUAL;
+    power_set_fan_speed(speed_percent);
+}
+
+FanMode power_get_fan_mode(void)
+{
+    return s_fan_mode;
+}
+
+bool power_fan_ntc_fault(void)
+{
+    return s_fan_ntc_fault;
 }
 
 /*============================================================================
@@ -902,7 +1010,14 @@ void power_soft_off(void)
     g_power_state   = POWER_STATE_OFF;
 
     /* 3. Blank the panel so the operator sees it shut down cleanly
-     *    rather than a frozen last frame. */
+     *    rather than a frozen last frame.  Both halves:
+     *    - boot_panel_off() drives TFT_DISP low (panel source/gate
+     *      drivers go into standby);
+     *    - then backlight PWM goes to 0 so the BL_AP3019 has no drive.
+     *    Order matters: blank the source drivers BEFORE killing the
+     *    backlight, otherwise the LCD could flash a frozen last frame
+     *    at full brightness during the collapse. */
+    boot_panel_off();
     power_set_backlight_duty(0U);
 
     /* 4. Block further keying, then release the rail. */

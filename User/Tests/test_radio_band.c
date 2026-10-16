@@ -673,6 +673,84 @@ TEST_CASE(the_published_frequency_and_the_global_agree)
 }
 
 /*============================================================================
+ *  set_hint / TX 守卫
+ *==========================================================================*/
+
+TEST_CASE(set_hint_after_auto_lock_drops_to_unknown)
+{
+    rb_reset();
+    /* 让自动识别先跑通（Kenwood 帧最简单） */
+    radio_band_feed(k_ken_14m, (uint16_t)sizeof k_ken_14m);
+    ASSERT_EQ(radio_band_get_type(), RADIO_TYPE_KENWOOD);
+
+    /* 用户在 GUI 切到一个不同协议 -> 已识别状态被清回 UNKNOWN */
+    radio_band_set_hint(RADIO_TYPE_ICOM_CIV);
+    ASSERT_EQ(radio_band_get_type(), RADIO_TYPE_UNKNOWN);
+}
+
+TEST_CASE(set_hint_to_explicit_protocol_overrides_auto_lock)
+{
+    rb_reset();
+    radio_band_feed(k_ken_14m, (uint16_t)sizeof k_ken_14m);
+    /* 与已识别一致：保持不动 */
+    radio_band_set_hint(RADIO_TYPE_KENWOOD);
+    ASSERT_EQ(radio_band_get_type(), RADIO_TYPE_KENWOOD);
+
+    /* 不一致：清回 UNKNOWN，下一帧会重新识别 */
+    radio_band_set_hint(RADIO_TYPE_YAESU);
+    ASSERT_EQ(radio_band_get_type(), RADIO_TYPE_UNKNOWN);
+}
+
+TEST_CASE(set_hint_unknown_keeps_current_identified_protocol)
+{
+    rb_reset();
+    radio_band_feed(k_ken_14m, (uint16_t)sizeof k_ken_14m);
+    RadioType before = radio_band_get_type();
+    /* 用户没指定协议，识别结果保留 */
+    radio_band_set_hint(RADIO_TYPE_UNKNOWN);
+    ASSERT_EQ(radio_band_get_type(), before);
+}
+
+TEST_CASE(tx_active_suppresses_frequency_updates)
+{
+    rb_reset();
+    /* 标识好协议后再发一个帧 -> 频率被采纳 */
+    radio_band_feed(k_ken_14m, (uint16_t)sizeof k_ken_14m);
+    ASSERT_EQ(g_radio_freq_hz, 14074200U);
+
+    /* 操作员按了 PTT */
+    g_tx_active = true;
+    /* 电台扫到 7.074 MHz 再发一帧 */
+    static const uint8_t ken_7m[] = {
+        'I', 'F', ';', '+', '0', '0', '0', '7', '0', '7', '4', '0', '0', ';'
+    };
+    radio_band_feed(ken_7m, (uint16_t)sizeof ken_7m);
+    /* 频率没变，freq_detect 不会被这次帧误导 */
+    ASSERT_EQ(g_radio_freq_hz, 14074200U);
+
+    /* TX 结束，下一帧恢复 */
+    g_tx_active = false;
+    radio_band_feed(ken_7m, (uint16_t)sizeof ken_7m);
+    /* Kenwood carries the frequency in 10 Hz steps: 000707400 -> 7074000 Hz. */
+    ASSERT_EQ(g_radio_freq_hz, 7074000U);
+}
+
+TEST_CASE(frames_held_tx_counter_increments_when_tx_active)
+{
+    rb_reset();
+    RadioBandStatsType st = {0};
+    radio_band_get_stats(&st);
+    uint32_t before = st.frames_held_tx;
+
+    g_tx_active = true;
+    radio_band_feed(k_ken_14m, (uint16_t)sizeof k_ken_14m);
+
+    radio_band_get_stats(&st);
+    ASSERT_EQ(st.frames_held_tx, before + 1U);
+    g_tx_active = false;
+}
+
+/*============================================================================
  *  Suite table
  *==========================================================================*/
 
@@ -717,5 +795,10 @@ const test_entry_t g_suite_radio_band[] = {
     TEST_ENTRY(every_merged_band_maps_correctly),
     TEST_ENTRY(a_zero_frequency_maps_to_no_band),
     TEST_ENTRY(the_published_frequency_and_the_global_agree),
+    TEST_ENTRY(set_hint_after_auto_lock_drops_to_unknown),
+    TEST_ENTRY(set_hint_to_explicit_protocol_overrides_auto_lock),
+    TEST_ENTRY(set_hint_unknown_keeps_current_identified_protocol),
+    TEST_ENTRY(tx_active_suppresses_frequency_updates),
+    TEST_ENTRY(frames_held_tx_counter_increments_when_tx_active),
     TEST_SUITE_END
 };

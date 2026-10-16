@@ -63,6 +63,19 @@ extern uint32_t SystemCoreClock;
 #define configSUPPORT_DYNAMIC_ALLOCATION         1
 #define configUSE_IDLE_HOOK                      0
 #define configUSE_TICK_HOOK                      0
+/* Stack overflow detection.  Method 2 walks the stack from the high
+ * address down looking for the 0xa5a5a5a5 pattern FreeRTOS fills
+ * newly created stacks with; if the live stack pointer is below the
+ * lowest pattern instance, a task has overflowed.  Cost: a few cycles
+ * per context switch.  Required for any of the size-sensitive tasks
+ * (GUI 8 KB / Comm 4 KB / Config flash-write 2 KB) to fail loudly
+ * rather than silently corrupt a sibling task's stack. */
+#define configCHECK_FOR_STACK_OVERFLOW           2
+/* Malloc-failure hook: surfaces pvPortMalloc() returning NULL, which
+ * otherwise would just look like a mutex/queue returning NULL.
+ * Together with stack overflow, the two cover almost all "mysterious
+ * system hang" failure modes. */
+#define configUSE_MALLOC_FAILED_HOOK             1
 #define configCPU_CLOCK_HZ                       ( SystemCoreClock )
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )

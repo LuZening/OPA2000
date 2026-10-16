@@ -6,9 +6,16 @@
 #include "gui.h"
 #include "lv_port_disp.h"
 #include <math.h>
+/* protection.h is needed OUTSIDE the LVGL_SIM guard: alert_dismiss_cb()
+ * calls protection_clear() so that dismissing the popup actually releases
+ * the fault latch.  That header only declares prototypes plus the
+ * protection_get_fault_string() helper - no HAL or hardware dependency -
+ * so it is safe in the simulator build too. */
+#include "protection.h"
 #ifndef LVGL_SIM
 #include "comm.h"
 #include "config.h"
+#include "radio_band.h"
 #include "touch.h"
 #include "power_control.h"
 #include "boot.h"
@@ -234,10 +241,19 @@ enum {
     STR_POWEROFF,       /* 关机 */
     STR_POWEROFF_ASK,   /* 确认关机？ */
     STR_SAVING,         /* 保存中… */
+    /* --- alerts that protection.c can raise but had no string ---
+     * ALERT_NTC_OVERHEAT / ALERT_VBIAS_FAULT were previously unmapped and
+     * fell through to the generic "警报" / "Alert". Appended at the end so
+     * the existing indices (and STR_COUNT) stay put. */
+    STR_NTC_OVERHEAT,   /* 核心温度过高 */
+    STR_VBIAS_FAULT,    /* PA 偏置异常 */
+    STR_FAN_FAULT,      /* 风扇异常 (占位，未接线) */
 };
 
-/* Number of entries in gui_strings[][].  STR_COUNT must stay last. */
-#define STR_COUNT (STR_SAVING + 1)
+/* Number of entries in gui_strings[][].  STR_COUNT must stay last - it
+ * anchors to the enum's final value, so adding a string above it is
+ * enough to grow the table with no second edit here. */
+#define STR_COUNT (STR_FAN_FAULT + 1)
 
 /* Multi-language strings.  Row 0 = Chinese, row 1 = English.
  * Index order must match the enum above. */
@@ -255,6 +271,8 @@ static const char* gui_strings[2][STR_COUNT] = {
         "传感器检查", "自动", "保存",
         "发射", "反射", "协议", "未连接", "已连接", "波段", "温度单位", "摄氏度 °C", "华氏度 °F",
         "关机", "确认关机？", "保存中…",
+        "核心温度过高", "PA 偏置异常",
+        "风扇异常",
     },
     /* English */
     {
@@ -269,6 +287,8 @@ static const char* gui_strings[2][STR_COUNT] = {
         "Sensor Inspect", "Auto", "Save",
         "FWD", "REV", "Protocol", "No link", "Linked", "Band", "Temp Unit", "Celsius \u00B0C", "Fahrenheit \u00B0F",
         "Poweroff", "Power off now?", "Saving...",
+        "Core Overheat", "PA Bias Fault",
+        "Fan Fault",
     }
 };
 
@@ -332,9 +352,15 @@ static lv_obj_t *lbl_protocol;
 
 /* Calibration state */
 #define CAL_POINT_COUNT 5
+
+/*!< 防连点：记下标定点后锁这么久（毫秒）。按住不放时采样每 10 ms 就来一个
+ *  新样本，不锁的话 5 个点会在 50 ms 内记满。减法写法对 tick 回绕安全。 */
+#define CAL_LOCKOUT_MS 200U
+
 static uint8_t cal_state = 0;        /* 0=idle, 1=showing point, 2=results */
 static uint8_t cal_point_idx = 0;
 static lv_obj_t *cal_container = NULL;
+static uint32_t s_cal_lockout_tick = 0U;   /*!< 上次记点的时刻 */
 
 /* Top-of-screen debug line.  On firmware build this shows the detected
  * touch driver + key boot-time flags; on the PC simulator it shows the
@@ -688,7 +714,7 @@ static void gui_create_main_screen(void)
 
     /* Power value uses the same size as the band text so the numeric column
      * does not overpower the title. */
-    val_fwd = make_label(c_fwd, "0W", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_24);
+    val_fwd = make_label(c_fwd, "0W", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_16);
     lv_obj_align(val_fwd, NULL, LV_ALIGN_IN_TOP_RIGHT, -8, 0);
 
     bar_fwd = make_bar(c_fwd, 6, 30, HOR_RES - 2 * MARGIN_X - 12, 20, BAR_MAX_FWD);
@@ -711,13 +737,13 @@ static void gui_create_main_screen(void)
 
     lbl_ref_title = make_label(c_ref, gui_get_string(STR_REF_POWER),
                                cell_pad, 2, LV_COLOR_WHITE, &MyCJK_16);
-    val_ref = make_label(c_ref, "0W", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_24);
+    val_ref = make_label(c_ref, "0W", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_16);
     lv_obj_align(val_ref, NULL, LV_ALIGN_IN_TOP_RIGHT, -cell_pad, 0);
     bar_ref = make_bar(c_ref, cell_pad, 22, half_w - 2 * cell_pad - 2, 18, BAR_MAX_REF);
 
     lbl_swr_title = make_label(c_swr, gui_get_string(STR_SWR),
                                cell_pad, 2, LV_COLOR_WHITE, &MyCJK_16);
-    val_swr = make_label(c_swr, "1.0", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_24);
+    val_swr = make_label(c_swr, "1.0", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_16);
     lv_obj_align(val_swr, NULL, LV_ALIGN_IN_TOP_RIGHT, -cell_pad, 0);
     bar_swr = make_bar(c_swr, cell_pad, 22, half_w - 2 * cell_pad - 2, 18, BAR_MAX_SWR);
 
@@ -1339,8 +1365,106 @@ static void gui_create_cal_screen(void)
 }
 
 /*============================================================================
+ *  LVGL 触屏输入设备（indev）
+ *
+ *  不注册 indev，LVGL 就根本不会去读触摸，点击对任何控件都不起作用 ——
+ *  界面能画、能刷新，但点不动。
+ *
+ *  read_cb 由 LVGL 在 lv_task_handler() 内部调用（也就是 gui_tick() 里
+ *  那一处），每个 tick 一次。它只读 touch.c 发布的 volatile 快照，既不碰
+ *  I2C 也不阻塞——采样节奏由 touch_process() 与 I2C 中断决定，LVGL 只是
+ *  消费者。这也是为什么 DMA 那一层改成非阻塞之后界面能跟上。
+ *
+ *  范式照 OPA1000（Code/Src/LVGL_GUI.c 的 lvGetTouchscreenXY），同样的
+ *  LVGL v7 API：
+ *      lv_indev_drv_init / .type / .read_cb / lv_indev_drv_register
+ *  OPA1000 还注册了旋钮（LV_INDEV_TYPE_ENCODER），本项目无旋钮，略。
+ *==========================================================================*/
+
+/* 整块只在固件构建：PC 模拟器没有 touch.c（依赖 STM32 HAL），由
+ * LVGL.Simulator.cpp 自己的输入模拟驱动 indev。见 gui_indev_register()
+ * 的 @note。 */
+#ifndef LVGL_SIM
+
+/*!< LVGL 输入设备描述符与句柄。static：只在本文件用。 */
+static lv_indev_drv_t s_indev_drv;
+static lv_indev_t    *s_indev_touch = NULL;
+
+/*!< 最近一次**真正取到**的样本，喂给 LVGL 用。
+ *
+ *  LVGL v7 的 read_cb 只能填 data->point / data->state，没有"这帧没新
+ *  数据"的表达方式（lv_indev_data_t 里只有 continue_reading，而它是用来
+ *  让 LVGL 继续问下一路设备的，不是"我无数据"）。所以驱动必须把当前状态
+ *  一直喂回去，于是就得在本地留一份缓存：touch_take_sample() 返回 false
+ *  时就沿用上一帧的值，而不是重读快照或清零。
+ *
+ *  只有 GUI 任务会碰这三个变量（read_cb 由 lv_task_handler() 在 gui_tick()
+ *  里调用，而 gui_tick() 已持有 gui 锁），所以不需要 volatile 或加锁。 */
+static uint16_t s_indev_x  = 0U;
+static uint16_t s_indev_y  = 0U;
+static bool     s_indev_pr = false;
+
+/**
+ * @brief LVGL 读取触摸回调。
+ *
+ * LVGL v7 的签名：填 data->point / data->state。返回值恒为 false——本项目
+ * 只有一路输入设备，不需要 LVGL 接着去轮询别的设备。
+ */
+static bool gui_indev_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+{
+    TouchPointType tp;
+
+    (void)drv;
+
+    if (data == NULL) {
+        return false;
+    }
+
+    /* LVGL 每 tick 调一次这里，而采样是 10 ms 一次——两个周期不同频，
+     * 绝大多数 tick 拿到的都是同一份样本。所以用 touch_take_sample()：
+     * 没有新样本时它返回 false，data 保持**上一帧的取值不变**。
+     *
+     * 这一点很关键：LVGL v7 的 read_cb 没有"我这帧没数据"的表达方式（只有
+     * continue_reading），驱动必须把当前状态一直喂回去。因此这里维护一份
+     * 缓存，只有真拿到新样本才更新——既能避免反复上报同一个历史值，也不
+     * 依赖 LVGL 内部的去重实现。范式同 OPA1000 的 lvGetTouchscreenXY
+     * （main.c），那里是 TS_touched 取走即清。
+     */
+    if (touch_take_sample(&tp)) {
+        s_indev_x = tp.x;
+        s_indev_y = tp.y;
+        s_indev_pr = tp.pressed;
+    }
+
+    /* 按下与抬起都要填坐标：LVGL 靠 state 判断这一帧算不算"按下"，而拖动
+     * 与松手判断依赖最后一帧的坐标。把坐标清零反而会让控件在抬手瞬间收到
+     * 一次跳到 (0,0) 的坐标，造成误点击。 */
+    data->point.x = s_indev_x;
+    data->point.y = s_indev_y;
+    data->state   = s_indev_pr ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+
+    return false;
+}
+
+/**
+ * @brief 注册触摸输入设备。gui_init() 里调用一次。
+ *
+ * 失败时 s_indev_touch 保持 NULL：gui_tick() 照样跑，只是界面点不动。这
+ * 比在初始化阶段直接死掉好——GUI 失去输入是能看见的状态，panic 不是。
+ */
+static void gui_indev_register(void)
+{
+    lv_indev_drv_init(&s_indev_drv);
+    s_indev_drv.type    = LV_INDEV_TYPE_POINTER;
+    s_indev_drv.read_cb = gui_indev_read_cb;
+    s_indev_touch       = lv_indev_drv_register(&s_indev_drv);
+}
+
+#endif /* !LVGL_SIM */
+
+/*============================================================================
  * Public Functions
- *============================================================================*/
+ *==========================================================================*/
 
 void gui_init(void)
 {
@@ -1366,6 +1490,15 @@ void gui_init(void)
     gui_create_main_screen();
     lv_scr_load(main_screen);
     current_screen = 0;
+
+#ifndef LVGL_SIM
+    /* Register the touch input device.  Must come after lv_init() (LVGL
+     * has to exist) but the exact position relative to the screen build
+     * does not matter - lv_indev_drv_register() just adds an entry to
+     * LVGL's indev list, which lv_task_handler() walks from its first call
+     * in gui_tick(). */
+    gui_indev_register();
+#endif
 }
 
 void gui_start(void)
@@ -1425,28 +1558,108 @@ void gui_update_display(void)
     gui_unlock();
 }
 
+/*============================================================================
+ *  保护告警弹窗
+ *==========================================================================*/
+
+/**
+ * @brief Dismiss 按钮的回调。
+ *
+ * 关键：这里**必须**调 protection_clear()，不能只调 gui_dismiss_alert()。
+ * 后者只删控件，不动 protection.c 里的锁存——那样会出现更糟的状态：
+ * 弹窗关了，但 s_protection_active 仍是 true，下一次 protection_check()
+ * 立刻重新触发，弹窗反复弹出，而且 g_allow_rf 永远是 false，操作员
+ * 再也发射不了。
+ *
+ * protection_clear() 一次性做四件事：清锁存、拉低 PB13（通知 RF 板保护
+ * 已解除）、停蜂鸣器、清 g_alert_flag。g_allow_rf 保持 false —— 那是设计
+ * 意图：操作员必须显式重跑一次 IM 零点标定才能重新武装射频。
+ *
+ * 不在 LVGL 回调里直接删 msgbox（LVGL 正在遍历这棵树，删了就悬空），
+ * 由 GUI 任务的泵去关——见 gui_dismiss_alert() 的调用点。
+ */
+static void alert_dismiss_cb(lv_obj_t *obj, lv_event_t e)
+{
+    (void)obj;
+
+    if (e != LV_EVENT_CLICKED) {
+        return;
+    }
+    protection_clear();
+}
+
 void gui_show_alert(AlertType alert_type)
 {
-    /* Called from the protect / comm / monitor tasks after a fault, NOT
-     * from an ISR (the actual fault ISR only sets g_alert_flag - see the
-     * concurrency note in gui.h).  Must take the lock. */
+    /* Called from the GUI task pump, NOT from an ISR: the fault path only
+     * sets g_alert_flag (see protection_trigger_locked() and the "no gui_*
+     * from ISR" rule in gui.h).  Must take the lock. */
     gui_lock();
+
+    /* Re-entrancy guard: one popup per fault.  protection_trigger_locked()
+     * already suppresses repeat triggers until cleared, but a stray second
+     * call here would otherwise leak the previous msgbox. */
+    if (alert_msgbox != NULL) {
+        gui_unlock();
+        return;
+    }
+
+    /* Text.  All eight causes are mapped - ALERT_NTC_OVERHEAT and
+     * ALERT_VBIAS_FAULT used to fall through to the generic STR_ALERT,
+     * which protection_get_fault_string() in protection.c does handle, so
+     * the two files disagreed about what the operator should be told. */
     const char *alert_text;
     switch (alert_type) {
-        case ALERT_SWR_HIGH:          alert_text = gui_get_string(STR_SWR_HIGH); break;
-        case ALERT_REFLECT_POWER_HIGH: alert_text = gui_get_string(STR_REF_HIGH); break;
-        case ALERT_CURRENT_HIGH:      alert_text = gui_get_string(STR_CURRENT_HIGH); break;
-        case ALERT_HARDWARE_FAULT:    alert_text = gui_get_string(STR_HARDWARE_FAULT); break;
-        case ALERT_OVERDRIVE:         alert_text = gui_get_string(STR_OVERDRIVE); break;
-        case ALERT_FREQ_MISMATCH:     alert_text = gui_get_string(STR_FREQ_MISMATCH); break;
-        default:                      alert_text = gui_get_string(STR_ALERT); break;
+        case ALERT_SWR_HIGH:            alert_text = gui_get_string(STR_SWR_HIGH); break;
+        case ALERT_REFLECT_POWER_HIGH:  alert_text = gui_get_string(STR_REF_HIGH); break;
+        case ALERT_CURRENT_HIGH:        alert_text = gui_get_string(STR_CURRENT_HIGH); break;
+        case ALERT_HARDWARE_FAULT:      alert_text = gui_get_string(STR_HARDWARE_FAULT); break;
+        case ALERT_OVERDRIVE:           alert_text = gui_get_string(STR_OVERDRIVE); break;
+        case ALERT_FREQ_MISMATCH:       alert_text = gui_get_string(STR_FREQ_MISMATCH); break;
+        case ALERT_NTC_OVERHEAT:        alert_text = gui_get_string(STR_NTC_OVERHEAT); break;
+        case ALERT_VBIAS_FAULT:         alert_text = gui_get_string(STR_VBIAS_FAULT); break;
+        case ALERT_FAN_FAULT:           alert_text = gui_get_string(STR_FAN_FAULT); break;
+        default:                        alert_text = gui_get_string(STR_ALERT); break;
     }
+
+    /* static: lv_msgbox_add_btns() keeps the pointer, so the array has to
+     * outlive this function (see CLAUDE.md "LVGL String Lifetime"). */
+    static const char *btn_txts[] = { NULL, "" };   /* filled below */
+
     alert_msgbox = lv_msgbox_create(main_screen, NULL);
     lv_msgbox_set_text(alert_msgbox, alert_text);
-    static const char *btn_txts[] = {"Dismiss", ""};
+
+    /* Button label is language-dependent, like the other popups in this
+     * file (show_language_selector etc.) - "解除" reads better than a bare
+     * "Dismiss" in Chinese. */
+    btn_txts[0] = gui_get_string(STR_DISMISS);
     lv_msgbox_add_btns(alert_msgbox, btn_txts);
     lv_obj_set_size(alert_msgbox, 280, 110);
     lv_obj_align(alert_msgbox, main_screen, LV_ALIGN_CENTER, 0, 0);
+
+    /* Style: without an explicit font the CJK glyphs render as boxes, and
+     * the default msgbox background does not match the rest of the UI. */
+    lv_obj_set_style_local_text_color(alert_msgbox, LV_MSGBOX_PART_BG,
+                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(alert_msgbox, LV_MSGBOX_PART_BG,
+                                      LV_STATE_DEFAULT, &MyCJK_12);
+    lv_obj_set_style_local_bg_color(alert_msgbox, LV_MSGBOX_PART_BG,
+                                     LV_STATE_DEFAULT, LV_COLOR_BLUE);
+
+    lv_obj_t *btnm = lv_msgbox_get_btnmatrix(alert_msgbox);
+    lv_obj_set_style_local_text_color(btnm, LV_BTNMATRIX_PART_BTN,
+                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(btnm, LV_BTNMATRIX_PART_BTN,
+                                     LV_STATE_DEFAULT, &MyCJK_12);
+    lv_obj_set_style_local_bg_color(btnm, LV_BTNMATRIX_PART_BTN,
+                                     LV_STATE_DEFAULT, LV_COLOR_MAKE(0, 160, 225));
+    lv_obj_set_style_local_border_color(btnm, LV_BTNMATRIX_PART_BTN,
+                                         LV_STATE_DEFAULT, LV_COLOR_GRAY);
+    lv_obj_set_style_local_radius(btnm, LV_BTNMATRIX_PART_BTN,
+                                   LV_STATE_DEFAULT, 0);
+
+    /* The click that ends it.  Without this the button is decorative. */
+    lv_obj_set_event_cb(alert_msgbox, alert_dismiss_cb);
+
     alert_active = true;
     gui_unlock();
 }
@@ -1527,6 +1740,10 @@ void gui_show_calibration(void)
     cal_state = 1;
     cal_point_idx = 0;
     memset(cal_data, 0, sizeof(cal_data));
+    /* 清掉连点锁定：重新进入校准（含标定失败后点 Retry）时不该被上一轮
+     * 残留的窗口挡住第一下操作。减法写法对回绕安全——即使 now 曾回绕到比
+     * 旧值小，(now - old) 是一个巨大的正数，判定自然通过。 */
+    s_cal_lockout_tick -= CAL_LOCKOUT_MS;
 #ifndef LVGL_SIM
     touch_calibrate_start();
     /* The calibration screen is the usual FIRST thing the operator sees
@@ -1561,27 +1778,34 @@ void gui_process_calibration(void)
         return;
     }
 
-    /* Single entry point for whichever controller touch_init() found
-     * (GT911 capacitive or NS2009 resistive).  We want the RAW panel
-     * coordinates here, so we read before any calibration transform is
-     * applied - that is exactly what touch_get_position() returns,
-     * because touch.c only applies g_config.touch.* inside
-     * touch_process() when calibrated != 0 and the calibration screen
-     * keeps g_config.touch.calibrated at 0 until the user accepts. */
-    TouchPointType tp;
-    if (touch_get_position(&tp) && tp.pressed) {
-        uint8_t idx = cal_point_idx;
-        if (idx >= CAL_POINT_COUNT) {
+    /* 防连点锁定：见 CAL_LOCKOUT_MS。用 lv_tick_get() 作时基（本文件其它
+     * 地方亦然），单位毫秒。检查完立即返回，不占 CPU、不破坏 10 ms 节拍。 */
+    {
+        uint32_t now = lv_tick_get();
+
+        if ((now - s_cal_lockout_tick) < CAL_LOCKOUT_MS) {
             gui_unlock();
             return;
         }
 
-        cal_data[idx].raw_x = tp.x;
-        cal_data[idx].raw_y = tp.y;
-        cal_data[idx].screen_x = cal_targets[idx].x;
-        cal_data[idx].screen_y = cal_targets[idx].y;
+        /* 要原始坐标：标定期间 g_config.touch.calibrated 仍为 0，所以
+         * touch_take_sample() 返回的未经变换。 */
+        TouchPointType tp;
+        if (touch_take_sample(&tp) && tp.pressed) {
+            uint8_t idx = cal_point_idx;
+            if (idx >= CAL_POINT_COUNT) {
+                gui_unlock();
+                return;
+            }
 
-        gui_calibration_advance();
+            cal_data[idx].raw_x = tp.x;
+            cal_data[idx].raw_y = tp.y;
+            cal_data[idx].screen_x = cal_targets[idx].x;
+            cal_data[idx].screen_y = cal_targets[idx].y;
+
+            s_cal_lockout_tick = now;   /* 立刻上锁，丢掉按住期间的余波 */
+            gui_calibration_advance();
+        }
     }
 #endif
     gui_unlock();
@@ -1906,7 +2130,10 @@ static void show_language_selector(void)
  * Screen Settings Popup
  *============================================================================*/
 
-static const char *screen_btns[] = {"Touch Cal", "\n", "Cancel", ""};
+static const char *screen_btns[] = {"Touch Cal", "Radio Baud", "\n", "Cancel", ""};
+
+static void show_screen_radio_baud(void);
+static void show_screen_cat_baud(void);
 
 static void screen_settings_cb(lv_obj_t *obj, lv_event_t e)
 {
@@ -1915,6 +2142,11 @@ static void screen_settings_cb(lv_obj_t *obj, lv_event_t e)
         if (btn_id == 0) {  /* Touch Calibration */
             lv_obj_del_async(obj);
             gui_show_calibration();
+            return;
+        }
+        if (btn_id == 1) {  /* Radio Baud */
+            lv_obj_del_async(obj);
+            show_screen_radio_baud();
             return;
         }
         lv_obj_del_async(obj);
@@ -1969,6 +2201,253 @@ static void coupler_sel_cb(lv_obj_t *obj, lv_event_t e)
             gui_show_coupler_cal(btn_id + 1);
         }
     }
+}
+
+/*============================================================================
+ * Baud-rate Selection Popups
+ *============================================================================*/
+
+/* 5 个标准 CAT 波特率（1200 / 2400 / 4800 / 9600 / 19200 / 38400 / 57600 /
+ * 115200）。显示用 lv_spinbox 而不是 btnmatrix：操作员点 +/- 按钮
+ * 在合法值列表里循环，title 区实时显示当前值，"Set" 按钮把当前值
+ * 写回 g_config 并标 dirty（立即生效；comm 任务下一次循环调
+ * radio_uart_set_baud 或 pc_uart_set_baud 把值写到对应 UART），"Back"
+ * 关闭弹窗而不保存。 */
+static const int32_t k_baud_table[] = {
+    1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200
+};
+#define BAUD_TABLE_LEN  ((int32_t)(sizeof(k_baud_table)/sizeof(k_baud_table[0])))
+
+/* Returns the index of the table entry that matches `baud`, or 0 if
+ * no exact match (the caller treats 0 as "use the spinner's first
+ * legal value" - the spinner only ever shows table entries, so this
+ * is only a cold-start edge case).  Currently unused since the
+ * roller pre-select uses an inline loop; kept commented for the
+ * next reader who needs to look up an index. */
+#if 0
+static int32_t baud_table_index(uint32_t baud)
+{
+    for (int32_t i = 0; i < BAUD_TABLE_LEN; i++) {
+        if ((uint32_t)k_baud_table[i] == baud) return i;
+    }
+    return 0;
+}
+#endif
+
+/* Build a roller popup.  `title_zh / title_en` label the heading,
+ * `field` is the destination (radio or PC).  The popup owns its
+ * scratch value (s_pending_baud) and only commits it to `field` /
+ * g_config when the operator presses Save.  Back discards the
+ * scratch - which is the whole point of adding the Save button:
+ * scrolling the roller around while exploring the table must NOT
+ * touch g_config or schedule a flash write per sample.
+ *
+ * Layout:
+ *   +----------------------------+
+ *   | <title>                    |
+ *   |                            |
+ *   |   <prev>                   |
+ *   |   <sel>    <-- selected    |
+ *   |   <next>                   |
+ *   |                            |
+ *   |  [Save]      [Back]        |
+ *   +----------------------------+
+ */
+static lv_obj_t *baud_spinner_popup = NULL;
+static lv_obj_t *baud_spinner_roller = NULL;
+static volatile uint32_t *baud_spinner_field = NULL;
+static lv_obj_t *baud_spinner_title = NULL;
+
+/* Scratch value updated only on Save.  Kept in sync with the current
+ * g_config value at popup-open time; roller events update this, but
+ * never touch g_config. */
+static uint32_t s_pending_baud = 0U;
+
+/* Save button - copy the scratch value into g_config, mark the menu
+ * dirty so the config task flushes to flash, and close. */
+static void baud_roller_save_cb(lv_obj_t *obj, lv_event_t e)
+{
+    (void)obj;
+    if (e != LV_EVENT_CLICKED) return;
+    if (!baud_spinner_popup || !baud_spinner_field) return;
+
+#ifndef LVGL_SIM
+    /* Commit the staged value.  The comm task will reprogram the UART
+     * within the next 10 ms tick (it compares against last_applied_*_baud)
+     * and the config task flushes g_config to flash on its 1 s window. */
+    *baud_spinner_field = s_pending_baud;
+    gui_menu_mark_dirty();
+#else
+    (void)baud_spinner_field;
+#endif
+
+    lv_obj_del_async(baud_spinner_popup);
+    baud_spinner_popup  = NULL;
+    baud_spinner_roller = NULL;
+    baud_spinner_field  = NULL;
+    baud_spinner_title  = NULL;
+}
+
+/* Back button - close without persisting.  s_pending_baud is
+ * discarded along with the popup. */
+static void baud_roller_back_cb(lv_obj_t *obj, lv_event_t e)
+{
+    (void)obj;
+    if (e != LV_EVENT_CLICKED) return;
+    if (!baud_spinner_popup) return;
+    lv_obj_del_async(baud_spinner_popup);
+    baud_spinner_popup  = NULL;
+    baud_spinner_roller = NULL;
+    baud_spinner_field  = NULL;
+    baud_spinner_title  = NULL;
+}
+
+/* Roller value-changed handler.  Only updates s_pending_baud; the
+ * config field is touched exclusively by the Save button.  Scrolling
+ * the roller is therefore free (no flash writes) - the operator can
+ * sample the whole table without paying a write per tick. */
+static void baud_roller_event_cb(lv_obj_t *obj, lv_event_t e)
+{
+    (void)obj;
+    if (e != LV_EVENT_VALUE_CHANGED) return;
+    if (!baud_spinner_roller) return;
+    uint16_t sel = lv_roller_get_selected(baud_spinner_roller);
+    if (sel >= BAUD_TABLE_LEN) return;
+    s_pending_baud = (uint32_t)k_baud_table[sel];
+}
+
+static void show_baud_spinbox(const char *title_zh,
+                              const char *title_en,
+                              volatile uint32_t *field)
+{
+    /* Tear down any previous roller instance so we never end up with
+     * a stale popup when the operator enters twice. */
+    if (baud_spinner_popup) {
+        lv_obj_del_async(baud_spinner_popup);
+        baud_spinner_popup = NULL;
+    }
+
+    lv_obj_t *scr = lv_scr_act();
+    baud_spinner_popup = lv_obj_create(scr, NULL);
+    lv_obj_set_size(baud_spinner_popup, 280, 200);
+    lv_obj_align(baud_spinner_popup, scr, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_local_bg_color(baud_spinner_popup, LV_OBJ_PART_MAIN,
+                                    LV_STATE_DEFAULT, COLOR_BG);
+    lv_obj_set_style_local_border_width(baud_spinner_popup, LV_OBJ_PART_MAIN,
+                                         LV_STATE_DEFAULT, 2);
+    lv_obj_set_style_local_border_color(baud_spinner_popup, LV_OBJ_PART_MAIN,
+                                         LV_STATE_DEFAULT, LV_COLOR_BLUE);
+
+    baud_spinner_field = field;
+    /* Seed the scratch from the current g_config so the roller's
+     * initial selection matches reality and a no-op Save is a real
+     * no-op. */
+    s_pending_baud = *field;
+
+    /* Title (yellow).  CJK string "Radio 波特率" / "PC 波特率" is wider
+     * than the popup width / 2, so we use MyCJK_12 (smaller) and
+     * LV_LABEL_LONG_CROP so a too-wide title clips inside the popup
+     * instead of overflowing the box. */
+    baud_spinner_title = lv_label_create(baud_spinner_popup, NULL);
+    lv_label_set_text(baud_spinner_title,
+                      (gui_get_lang_index() == 0) ? title_zh : title_en);
+    lv_label_set_long_mode(baud_spinner_title, LV_LABEL_LONG_CROP);
+    lv_obj_set_width(baud_spinner_title, 260);
+    lv_obj_align(baud_spinner_title, baud_spinner_popup, LV_ALIGN_IN_TOP_MID,
+                 0, 4);
+    lv_obj_set_style_local_text_color(baud_spinner_title, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_YELLOW);
+    lv_obj_set_style_local_text_font(baud_spinner_title, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &MyCJK_12);
+
+    /* Build the roller option list out of k_baud_table[].  Same
+     * "\n"-separated format OPA1000 uses (LVGL_items.c optsRollerBaudrates). */
+    static char opts[BAUD_TABLE_LEN * 8];
+    opts[0] = '\0';
+    for (int32_t i = 0; i < BAUD_TABLE_LEN; i++) {
+        char tmp[12];
+        snprintf(tmp, sizeof tmp, "%lu", (unsigned long)k_baud_table[i]);
+        if (i > 0) strncat(opts, "\n", sizeof(opts) - strlen(opts) - 1);
+        strncat(opts, tmp, sizeof(opts) - strlen(opts) - 1);
+    }
+
+    baud_spinner_roller = lv_roller_create(baud_spinner_popup, NULL);
+    /* visible row count = 3 -> one row above the selected, the
+     * selected, one row below.  anim time 0 so the roller snaps
+     * immediately on every keystroke / touch. */
+    lv_roller_set_visible_row_count(baud_spinner_roller, 3);
+    lv_roller_set_anim_time(baud_spinner_roller, 0);
+    lv_roller_set_options(baud_spinner_roller, opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_align(baud_spinner_roller, LV_LABEL_ALIGN_CENTER);
+    lv_obj_set_size(baud_spinner_roller, 240, 80);
+    lv_obj_align(baud_spinner_roller, baud_spinner_popup, LV_ALIGN_CENTER,
+                 0, 14);
+    /* Highlight the selected row.  We use the default LV_ROLLER_PART_BG
+     * + LV_ROLLER_PART_SELECTED styling but tighten the colours to
+     * match the rest of the popup. */
+    lv_obj_set_style_local_bg_color(baud_spinner_roller, LV_ROLLER_PART_BG,
+                                     LV_STATE_DEFAULT,
+                                     LV_COLOR_MAKE(20, 24, 28));
+    lv_obj_set_style_local_text_color(baud_spinner_roller, LV_ROLLER_PART_BG,
+                                      LV_STATE_DEFAULT,
+                                      LV_COLOR_MAKE(160, 170, 180));
+    lv_obj_set_style_local_bg_color(baud_spinner_roller, LV_ROLLER_PART_SELECTED,
+                                     LV_STATE_DEFAULT,
+                                     LV_COLOR_MAKE(0, 90, 130));
+    lv_obj_set_style_local_text_color(baud_spinner_roller, LV_ROLLER_PART_SELECTED,
+                                      LV_STATE_DEFAULT,
+                                      LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(baud_spinner_roller, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &lv_font_montserrat_16);
+
+    /* Pre-select the current baud.  If it is not in the table, fall
+     * back to the closest lower entry. */
+    int32_t start_idx = 0;
+    for (int32_t i = 0; i < BAUD_TABLE_LEN; i++) {
+        if ((uint32_t)k_baud_table[i] == *field) { start_idx = i; break; }
+        if ((uint32_t)k_baud_table[i] < *field) start_idx = i;
+    }
+    lv_roller_set_selected(baud_spinner_roller, start_idx, LV_ANIM_OFF);
+
+    /* The roller fires VALUE_CHANGED on every selection but only
+     * updates s_pending_baud; the config field is touched exclusively
+     * by the Save button below.  Scrolling is free. */
+    lv_obj_set_event_cb(baud_spinner_roller, baud_roller_event_cb);
+
+    /* Save / Back row at the bottom of the popup. */
+    lv_obj_t *save_btn = lv_btn_create(baud_spinner_popup, NULL);
+    lv_obj_set_size(save_btn, 80, 30);
+    lv_obj_align(save_btn, baud_spinner_popup, LV_ALIGN_IN_BOTTOM_LEFT, 20, -6);
+    lv_obj_t *save_lbl = lv_label_create(save_btn, NULL);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_local_text_font(save_lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &MyCJK_12);
+    lv_obj_set_event_cb(save_btn, baud_roller_save_cb);
+
+    lv_obj_t *back_btn = lv_btn_create(baud_spinner_popup, NULL);
+    lv_obj_set_size(back_btn, 80, 30);
+    lv_obj_align(back_btn, baud_spinner_popup, LV_ALIGN_IN_BOTTOM_RIGHT,
+                 -20, -6);
+    lv_obj_t *back_lbl = lv_label_create(back_btn, NULL);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_local_text_font(back_lbl, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT, &MyCJK_12);
+    lv_obj_set_event_cb(back_btn, baud_roller_back_cb);
+}
+
+/* Public entry points used by the Band Communication popup.  "Radio
+ * Baud" drives g_config.radio_baud_rate (UART4 -> transceiver CAT),
+ * "CAT Baud" drives g_config.pc_baud_rate (LPUART1 -> PC CAT link). */
+static void show_screen_radio_baud(void)
+{
+    show_baud_spinbox("Radio 波特率", "Radio Baud",
+                      &g_config.radio_baud_rate);
+}
+
+static void show_screen_cat_baud(void)
+{
+    show_baud_spinbox("PC 波特率", "CAT Baud",
+                      &g_config.pc_baud_rate);
 }
 
 static void show_coupler_selector(void)
@@ -2447,6 +2926,13 @@ static lv_obj_t *si_overlay = NULL;
 static lv_obj_t *si_raw_labels[SI_ROW_COUNT];
 static lv_obj_t *si_val_labels[SI_ROW_COUNT];
 
+/* ADC2 has 2 regular ranks (IF PA / IF RADIO) plus 3 injected ranks (core
+ * NTC, aux NTC, MCU internal).  The Sensor Inspect overlay shows all five
+ * so the operator can verify both ADCs at once. */
+#define SI_ADC2_ROW_COUNT  5U
+static lv_obj_t *si_adc2_raw_labels[SI_ADC2_ROW_COUNT];
+static lv_obj_t *si_adc2_val_labels[SI_ADC2_ROW_COUNT];
+
 static void si_close_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
@@ -2455,42 +2941,123 @@ static void si_close_cb(lv_obj_t *obj, lv_event_t e)
     }
 }
 
-/* Build the sensor-inspect table — all text centered.
- * Rows are indexed by ADC1_RANK_* (see opa2000.h). */
-static void si_build_table(lv_obj_t *parent, lv_coord_t x, int count)
+/* Render one channel row at vertical position y on parent.  Shared by
+ * the ADC1 and ADC2 sub-tables so the column geometry stays consistent
+ * across sections.  raw_lbl / val_lbl are stored so the live update
+ * loop can rewrite them every tick. */
+static void si_draw_row(lv_obj_t *parent,
+                        lv_coord_t y,
+                        const char *name, const char *adc_txt,
+                        lv_coord_t name_cx, lv_coord_t adc_cx,
+                        lv_coord_t raw_cx, lv_coord_t val_cx,
+                        lv_coord_t cw_name, lv_coord_t cw_adc,
+                        lv_coord_t cw_raw,  lv_coord_t cw_val,
+                        lv_obj_t **raw_lbl, lv_obj_t **val_lbl)
 {
-    lv_coord_t hdr_y = 26;
-    lv_coord_t row_h = 20;
-    /* Column widths for centering */
-    const lv_coord_t cw_name = 84, cw_adc = 46, cw_raw = 62, cw_val = 78;
-    lv_coord_t name_cx = x + cw_name / 2;
-    lv_coord_t adc_cx  = x + cw_name + cw_adc / 2;
-    lv_coord_t raw_cx  = x + cw_name + cw_adc + cw_raw / 2;
-    lv_coord_t val_cx  = x + cw_name + cw_adc + cw_raw + cw_val / 2;
+    /* name + adc text labels (static for the lifetime of the overlay) */
+    lv_obj_t *n = lv_label_create(parent, NULL);
+    lv_label_set_text(n, name);
+    lv_obj_set_width(n, cw_name);
+    lv_obj_set_pos(n, name_cx - cw_name / 2, y);
+    lv_label_set_align(n, LV_LABEL_ALIGN_CENTER);
+    lv_obj_set_style_local_text_color(n, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(n, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &lv_font_montserrat_12);
 
-    /* Helper: create a centered label */
-#define SI_LABEL(_parent, _text, _cx, _y, _w, _color, _font) \
-    do { \
-        lv_obj_t *l__ = lv_label_create(_parent, NULL); \
-        lv_label_set_text(l__, _text); \
-        lv_obj_set_width(l__, _w); \
-        lv_obj_set_pos(l__, _cx - _w / 2, _y); \
-        lv_label_set_align(l__, LV_LABEL_ALIGN_CENTER); \
-        lv_obj_set_style_local_text_color(l__, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, _color); \
-        lv_obj_set_style_local_text_font(l__, LV_LABEL_PART_MAIN, LV_STATE_DEFAULT, _font); \
-    } while(0)
+    lv_obj_t *a = lv_label_create(parent, NULL);
+    lv_label_set_text(a, adc_txt);
+    lv_obj_set_width(a, cw_adc);
+    lv_obj_set_pos(a, adc_cx - cw_adc / 2, y);
+    lv_label_set_align(a, LV_LABEL_ALIGN_CENTER);
+    lv_obj_set_style_local_text_color(a, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(a, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &lv_font_montserrat_12);
 
-    /* Column title */
-    SI_LABEL(parent, "ADC1", x + 135, 4, 270, LV_COLOR_YELLOW, &MyCJK_12);
+    /* raw + value labels (mutated each tick by gui_update_sensor_inspect) */
+    *raw_lbl = lv_label_create(parent, NULL);
+    lv_label_set_text(*raw_lbl, "---");
+    lv_obj_set_width(*raw_lbl, cw_raw);
+    lv_obj_set_pos(*raw_lbl, raw_cx - cw_raw / 2, y);
+    lv_label_set_align(*raw_lbl, LV_LABEL_ALIGN_CENTER);
+    lv_obj_set_style_local_text_color(*raw_lbl, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(*raw_lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &lv_font_montserrat_16);
 
-    /* Header row */
+    *val_lbl = lv_label_create(parent, NULL);
+    lv_label_set_text(*val_lbl, "---");
+    lv_obj_set_width(*val_lbl, cw_val);
+    lv_obj_set_pos(*val_lbl, val_cx - cw_val / 2, y);
+    lv_label_set_align(*val_lbl, LV_LABEL_ALIGN_CENTER);
+    lv_obj_set_style_local_text_color(*val_lbl, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT, LV_COLOR_YELLOW);
+    lv_obj_set_style_local_text_font(*val_lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &lv_font_montserrat_16);
+}
+
+/* Draw the section title (yellow) and the four-column header (gray).
+ * Reused for the ADC1 and ADC2 tables. */
+static void si_draw_header(lv_obj_t *parent,
+                           lv_coord_t title_y,
+                           lv_coord_t hdr_y,
+                           lv_coord_t x_offset,
+                           const char *title,
+                           lv_coord_t name_cx, lv_coord_t adc_cx,
+                           lv_coord_t raw_cx, lv_coord_t val_cx,
+                           lv_coord_t cw_name, lv_coord_t cw_adc,
+                           lv_coord_t cw_raw,  lv_coord_t cw_val)
+{
+    /* Section title */
+    lv_obj_t *t = lv_label_create(parent, NULL);
+    lv_label_set_text(t, title);
+    lv_obj_set_width(t, 270);
+    lv_obj_set_pos(t, x_offset + 135, title_y);
+    lv_label_set_align(t, LV_LABEL_ALIGN_CENTER);
+    lv_obj_set_style_local_text_color(t, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT, LV_COLOR_YELLOW);
+    lv_obj_set_style_local_text_font(t, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &MyCJK_12);
+
     static const char *hdr[] = {"Name", "ADC", "Raw", "Value"};
     lv_coord_t hcxs[] = {name_cx, adc_cx, raw_cx, val_cx};
     lv_coord_t hws[]  = {cw_name, cw_adc, cw_raw, cw_val};
-    for (int c = 0; c < 4; c++)
-        SI_LABEL(parent, hdr[c], hcxs[c], hdr_y, hws[c], LV_COLOR_GRAY, &MyCJK_12);
+    for (int c = 0; c < 4; c++) {
+        lv_obj_t *l = lv_label_create(parent, NULL);
+        lv_label_set_text(l, hdr[c]);
+        lv_obj_set_width(l, hws[c]);
+        lv_obj_set_pos(l, hcxs[c] - hws[c] / 2, hdr_y);
+        lv_label_set_align(l, LV_LABEL_ALIGN_CENTER);
+        lv_obj_set_style_local_text_color(l, LV_LABEL_PART_MAIN,
+                                           LV_STATE_DEFAULT, LV_COLOR_GRAY);
+        lv_obj_set_style_local_text_font(l, LV_LABEL_PART_MAIN,
+                                          LV_STATE_DEFAULT, &MyCJK_12);
+    }
+}
 
-    /* Short channel names, ordered by ADC1_RANK_* */
+/* Column widths shared by both sections so the two tables line up when
+ * the operator scrolls between them. */
+#define SI_CW_NAME  78
+#define SI_CW_ADC   38
+#define SI_CW_RAW   58
+#define SI_CW_VAL   78
+
+/* ADC1 sub-table — 9 rows, indexed by ADC1_RANK_* (see opa2000.h). */
+static void si_build_adc1_table(lv_obj_t *parent, lv_coord_t x, int count)
+{
+    lv_coord_t hdr_y = 26;
+    lv_coord_t row_h = 16;
+
+    lv_coord_t name_cx = x + SI_CW_NAME / 2;
+    lv_coord_t adc_cx  = x + SI_CW_NAME + SI_CW_ADC / 2;
+    lv_coord_t raw_cx  = x + SI_CW_NAME + SI_CW_ADC + SI_CW_RAW / 2;
+    lv_coord_t val_cx  = x + SI_CW_NAME + SI_CW_ADC + SI_CW_RAW + SI_CW_VAL / 2;
+
+    si_draw_header(parent, 4, hdr_y, x, "ADC1",
+                   name_cx, adc_cx, raw_cx, val_cx,
+                   SI_CW_NAME, SI_CW_ADC, SI_CW_RAW, SI_CW_VAL);
+
     static const char *ch_short[SI_ROW_COUNT] = {
         "RF In",    /* ADC1_RANK_RF_IN    */
         "Current",  /* ADC1_RANK_IM       */
@@ -2508,34 +3075,55 @@ static void si_build_table(lv_obj_t *parent, lv_coord_t x, int count)
 
     for (int i = 0; i < count; i++) {
         lv_coord_t y = hdr_y + 16 + i * row_h;
-
         char adc_txt[8];
         snprintf(adc_txt, sizeof(adc_txt), "INP%d", si_adc1_inp[i]);
-
-        SI_LABEL(parent, ch_short[i],  name_cx, y, cw_name, LV_COLOR_WHITE, &lv_font_montserrat_12);
-        SI_LABEL(parent, adc_txt,      adc_cx,  y, cw_adc,  LV_COLOR_WHITE, &lv_font_montserrat_12);
-
-        si_raw_labels[i] = lv_label_create(parent, NULL);
-        lv_label_set_text(si_raw_labels[i], "---");
-        lv_obj_set_width(si_raw_labels[i], cw_raw);
-        lv_obj_set_pos(si_raw_labels[i], raw_cx - cw_raw / 2, y);
-        lv_label_set_align(si_raw_labels[i], LV_LABEL_ALIGN_CENTER);
-        lv_obj_set_style_local_text_color(si_raw_labels[i], LV_LABEL_PART_MAIN,
-                                           LV_STATE_DEFAULT, LV_COLOR_WHITE);
-        lv_obj_set_style_local_text_font(si_raw_labels[i], LV_LABEL_PART_MAIN,
-                                          LV_STATE_DEFAULT, &lv_font_montserrat_16);
-
-        si_val_labels[i] = lv_label_create(parent, NULL);
-        lv_label_set_text(si_val_labels[i], "---");
-        lv_obj_set_width(si_val_labels[i], cw_val);
-        lv_obj_set_pos(si_val_labels[i], val_cx - cw_val / 2, y);
-        lv_label_set_align(si_val_labels[i], LV_LABEL_ALIGN_CENTER);
-        lv_obj_set_style_local_text_color(si_val_labels[i], LV_LABEL_PART_MAIN,
-                                           LV_STATE_DEFAULT, LV_COLOR_YELLOW);
-        lv_obj_set_style_local_text_font(si_val_labels[i], LV_LABEL_PART_MAIN,
-                                          LV_STATE_DEFAULT, &lv_font_montserrat_16);
+        si_draw_row(parent, y, ch_short[i], adc_txt,
+                    name_cx, adc_cx, raw_cx, val_cx,
+                    SI_CW_NAME, SI_CW_ADC, SI_CW_RAW, SI_CW_VAL,
+                    &si_raw_labels[i], &si_val_labels[i]);
     }
-#undef SI_LABEL
+}
+
+/* ADC2 sub-table — 2 regular ranks (455 kHz IF samples for the PA /
+ * radio paths) and 3 injected ranks (core NTC, aux NTC, MCU internal
+ * temperature).  Channels per OPA2000_H7 固件设计要求.txt sec [ADC2
+ * channel mapping]. */
+static void si_build_adc2_table(lv_obj_t *parent, lv_coord_t x, lv_coord_t y_start)
+{
+    lv_coord_t row_h = 16;
+
+    lv_coord_t name_cx = x + SI_CW_NAME / 2;
+    lv_coord_t adc_cx  = x + SI_CW_NAME + SI_CW_ADC / 2;
+    lv_coord_t raw_cx  = x + SI_CW_NAME + SI_CW_ADC + SI_CW_RAW / 2;
+    lv_coord_t val_cx  = x + SI_CW_NAME + SI_CW_ADC + SI_CW_RAW + SI_CW_VAL / 2;
+
+    lv_coord_t hdr_y = y_start + 22;
+    si_draw_header(parent, y_start, hdr_y, x, "ADC2",
+                   name_cx, adc_cx, raw_cx, val_cx,
+                   SI_CW_NAME, SI_CW_ADC, SI_CW_RAW, SI_CW_VAL);
+
+    /* Two regular ranks first (IF PA, IF RADIO), then three injected
+     * temperature ranks (core NTC, aux NTC, MCU internal).  The "ADC"
+     * column shows the input number; the live update path distinguishes
+     * them by row index 0..4. */
+    static const char *adc2_name[SI_ADC2_ROW_COUNT] = {
+        "PA IF",     /* ADC2_RANK_IF_PA      */
+        "Radio IF",  /* ADC2_RANK_IF_RADIO   */
+        "Core NTC",  /* inj rank 1, INP2     */
+        "Aux NTC",   /* inj rank 2, INP6     */
+        "MCU Temp",  /* inj rank 3, TEMPSENSOR */
+    };
+    static const char *adc2_ch[SI_ADC2_ROW_COUNT] = {
+        "INP0", "INP1", "INP2", "INP6", "TSENSE",
+    };
+
+    for (unsigned i = 0U; i < SI_ADC2_ROW_COUNT; i++) {
+        lv_coord_t y = hdr_y + 16 + (lv_coord_t)i * row_h;
+        si_draw_row(parent, y, adc2_name[i], adc2_ch[i],
+                    name_cx, adc_cx, raw_cx, val_cx,
+                    SI_CW_NAME, SI_CW_ADC, SI_CW_RAW, SI_CW_VAL,
+                    &si_adc2_raw_labels[i], &si_adc2_val_labels[i]);
+    }
 }
 
 static void show_sensor_inspect(void)
@@ -2560,9 +3148,31 @@ static void show_sensor_inspect(void)
     lv_obj_set_style_local_text_font(title, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, &MyCJK_12);
 
-    /* Single ADC1 table — rows follow ADC1_RANK_* order */
-    si_build_table(si_overlay, 6, SI_ROW_COUNT);
+    /* Scrollable page that holds both sub-tables.  272 px tall screen
+     * cannot fit ADC1 (9 rows) + ADC2 (5 rows) at 16 px/row, so the
+     * page grows beyond the overlay and the operator scrolls within
+     * it.  The page sits between the title (top) and the close button
+     * (bottom). */
+    lv_obj_t *si_page = lv_page_create(si_overlay, NULL);
+    lv_obj_set_size(si_page, o_w, o_h - 16 - 30);  /* leave space for close */
+    lv_obj_align(si_page, si_overlay, LV_ALIGN_IN_TOP_MID, 0, 16);
+    lv_page_set_scrollbar_mode(si_page, LV_SCROLLBAR_MODE_AUTO);
+    /* Allow the page background to show the dark overlay color so the
+     * scroll looks seamless. */
+    lv_obj_set_style_local_bg_color(si_page, LV_PAGE_PART_BG,
+                                    LV_STATE_DEFAULT, COLOR_BG);
 
+    /* ADC1 sub-table — rows follow ADC1_RANK_* order. */
+    si_build_adc1_table(si_page, 6, SI_ROW_COUNT);
+
+    /* ADC2 sub-table sits below ADC1.  ADC1 ends at:
+     *   hdr_y (26) + 16 (first row offset) + 9 rows * 16 px
+     *   = 26 + 16 + 144 = 186
+     * leaving a small gap before the ADC2 title.  186 + 6 = 192. */
+    si_build_adc2_table(si_page, 6, 192);
+
+    /* Close button stays on the overlay, anchored to the bottom so it
+     * does not scroll with the tables above. */
     lv_obj_t *close_btn = lv_btn_create(si_overlay, NULL);
     lv_obj_set_size(close_btn, 90, 26);
     lv_obj_align(close_btn, si_overlay, LV_ALIGN_IN_BOTTOM_MID, 0, -3);
@@ -2581,6 +3191,8 @@ void gui_update_sensor_inspect(void)
     gui_lock();
     if (!si_overlay) { gui_unlock(); return; }
     char buf[48];
+
+    /* ADC1 rows. */
     for (unsigned i = 0; i < SI_ROW_COUNT; i++) {
 #ifndef LVGL_SIM
         uint16_t raw = g_adc_data.adc1_raw[i];
@@ -2631,6 +3243,60 @@ void gui_update_sensor_inspect(void)
         snprintf(buf, sizeof(buf), "%s", sim_val[i]);
 #endif
         if (si_val_labels[i]) lv_label_set_text(si_val_labels[i], buf);
+    }
+
+    /* ADC2 rows.  Two regular (IF PA / IF RADIO) plus three injected
+     * (core NTC, aux NTC, MCU internal).  Row index 0 = PA IF, 1 = Radio
+     * IF, 2 = Core NTC, 3 = Aux NTC, 4 = MCU Temp - matches the order
+     * in si_build_adc2_table(). */
+    for (unsigned i = 0; i < SI_ADC2_ROW_COUNT; i++) {
+        uint16_t raw;
+#ifndef LVGL_SIM
+        switch (i) {
+            case 0: raw = g_adc_data.adc2_if_pa_raw;       break;
+            case 1: raw = g_adc_data.adc2_if_radio_raw;    break;
+            case 2: raw = g_adc_data.adc2_inj_ntc_core_raw;break;
+            case 3: raw = g_adc_data.adc2_inj_ntc_aux_raw; break;
+            default:raw = g_adc_data.adc2_inj_tsense_raw;  break;
+        }
+        snprintf(buf, sizeof(buf), "%u", raw);
+        if (si_adc2_raw_labels[i]) lv_label_set_text(si_adc2_raw_labels[i], buf);
+
+        switch (i) {
+            case 0:
+                /* 455 kHz IF samples - no calibrated engineering unit
+                 * yet, show raw code as the engineering value too. */
+                snprintf(buf, sizeof(buf), "%u", raw);
+                break;
+            case 1:
+                snprintf(buf, sizeof(buf), "%u", raw);
+                break;
+            case 2:
+                snprintf(buf, sizeof(buf), "%.1fC",
+                         (float)g_adc_data.ntc_core_tenth_c / 10.0f);
+                break;
+            case 3:
+                snprintf(buf, sizeof(buf), "%.1fC",
+                         (float)g_adc_data.ntc_aux_tenth_c / 10.0f);
+                break;
+            default:
+                snprintf(buf, sizeof(buf), "%.1fC",
+                         (float)g_adc_data.mcu_int_tenth_c / 10.0f);
+                break;
+        }
+#else
+        /* Simulator: synthesise plausible ADC2 codes */
+        static const uint16_t sim_raw[SI_ADC2_ROW_COUNT] = {
+            32500, 31200, 20500, 21500, 17000
+        };
+        snprintf(buf, sizeof(buf), "%u", sim_raw[i]);
+        if (si_adc2_raw_labels[i]) lv_label_set_text(si_adc2_raw_labels[i], buf);
+        static const char *sim_val[SI_ADC2_ROW_COUNT] = {
+            "32500", "31200", "28.5C", "27.0C", "32.4C"
+        };
+        snprintf(buf, sizeof(buf), "%s", sim_val[i]);
+#endif
+        if (si_adc2_val_labels[i]) lv_label_set_text(si_adc2_val_labels[i], buf);
     }
     gui_unlock();
 }
@@ -2691,16 +3357,82 @@ static void show_fan_settings(void)
  * Band Communication Settings Popup
  *============================================================================*/
 
-static const char *band_comm_btns[] = {"ICOM", "Yaesu", "Kenwood", "\n", "Cancel", ""};
+/* Layout, in row-major order:
+ *   row 0: ICOM | Yaesu | Kenwood
+ *   row 1: Auto | Radio Baud | CAT Baud
+ *   row 2: Cancel (full-width)
+ *
+ * Radio Baud pops up the spinner bound to g_config.radio_baud_rate
+ * (UART4 -> transceiver CAT, defaults to 115200).
+ * CAT Baud pops up the spinner bound to g_config.pc_baud_rate (LPUART1
+ * -> PC CAT link, defaults to 115200).  Both use the same spinner
+ * infrastructure (show_baud_spinbox).
+ *
+ * Both spinner popups stay alive while their caller is open so the
+ * operator can come back and pick another baud or change protocol.
+ * The band_comm popup is only closed by a protocol selection, Auto
+ * or Cancel - never by the baud sub-popups. */
+static const char *band_comm_btns[] = {
+    "ICOM", "Yaesu", "Kenwood", "\n",
+    "Auto", "Radio Baud", "CAT Baud", "\n",
+    "Cancel", "", "", ""
+};
+
+/* Spinner button labels - populated at show-band-comm-time based on
+ * current language so the operator always sees the right glyph set. */
+static const char *band_comm_radio_baud_label_zh = "Radio 波特率";
+static const char *band_comm_radio_baud_label_en = "Radio Baud";
+static const char *band_comm_cat_baud_label_zh   = "PC 波特率";
+static const char *band_comm_cat_baud_label_en   = "CAT Baud";
+
+/* Button matrix layout for band_comm_btns (after LVGL strips "\n"):
+ *
+ *   idx 0 1 2       (ICOM Yaesu Kenwood)
+ *       3 4 5       (Auto  Radio Baud  CAT Baud)
+ *       6           (Cancel)
+ *
+ * LVGL drops the two "\n" placeholders before numbering, hence no gaps
+ * in the active-btn ids. */
+#define BAND_COMM_BTN_ICOM       0U
+#define BAND_COMM_BTN_YAESU      1U
+#define BAND_COMM_BTN_KENWOOD    2U
+#define BAND_COMM_BTN_AUTO       3U
+#define BAND_COMM_BTN_RADIO_BAUD 4U
+#define BAND_COMM_BTN_CAT_BAUD   5U
+#define BAND_COMM_BTN_CANCEL     6U
 
 static void band_comm_cb(lv_obj_t *obj, lv_event_t e)
 {
     if (e == LV_EVENT_CLICKED) {
         uint16_t btn_id = lv_msgbox_get_active_btn(obj);
+        if (btn_id == BAND_COMM_BTN_RADIO_BAUD) {
+            /* Pop the radio-baud spinner on top of the current popup. */
+            show_screen_radio_baud();
+            return;
+        }
+        if (btn_id == BAND_COMM_BTN_CAT_BAUD) {
+            /* Pop the PC-CAT-link-baud spinner on top of the current
+             * popup. */
+            show_screen_cat_baud();
+            return;
+        }
+        /* Anything else (protocol selection or Auto/Cancel) closes the
+         * popup immediately as before. */
         lv_obj_del_async(obj);
 #ifndef LVGL_SIM
-        if (btn_id <= 2) {
+        if (btn_id <= BAND_COMM_BTN_KENWOOD) {
+            /* 具体协议 (ICOM=0, Yaesu=1, Kenwood=2) */
             g_config.radio_type = (RadioType)(btn_id + 1);
+        } else if (btn_id == BAND_COMM_BTN_AUTO) {
+            /* Auto: 让协议层自己识别 */
+            g_config.radio_type = RADIO_TYPE_UNKNOWN;
+        } else {
+            /* Cancel / 其他 - 不动 g_config。*/
+        }
+        /* 协议变更路径：通知 radio_band + dirty。Cancel / 两个 Baud
+         * 按钮不动协议。 */
+        if (btn_id <= BAND_COMM_BTN_AUTO) {
+            radio_band_set_hint(g_config.radio_type);
             gui_menu_mark_dirty();
         }
 #endif
@@ -2709,13 +3441,24 @@ static void band_comm_cb(lv_obj_t *obj, lv_event_t e)
 
 static void show_band_comm_settings(void)
 {
-    band_comm_btns[4] = gui_get_string(STR_CANCEL);
+    band_comm_btns[4] = gui_get_string(STR_AUTO);
+    /* btn 5 = "Radio Baud" / btn 6 = "CAT Baud" - keep English labels
+     * so the operator can recognise the same entry across both
+     * languages; the spinner itself already follows the active language.
+     * btn 8 = Cancel (the trailing empty strings are btnmatrix padding). */
+    band_comm_btns[5] = (gui_get_lang_index() == 0)
+                        ? band_comm_radio_baud_label_zh
+                        : band_comm_radio_baud_label_en;
+    band_comm_btns[6] = (gui_get_lang_index() == 0)
+                        ? band_comm_cat_baud_label_zh
+                        : band_comm_cat_baud_label_en;
+    band_comm_btns[8] = gui_get_string(STR_CANCEL);
 
     lv_obj_t *scr = lv_scr_act();
     lv_obj_t *mbox = lv_msgbox_create(scr, NULL);
     lv_msgbox_set_text(mbox, gui_get_string(STR_BAND));
     lv_msgbox_add_btns(mbox, band_comm_btns);
-    lv_obj_set_size(mbox, 300, 130);
+    lv_obj_set_size(mbox, 320, 180);
     lv_obj_align(mbox, scr, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_set_style_local_text_color(mbox, LV_MSGBOX_PART_BG,

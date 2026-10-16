@@ -1,6 +1,24 @@
 /**
  * @file comm.h
- * @brief Communication Protocol Header (USB CDC, LPUART1, Radio)
+ * @brief LPUART1 / USB CDC PC CAT 协议（行式 ASCII，\r\n 终止）
+ *
+ * @details
+ *  命令不区分大小写。三类动词：
+ *    VAR=VAL    设置变量，立即生效
+ *    VAR?       查询变量
+ *    命令        动作：psu on/off, hv on/off, bias on/off, status, help, ...
+ *
+ *  comm 任务负责：
+ *    comm_process_rx()       —— 排空 RX 队列，按行解析与执行
+ *    comm_periodic_tick()    —— 100ms 主动上报一行 "status ..."
+ *
+ *  中断/任务分工：
+ *    HAL_UARTEx_RxEventCallback（强定义在 comm.c）：
+ *      LPUART1 -> comm_lpuart_rx_callback -> 入队
+ *      UART4   -> radio_uart_rx_event
+ *
+ * 兼容旧 API（comm_execute_command / comm_get_radio_* /
+ * comm_calibrate_*），新代码应该用 line 解析入口。
  */
 
 #ifndef COMM_H
@@ -11,91 +29,45 @@ extern "C" {
 #endif
 
 #include "opa2000.h"
+#include <stdbool.h>
 
 /*============================================================================
- * Communication Configuration
+ *  Communication Configuration
  *============================================================================*/
 
 #define COMM_RX_QUEUE_SIZE     256
 #define COMM_TX_QUEUE_SIZE     256
 
-/* Command buffer size */
+/* Command buffer size - 单行最大长度，含结尾 \0 */
 #define COMM_CMD_MAX_LEN       64
 
 /*============================================================================
- * Command Types
+ *  Coupler Calibration (legacy - 兼容老 GUI/PC 入口)
  *============================================================================*/
 
 typedef enum {
-    CMD_NONE = 0,
-    CMD_GET_STATUS,
-    CMD_SET_FREQ,
-    CMD_GET_POWER,
-    CMD_GET_SWR,
-    CMD_GET_VOLTAGE,
-    CMD_GET_CURRENT,
-    CMD_GET_TEMP,
-    CMD_GET_BAND,
-    CMD_GET_FREQ,
-    CMD_ALERT_OFF,
-    CMD_SET_CONFIG,
-    CMD_GET_CONFIG,
-    CMD_SAVE_CONFIG,
-    CMD_RESET_CONFIG,
-    CMD_CALIBRATE,
-    CMD_SET_LANGUAGE,
-    CMD_GET_LANGUAGE,
-    CMD_CALIBRATE_COUPLER,
-    /* Remote control of the external PSU (Power Supply Unit, PG5).
-     *
-     * TODO(PROTOCOL): these two are SKELETON ONLY.  The wire format has not
-     * been decided yet - the user only specified that a CAT packet over the
-     * LPUART link will be able to switch the PSU on and off, alongside the
-     * front panel.  Until the framing / opcode / checksum is agreed, the
-     * parser does NOT recognise any PSU keyword, so these branches are
-     * unreachable and nothing in the firmware can drive the PSU remotely.
-     *
-     * The power_psu_on() / power_psu_off() calls below are the intended
-     * end state and are written out so the plumbing is ready; they are simply
-     * gated on a condition that is always false.  See
-     * User/TODO-PSU远程控制.txt for what still has to be decided. */
-    CMD_PSU_ON,                      /*!< TODO: protocol undefined       */
-    CMD_PSU_OFF,                     /*!< TODO: protocol undefined       */
-    CMD_UNKNOWN
-} CommandType;
-
-/*============================================================================
- * Coupler Calibration State Machine
- *============================================================================*/
-
-typedef enum {
-    COUPLER_CAL_IDLE = 0,           /* Not in calibration mode */
-    COUPLER_CAL_START,              /* Calibration started, waiting for OK */
-    COUPLER_CAL_STAGE1_5W_FWD,      /* Stage 1: 5W forward power, waiting for OK */
-    COUPLER_CAL_STAGE1_5W_REF,      /* Stage 1: 5W reflected power, waiting for OK */
-    COUPLER_CAL_STAGE2_20W_FWD,     /* Stage 2: 20W forward power, waiting for OK */
-    COUPLER_CAL_STAGE2_20W_REF,     /* Stage 2: 20W reflected power, waiting for OK */
-    COUPLER_CAL_COMPLETE,           /* Calibration complete */
-    COUPLER_CAL_ABORTED             /* Calibration aborted */
+    COUPLER_CAL_IDLE = 0,
+    COUPLER_CAL_START,
+    COUPLER_CAL_STAGE1_5W_FWD,
+    COUPLER_CAL_STAGE1_5W_REF,
+    COUPLER_CAL_STAGE2_20W_FWD,
+    COUPLER_CAL_STAGE2_20W_REF,
+    COUPLER_CAL_COMPLETE,
+    COUPLER_CAL_ABORTED
 } CouplerCalState;
 
 typedef enum {
-    COUPLER_1 = 0,    /* Coupler 1: Between PA and LPF */
-    COUPLER_2,        /* Coupler 2: Between LPF and Antenna */
+    COUPLER_1 = 0,
+    COUPLER_2,
     COUPLER_COUNT
 } CouplerId;
 
-/* Calibration data storage */
 typedef struct {
-    float stage1_fwd_adc;      /* ADC reading at 5W forward */
-    float stage1_ref_adc;      /* ADC reading at 5W reflected */
-    float stage2_fwd_adc;      /* ADC reading at 20W forward */
-    float stage2_ref_adc;      /* ADC reading at 20W reflected */
+    float stage1_fwd_adc;
+    float stage1_ref_adc;
+    float stage2_fwd_adc;
+    float stage2_ref_adc;
 } CouplerCalData;
-
-/*============================================================================
- * Communication Structures
- *============================================================================*/
 
 typedef struct {
     uint8_t data[COMM_RX_QUEUE_SIZE];
@@ -104,111 +76,74 @@ typedef struct {
     uint16_t count;
 } CommQueueType;
 
-typedef struct {
-    CommandType type;
-    char args[COMM_CMD_MAX_LEN];
-} CommandTypeDef;
-
 /*============================================================================
- * Function Prototypes
+ *  Public API
  *============================================================================*/
 
-/**
- * @brief Initialize communication (USB and LPUART)
- */
+/* 初始化与启动 */
 void comm_init(void);
-
-/**
- * @brief Start communication (enable USB and UART)
- */
 void comm_start(void);
 
-/**
- * @brief Process received data
- * @note Call from communication task
- */
+/* 任务循环调用：处理已收到的字节，按行解析执行 */
 void comm_process_rx(void);
 
-/**
- * @brief Parse and execute command
- * @param cmd Command string
- */
+/* 任务循环调用：每 10ms 调一次，100ms 主动发一行 "status ..." */
+void comm_periodic_tick(void);
+
+/* 任务循环调用：从 s_tx_ring 搬数据到 DMA 缓冲并启动 LPUART1 TX。
+ * 若 DMA 还在跑或 ring 空就什么都不做。HAL_UART_TxCpltCallback 负责
+ * 释放 busy 标志，下一次 pump 自动接上。 */
+void comm_tx_pump(void);
+
+/* 直接执行一条已拼好的命令（兼容旧入口） */
 void comm_execute_command(const char *cmd);
 
-/**
- * @brief Send response to both USB and LPUART
- * @param data Data to send
- * @param len Data length
- */
+/* 兼容旧 API：发送响应（任意二进制） */
 void comm_send_response(const uint8_t *data, uint16_t len);
-
-/**
- * @brief Send string response
- * @param str String to send
- */
 void comm_send_string(const char *str);
 
-/**
- * @brief Get radio frequency from communication
- * @return Frequency in Hz
- */
-uint32_t comm_get_radio_frequency(void);
+/*============================================================================
+ *  告警事件主动推送
+ *
+ *  comm_post_alert_evt() 供 ISR 或任何上下文调用，把"alert 状态
+ *  变化"事件压入内部 ring。comm 任务在 comm_alert_pump() 里把
+ *  事件格式化成 "alert=ON <code> <p0|p1>\r\n" 或 "alert=OFF\r\n"
+ *  送进 s_tx_ring，由 comm_tx_pump() 经 LPUART1 DMA 发出。
+ *
+ *  on = true  : 推送 ON 事件（cause/severity 必须有效）
+ *  on = false : 推送 OFF 事件（cause/severity 忽略，输出 alert=OFF）
+ *
+ *  ring 满则丢最新的，记 g_alert_evt_overrun 计数。
+ *==========================================================================*/
+void comm_post_alert_evt(AlertType cause, AlertSeverity sev, bool on);
 
-/**
- * @brief Get radio type
- * @return Radio type
- */
+/* 任务循环调用：把已入队的事件 pump 进 s_tx_ring。
+ * 替代 comm_periodic_tick() 的位置，每 10ms 调一次。 */
+void comm_alert_pump(void);
+
+/* 诊断：事件被覆盖的次数（ring 满） */
+uint32_t comm_get_alert_evt_overrun(void);
+
+/* 查询当前 radio 状态 */
+uint32_t comm_get_radio_frequency(void);
 RadioType comm_get_radio_type(void);
 
-/**
- * @brief Queue received byte
- * @param byte Received byte
- */
+/* 字节入队（中断侧）。命令解析已用 ring buffer 模式，
+ * 此函数保留给老调用方——新代码应直接调 comm_lpuart_rx_callback。 */
 void comm_queue_rx_byte(uint8_t byte);
+bool     comm_get_queued_byte(uint8_t *byte);
 
-/**
- * @brief LPUART Rx Event Callback (called on IDLE line detection)
- * @param size Number of bytes received
- */
+/* LPUART1 IDLE 回调入口（HAL 强定义按实例转发到这里） */
 void comm_lpuart_rx_callback(uint16_t size);
 
-/**
- * @brief Get queued byte
- * @param byte Pointer to store byte
- * @return true if byte was available
- */
-bool comm_get_queued_byte(uint8_t *byte);
-
-/**
- * @brief Process radio communication (ICOM/Yaesu/Kenwood)
- * @param data Received data
- * @param len Data length
- */
+/* 兼容：把整段字节喂给 radio 协议层 */
 void comm_process_radio_data(const uint8_t *data, uint16_t len);
 
-/**
- * @brief Start coupler calibration
- * @param coupler_id Which coupler to calibrate (0=TX1, 1=TX2, 2=REF1, 3=REF2)
- * @return true if calibration started successfully
- */
-bool comm_calibrate_coupler_start(CouplerId coupler_id);
-
-/**
- * @brief Continue calibration with current ADC reading
- * @return true if calibration continued (more steps needed)
- */
-bool comm_calibrate_coupler_continue(void);
-
-/**
- * @brief Abort calibration
- */
-void comm_calibrate_coupler_abort(void);
-
-/**
- * @brief Get current calibration state
- * @return Current state
- */
-CouplerCalState comm_calibrate_get_state(void);
+/* 兼容：耦合器标定（已废弃但保留符号） */
+bool               comm_calibrate_coupler_start(CouplerId coupler_id);
+bool               comm_calibrate_coupler_continue(void);
+void               comm_calibrate_coupler_abort(void);
+CouplerCalState    comm_calibrate_get_state(void);
 
 #ifdef __cplusplus
 }

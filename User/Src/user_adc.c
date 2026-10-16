@@ -214,8 +214,15 @@ void adc_start(void)
         != HAL_OK) {
         Error_Handler();
     }
-    /* Enable ADC1 AWD interrupt (only WatchDog interrupts per design) */
-    /* (configured in HAL_ADC_Start but kept disabled until calibration done) */
+    /* AWD1/AWD2/AWD3 interrupts are already armed by MX_ADC1_Init():
+     * it calls HAL_ADC_AnalogWDGConfig() once per watchdog with
+     * ITMode = ENABLE, and that HAL call enables the matching bit in
+     * ADC1->IER itself (stm32h7xx_hal_adc.c, the AWD2/AWD3 branches).
+     * Routing and thresholds:
+     *   AWD1 -> CH4 RF input power   (threshold via adc_awd_set_rf_in_mW)
+     *   AWD2 -> CH5 main current IM  (threshold via adc_awd_set_im_mA)
+     *   AWD3 -> CH6 coupler 1 reverse (threshold via adc_awd_set_rev1_mW)
+     * So nothing extra is needed here beyond starting the conversions. */
 
     if (HAL_ADC_Start_DMA(&hadc2,
                           (uint32_t *)adc2_dma_buf,

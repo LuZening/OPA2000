@@ -79,7 +79,15 @@ add_executable(host_tests
     ${USER_SRC}/protection.c
     ${USER_SRC}/buzzer.c
     ${USER_SRC}/radio_band.c
+    ${USER_SRC}/freq_detect.c
     ${USER_SRC}/flash_eeprom.c
+    # comm.c is intentionally NOT linked into the host build: it depends
+    # on LPUART1 HAL + USB CDC, neither of which has a host stub.  The
+    # pure protocol layer (set/query/action dispatch) lives inside
+    # comm.c as static functions for now; if/when we add a host-side
+    # test for the protocol it should be lifted into a separate
+    # comm_proto.c with the UART wrappers kept here.  See the TEST_DEBT
+    # note in the user-facing task list.
 
     # test cases
     ${CMAKE_CURRENT_SOURCE_DIR}/test_opa2000.c
@@ -89,6 +97,7 @@ add_executable(host_tests
     ${CMAKE_CURRENT_SOURCE_DIR}/test_power_control.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_protection.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_radio_band.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_freq_detect.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_flash_eeprom.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_cmsis_os_shim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_config_mutex.c
@@ -103,6 +112,12 @@ add_executable(host_tests
     # unconditionally - these stand-ins satisfy that link and give the host
     # run the documented "empty store" semantics config_init() expects.
     ${STUB_DIR}/flash_eeprom_host_stub.c
+
+    # comm.c is not linked (LPUART1 HAL + USB CDC have no host stub), but
+    # protection.c calls comm_post_alert_evt() to push alert transitions
+    # into the CAT link.  This stand-in records them so test_protection.c
+    # can assert one event per trigger / dismiss.
+    ${STUB_DIR}/comm_host_stub.c
 )
 
 # Math library: only the test reference implementation uses log() to

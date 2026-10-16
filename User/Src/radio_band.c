@@ -429,7 +429,21 @@ static bool radio_band_try_consume(void)
                 s_type = seen;
             }
             s_stats.frames_ok++;
-            if (hz != s_freq_hz) {
+
+            /* TX 守卫：发射期间拒绝更新频率。
+             *
+             * freq_detect 在 g_tx_active 时把测到的频率与 g_current_band
+             * 比对：不匹配就 ALERT_FREQ_MISMATCH 跳保护。如果这里
+             * 在 TX 期间更新 g_radio_freq_hz，freq_detect 拿到新值
+             * 会立刻误判——操作员切波段（电台扫频）会无端触发跳闸。
+             *
+             * 静默保留这一帧但不更新 s_freq_hz / g_radio_freq_hz，
+             * TX 结束后下一帧再恢复更新。计数仍记 OK，因为协议层
+             * 解析没错，只是应用层暂不采用。 */
+            if (g_tx_active) {
+                s_stats.frames_held_tx++;
+            }
+            else if (hz != s_freq_hz) {
                 s_freq_hz       = hz;
                 g_radio_freq_hz = hz;
             }
@@ -465,6 +479,28 @@ void radio_band_init(RadioType radio_type_hint)
     s_poll_accum  = 0U;
     s_tx_pending  = false;
     memset(&s_stats, 0, sizeof s_stats);
+}
+
+void radio_band_set_hint(RadioType radio_type_hint)
+{
+    /* 用户在 GUI 切协议时调用。若已是自动识别出的具体协议（hint 是
+     * UNKNOWN 但 s_type 已被识别），且新 hint 与已识别协议不一致，
+     * 把 s_type 拉回 UNKNOWN 让下一帧重新识别——保留自动识别的"我已
+     * 经认出来了"语义，但避免在用户手动改协议时把识别结果卡死。
+     *
+     * 若新 hint 本身就是 UNKNOWN，则按用户没指定对待，等下一帧触发
+     * 自动识别。
+     *
+     * 半帧缓冲必须清空：旧协议下累积的字节不是新协议的合法前缀。 */
+    if (s_type != RADIO_TYPE_UNKNOWN && radio_type_hint != RADIO_TYPE_UNKNOWN &&
+        s_type != radio_type_hint) {
+        s_type = RADIO_TYPE_UNKNOWN;
+    }
+    else if (radio_type_hint != RADIO_TYPE_UNKNOWN) {
+        s_type = radio_type_hint;
+    }
+    s_buf_len    = 0U;
+    s_poll_accum = 0U;
 }
 
 void radio_band_reset(void)
@@ -643,9 +679,10 @@ void radio_band_get_stats(RadioBandStatsType *out)
     if (out == NULL) {
         return;
     }
-    out->rx_bytes   = s_stats.rx_bytes;
-    out->frames_ok  = s_stats.frames_ok;
-    out->frames_bad = s_stats.frames_bad;
-    out->timeouts   = s_stats.timeouts;
-    out->overrun    = s_stats.overrun;
+    out->rx_bytes       = s_stats.rx_bytes;
+    out->frames_ok      = s_stats.frames_ok;
+    out->frames_bad     = s_stats.frames_bad;
+    out->timeouts       = s_stats.timeouts;
+    out->overrun        = s_stats.overrun;
+    out->frames_held_tx = s_stats.frames_held_tx;
 }

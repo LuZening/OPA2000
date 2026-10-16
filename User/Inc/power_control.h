@@ -51,14 +51,41 @@ extern volatile int          ptt_event_flag;  /*!< -1=none, 0=release, 1=press *
  *  Fan / pump control
  *============================================================================*/
 
+/* Fan control mode.  AUTO = power_update_fan() drives duty from the NTC
+ * temperature + fault detection.  MANUAL = caller owns the duty via
+ * power_set_fan_speed() and power_update_fan() becomes a no-op until the
+ * caller switches back to AUTO with power_set_fan_mode(MODE_AUTO).  The
+ * default after boot is AUTO. */
+typedef enum {
+    FAN_MODE_AUTO = 0,
+    FAN_MODE_MANUAL,
+} FanMode;
+
 /* Initialise fan PWM (TIM3_CH3) and pump PWM (TIM4_CH4) at 10 kHz. */
 void power_init_fan_pwm(void);
-/* Set fan duty 0..100 % (smooth start/stop allowed). */
+/* Set fan duty 0..100 % (smooth start/stop allowed).  This is the only
+ * path that ever touches the TIM3_CH3 CCR register.  In AUTO mode the
+ * next power_update_fan() call will overwrite this; in MANUAL mode it
+ * sticks until you switch back. */
 void power_set_fan_speed(uint8_t speed_percent);
 /* Set pump duty 0..100 %. */
 void power_set_pump_speed(uint8_t speed_percent);
-/* Update fan based on temperature + hysteresis (50/80/100 %). */
+/* Switch between AUTO and MANUAL.  When entering AUTO the next
+ * power_update_fan() picks up from the current temperature; when
+ * entering MANUAL the previously computed duty is held. */
+void power_set_fan_mode(FanMode mode);
+/* Convenience: in MANUAL mode, set the duty in one call.  Equivalent to
+ * power_set_fan_mode(MANUAL) + power_set_fan_speed(percent). */
+void power_set_fan_manual(uint8_t speed_percent);
+/* Read-only: current mode. */
+FanMode power_get_fan_mode(void);
+/* Update fan based on temperature (continuous curve, see below).
+ * No-op in MANUAL mode so the operator's choice is preserved. */
 void power_update_fan(int16_t temperature_tenth_c);
+/* Returns true if the NTC reading looks broken (open-circuit or short),
+ * so power_update_fan() can force 100 % duty to protect the PA.  The
+ * same flag is also exported for the GUI to show a sensor-fault icon. */
+bool power_fan_ntc_fault(void);
 
 /*============================================================================
  *  电源与射频通路

@@ -87,6 +87,13 @@ bool radio_uart_init(void);
 /*!< 停止接收。可重复调用。 */
 void radio_uart_deinit(void);
 
+/*!< 在任务上下文中改 UART4 波特率并立即生效。
+ *   流程：DeInit 旧 UART + 改 Init.BaudRate + Init 新 UART + 重新启动
+ *   双缓冲接收。协议层不重置：radio_band 状态机跨波特率保持。
+ *   必须在 radio_uart_init() 成功之后调用。
+ *   @return true  = 重挂成功；false = MX 重生成失败，沿用旧设置。 */
+bool radio_uart_set_baud(uint32_t baud);
+
 /*!< radio_band 的发送钩子：阻塞发送一帧 CAT 查询。
  *   已注册给 radio_band，一般不直接调用。 */
 void radio_uart_tx(const uint8_t *data, uint16_t len);

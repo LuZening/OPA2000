@@ -88,6 +88,9 @@
 #define ETR_FREQDET_GPIO_Port GPIOE
 #define BUZZER_Pin GPIO_PIN_6
 #define BUZZER_GPIO_Port GPIOE
+/* Panel display enable (hw_pinmap.h uses the CubeMX names directly) */
+#define TFT_DISP_Pin GPIO_PIN_10
+#define TFT_DISP_GPIO_Port GPIOE
 
 /* Touch / rear */
 #define REAR_RESERVED1_Pin GPIO_PIN_4

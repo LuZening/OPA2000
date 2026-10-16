@@ -269,14 +269,15 @@ protection_clear();
 - 拉低 PB13（`RF_IN_PROTECT_CLEAR()`），通知 RF 板保护已解除
 - `buzzer_stop()`（TIM15 PWM 停，蜂鸣器静音）
 
-**解除后仍然不会自动恢复发射**，这是有意为之：
+**解除后 RF 路径自动恢复**：
 
-- `g_allow_rf` 保持 `false`，必须让用户重新跑一次 IM 零点校准才重新允许发射。
+- `g_allow_rf` 恢复 `true`——CC6920 零点与本次故障无关，原标定值继续有效；
+  ADC 任务只在开机时跑一次 `adc_im_zero_offset_tick()`，不要求任何手动操作。
 - `g_hv_on` **不会**被保护清掉，电源指示灯仍是"就绪"。如果你的"一键恢复"流程需要
   重新上高压，请显式调 `power_hv_disable()` → `power_hv_enable()`，不要去改 `g_hv_on`。
 
-**如果你要做"一键复位"**：只能在用户长按确认（防误触）后，先 `power_hv_disable()`、
-再 `protection_clear()`、再引导用户重跑零点校准。顺序反了会留下 PB13 仍拉高的状态。
+**如果你要做"一键复位"**：用户长按确认（防误触）后，顺序是 `protection_clear()` →
+`power_hv_disable()` → `power_hv_enable()`。顺序反了会留下 PB13 仍拉高的状态。
 
 ### 5.4a 高压轨时序（**不要绕过**）
 
@@ -323,8 +324,7 @@ protection_clear();
 - **不要自己再去拉 PB13、不要自己去停 TIM15**，全部由 `protection_clear()` 收口，
   否则会和 ISR 里的关断动作打架。
 - 解除后建议回一条确认帧（你定协议），让上位机知道告警已清。
-- 同样地，`g_allow_rf` 解除后仍是 false，**不要在协议里假装"已恢复发射"**；
-  需要真正恢复发射时，让操作员重跑零点校准。
+- 同样地，`g_allow_rf` 解除后已恢复 `true`，CAT 状态查询帧可以直接回报"射频就绪"。
 - CAT 侧还可以顺手做只读上报：把 `g_alert_active` 编进状态查询帧（SWR/电流类故障码）。
   **只读上报不要调任何 clear 类函数。**
 - GUI 和 Networking 可能同时收到解除请求：`protection_clear()` 是幂等的，
@@ -337,7 +337,7 @@ protection_clear();
 | 判定阈值、DMA/AWD/EXTI 中断里关断、锁存、蜂鸣器启动 | **Control（已完成，勿重写）** |
 | 弹窗显示、多语言文案、解除按钮 | **GUI（§5.4）** |
 | CAT/SPI6 解除命令、状态上报 | **Networking（§5.5）** |
-| IM 零点校准后恢复 `g_allow_rf` | Control 已提供，GUI 负责触发流程 |
+| IM 零点校准后恢复 `g_allow_rf` | Control 任务开机自动跑，**无 GUI 入口** |
 
 ---
 

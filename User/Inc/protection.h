@@ -23,6 +23,13 @@
  *
  * The task-side checks run in protection_check() called from the Control
  * task on the 100 ms tick.
+ *
+ * Severity: each AlertType maps to a severity (alert_severity() in
+ * opa2000.c).  P0 (emergency) does the full 7-step hard shutdown and
+ * drives PB13; P1 (mild, e.g. thermal) cuts PWR_ON + RF_BIAS so the PA
+ * stops self-heating but does NOT latch the RF board protection bus and
+ * does NOT clobber g_allow_rf - dismissing a P1 alert returns the rig to
+ * keyable immediately.
  */
 
 #ifndef PROTECTION_H

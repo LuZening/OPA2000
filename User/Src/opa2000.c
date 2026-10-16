@@ -42,6 +42,7 @@ volatile bool           g_allow_rf     = false;
 /* Alert */
 volatile AlertType      g_alert_active = ALERT_NONE;
 volatile bool           g_alert_flag   = false;
+volatile AlertSeverity  g_alert_severity = ALERT_SEV_NONE;
 
 /* Fan speed */
 volatile FanSpeedType   g_fan_speed    = FAN_SPEED_LOW;
@@ -77,6 +78,9 @@ volatile bool g_touch_calibrated     = false;
  * that dies early can never transmit. */
 volatile bool g_gui_ready = false;
 volatile bool g_ptt_ready = false;
+
+/* FreeRTOS 致命错误标志：见 opa2000.h。freertos_hooks.c 写，其他读。 */
+volatile uint32_t g_freertos_fault = 0U;
 
 /*============================================================================
  *  2. Band / frequency helpers
@@ -132,6 +136,45 @@ int32_t calculate_swr_x100(int32_t fwd2_mW, int32_t rev2_mW)
     if (swr < 100U) swr = 100U;
     if (swr > 999U) swr = 999U;
     return (int32_t)swr;
+}
+
+/*============================================================================
+ *  2a. Alert severity mapping
+ *
+ *  Single source of truth for "this AlertType -> P0 or P1" so the
+ *  hardware-shutdown logic in protection.c and the dismiss path stay in
+ *  step.  Adding a new alert means one line here, one case in
+ *  protection_get_fault_string(), and one string id in gui.c.
+ *
+ *  P0 (emergency): power / current / voltage / external hardware faults.
+ *      Hard-shutdown + latches RF path off (g_allow_rf cleared).  Dismiss
+ *      re-arms the RF path (the underlying sensor reading is not the
+ *      current sensor's zero-offset, so the old calibration is still good).
+ *
+ *  P1 (mild): thermal / fan / pump.  Hard-shutdown (PWR_ON + RF_BIAS, so
+ *      the PA stops self-heating) but does NOT latch the RF path - the
+ *      IMain zero offset is unaffected by temperature, and the operator
+ *      must be able to key again as soon as they dismiss.
+ *==========================================================================*/
+
+AlertSeverity alert_severity(AlertType a)
+{
+    switch (a) {
+    case ALERT_SWR_HIGH:
+    case ALERT_REFLECT_POWER_HIGH:
+    case ALERT_CURRENT_HIGH:
+    case ALERT_HARDWARE_FAULT:
+    case ALERT_OVERDRIVE:
+    case ALERT_FREQ_MISMATCH:
+    case ALERT_VBIAS_FAULT:
+        return ALERT_SEV_P0;
+    case ALERT_NTC_OVERHEAT:
+    case ALERT_FAN_FAULT:
+        return ALERT_SEV_P1;
+    case ALERT_NONE:
+    default:
+        return ALERT_SEV_NONE;
+    }
 }
 
 /*============================================================================
@@ -200,7 +243,7 @@ void opa2000_init(void)
     /* Default config (Networking agent may overwrite from SD card) */
     g_config.pc_baud_rate          = DEFAULT_PC_BAUD_RATE;
     g_config.radio_type            = RADIO_TYPE_UNKNOWN;
-    g_config.radio_baud_rate       = 19200U;
+    g_config.radio_baud_rate       = DEFAULT_RADIO_BAUD_RATE;
     for (int i = 0; i < 6; i++) g_config.band_rf_in_max_w[i] = 20U;
     g_config.band_rev1_max_w       = 600U;
     g_config.band_rev2_max_w       = 400U;
@@ -244,6 +287,7 @@ void opa2000_init(void)
     g_allow_rf = false;
     g_alert_active = ALERT_NONE;
     g_alert_flag = false;
+    g_alert_severity = ALERT_SEV_NONE;
     g_fan_speed = FAN_SPEED_LOW;
     g_radio_freq_hz = 0U;
 }

@@ -61,8 +61,10 @@ extern "C" {
 #define RADIO_BAND_MAX_HZ       30000000UL
 
 /*!< 轮询间隔（tick 数）。与 radio_band_tick() 的调用频率配合：
- *   若挂在 10 ms tick 上则 10 = 100 ms；若挂在 1 ms tick 上则 100。 */
-#define RADIO_BAND_POLL_PERIOD_MS   10U
+ *   若挂在 10 ms tick 上则 20 = 200 ms；若挂在 1 ms tick 上则 200。
+ *   CAT 查询每 200 ms 一次：足够频繁以保证频率显示与波段切换的
+ *   响应延迟 < 0.5 s，又不至于把安静的电台淹没在轮询包里。 */
+#define RADIO_BAND_POLL_PERIOD_MS   20U
 
 /*============================================================================
  *  硬件回调
@@ -81,6 +83,12 @@ typedef void (*radio_band_rx_fn_t)(const uint8_t *data, uint16_t len);
 /* 初始化。radio_type_hint 传 RADIO_TYPE_UNKNOWN 时自动识别，
  * 传具体类型则只认该协议。 */
 void radio_band_init(RadioType radio_type_hint);
+
+/* GUI/用户切换 radio_type 时调用：只改协议提示，不动已识别的状态。
+ * 若已是自动识别出的协议，新 hint 若与之不一致则降回 UNKNOWN 让
+ * 重新识别（避免把已经稳定的链路状态清空）。
+ * 同时清空重组缓冲——切协议时旧协议的半帧没有意义。 */
+void radio_band_set_hint(RadioType radio_type_hint);
 
 /* 丢弃半帧缓冲（不动已识别的协议与频率）。 */
 void radio_band_reset(void);
@@ -124,7 +132,9 @@ typedef struct {
     uint32_t frames_ok;
     uint32_t frames_bad;
     uint32_t timeouts;
-    uint32_t overrun;      /*!< ISR 环形缓冲写满次数 */
+    uint32_t overrun;         /*!< ISR 环形缓冲写满次数   */
+    uint32_t frames_held_tx;  /*!< TX 期间收到的合法帧，
+                                    协议解析通过但暂不更新频率 */
 } RadioBandStatsType;
 
 void radio_band_get_stats(RadioBandStatsType *out);

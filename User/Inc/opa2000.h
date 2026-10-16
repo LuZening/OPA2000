@@ -20,6 +20,7 @@
 extern "C" {
 #endif
 
+typedef unsigned int uint32_t;
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -121,12 +122,14 @@ extern "C" {
 #define BAND_15M_10M_MIN   21000000U
 #define BAND_15M_10M_MAX   29700000U
 
-#define DEFAULT_PC_BAUD_RATE      19200U
+#define DEFAULT_PC_BAUD_RATE      115200U
+#define DEFAULT_RADIO_BAUD_RATE   115200U
 
 /* Frequency detection (TIM1 ETR + TIM7 100us tick)
  * TIM7 ticks every 100us; counts accumulated; freq = count * 10000 */
 #define FREQDET_MULTIPLIER         10000U  /*!< count * 10000 = Hz (1s/100us) */
-#define FREQDET_MIN_VALID_FREQ_HZ  1000000U /*!< 1 MHz threshold */
+#define FREQDET_MIN_VALID_FREQ_HZ  1000000U /*!< 1 MHz threshold  */
+#define FREQDET_MAX_VALID_FREQ_HZ 60000000U /*!< 60 MHz upper bound */
 
 /* Buzzer 3-tone warning timing */
 #define BUZZER_NOTE_DURATION_MS    300U
@@ -175,7 +178,17 @@ typedef enum {
     ALERT_FREQ_MISMATCH,
     ALERT_NTC_OVERHEAT,
     ALERT_VBIAS_FAULT,
+    ALERT_FAN_FAULT,         /*!< 占位 - FAN1 tacho 暂未接线 */
 } AlertType;
+
+/* Alert severity - drives which hardware actions and which dismiss
+ * behaviour protection.c takes.  Single source of truth is
+ * alert_severity() in opa2000.c. */
+typedef enum {
+    ALERT_SEV_NONE = 0,
+    ALERT_SEV_P0,            /*!< Emergency - full hard shutdown    */
+    ALERT_SEV_P1,            /*!< Mild     - stop keying + alert    */
+} AlertSeverity;
 
 /* Fan speed state */
 typedef enum {
@@ -391,6 +404,7 @@ extern volatile bool           g_tx_active;
 extern volatile BandType       g_current_band;
 extern volatile bool           g_allow_rf;        /*!< CC6920 zero-offset done */
 extern volatile AlertType      g_alert_active;
+extern volatile AlertSeverity  g_alert_severity;
 extern volatile bool           g_alert_flag;
 extern volatile FanSpeedType   g_fan_speed;
 extern volatile uint32_t       g_radio_freq_hz;   /*!< last measured Hz */
@@ -436,6 +450,13 @@ extern volatile bool g_touch_calibrated;
 extern volatile bool g_gui_ready;
 extern volatile bool g_ptt_ready;
 
+/* FreeRTOS 致命错误标志（freertos_hooks.c 写、其他任何上下文读）。
+ *   0          = 正常
+ *   0xDEAD0001 = 栈溢出 (vApplicationStackOverflowHook)
+ *   0xDEAD0002 = malloc 失败 (vApplicationMallocFailedHook)
+ * 任务死循环前会先 __disable_irq()，所以读这个变量也建议在关中断上下文。 */
+extern volatile uint32_t g_freertos_fault;
+
 /* Band strings for GUI display (defined in opa2000.c) */
 extern const char *strFreqRanges[];
 extern const char *strBands[];
@@ -448,6 +469,7 @@ extern const char *strBands[];
 uint32_t crc32_calculate(const uint8_t *data, uint32_t length);
 BandType frequency_to_band(uint32_t frequency_hz);
 int32_t  calculate_swr_x100(int32_t fwd2_mW, int32_t rev2_mW);
+AlertSeverity alert_severity(AlertType a);
 
 /* Initialization (called once at startup) */
 void opa2000_init(void);

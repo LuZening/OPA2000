@@ -7,16 +7,57 @@
  *          every 100 us and triggers freq_detect_isr() which:
  *            - reads TIM1->CNT
  *            - subtracts the previous count (with 16-bit wrap handling)
- *            - publishes g_radio_freq_hz = delta * 10000
- *            - if freq > 1 MHz and measured band != g_current_band and
- *              g_tx_active, calls protection_trigger_locked()
- *              with ALERT_FREQ_MISMATCH.
+ *            - pushes the sample through a 3-deep sliding window
+ *            - publishes g_radio_freq_hz once the window has a stable
+ *              value (at least 2 of 3 samples agree within +/- 2 LSB)
+ *            - if the window says the amp is transmitting on a
+ *              different band than the operator asked for, calls
+ *              protection_trigger_locked() with ALERT_FREQ_MISMATCH
+ *
+ *          Band-mismatch robustness (the lesson learned the hard way
+ *          with the original single-sample version):
+ *
+ *            1. The ETR line carries a 1.8..30 MHz RF signal divided
+ *               down by a /32 prescaler in the LO board.  The TIM1
+ *               counter sees events at F_RF / 32; the 100 us sampling
+ *               window therefore has a +/- 1 LSB quantisation of
+ *               F_RF / 32 * 100e-6 = 1 part in 10000 = 10 kHz per
+ *               LSB.  Worst-case quantisation error on the displayed
+ *               frequency is +/- 1 LSB (a single 10 kHz step), and
+ *               since the loop can be off by half a step in either
+ *               direction, we accept consecutive samples that agree
+ *               within +/- 2 LSB (= 20 kHz).
+ *
+ *            2. The measurement therefore dithers around the real
+ *               value by +/- 2 LSB.  When the radio is parked on a
+ *               band edge (e.g. exactly 14.000000 MHz on the 20m/17m
+ *               boundary) the displayed value crosses the boundary
+ *               with each sample and the band classifier oscillates
+ *               between BAND_20M_17M and BAND_15M_10M.  The single-
+ *               sample detector would then trip ALERT_FREQ_MISMATCH
+ *               once per boundary crossing - unacceptable.
+ *
+ *               Mitigation:  the band classifier used by the
+ *               mismatch check widens each band interval by BAND_EPS_HZ
+ *               on both sides (a guard band) so that a measured
+ *               frequency sitting within +/- BAND_EPS_HZ of a band
+ *               edge is treated as belonging to whichever band the
+ *               radio is already on.  BAND_EPS_HZ must be larger
+ *               than the +/- 2 LSB quantisation band (10 kHz * 2)
+ *               - we set it to 500 kHz, which also gives ample
+ *               margin against a slow PLL drift or a slightly out-
+ *               of-tune exciter.
+ *
+ *               frequency_to_band() (the raw classifier used by the
+ *               LPF-band auto-follow) is left untouched so the GUI
+ *               and LPF logic keep their crisp edges; only the
+ *               mismatch check uses the widened version.
  *
  *          The task-side wrapper freq_detect_check() runs in the
  *          Control task (10 ms tick) and updates the LPF band
  *          via switch_band() once the measured band has stabilised.
  */
-
+#include <stdint.h>
 #include "freq_detect.h"
 #include "protection.h"
 #include "power_control.h"
@@ -26,12 +67,30 @@
  *  Private state (volatile for ISR/task sharing)
  *============================================================================*/
 
-/* Latest measured frequency in Hz - written by ISR, read by task */
+/* Latest published frequency in Hz - written by ISR, read by task.
+ * Only updated once the sliding window agrees; otherwise holds the
+ * last accepted value (or 0 right after boot). */
 static volatile uint32_t s_measured_freq = 0U;
+
+/* Latest raw sample, even if it has not been accepted by the
+ * window yet.  Used by host tests and by debug. */
+static volatile uint32_t s_raw_sample    = 0U;
 
 /* TIM1 counter snapshot for delta computation in the ISR. */
 static volatile uint16_t s_last_counter = 0U;
 static volatile bool     s_first_check  = true;
+
+/* 3-deep sliding window of raw samples (in TIM1-CNT LSB units, i.e.
+ * pre-multiplication by 10000).  Reading and writing happens entirely
+ * from the ISR context so no locking is required; the volatile is
+ * only here to be defensive against the compiler optimising across
+ * the ISR boundary. */
+static volatile uint16_t s_window[3] = { 0U, 0U, 0U };
+static volatile uint8_t  s_window_fill = 0U;  /*!< samples in window */
+
+/* The accepted frequency in raw LSB units (kept next to the window so
+ * a debug reader can see what made it through the filter). */
+static volatile uint16_t s_accepted_lsb = 0U;
 
 /* Band-mismatch latched flag (ISR sets, task reads+clears). */
 static volatile bool     s_mismatch_latched = false;
@@ -42,11 +101,67 @@ static volatile bool     s_mismatch_alerted = false;
  *============================================================================*/
 
 /* TIM7: APB1 timer clock = 200 MHz, prescaler = 19 -> 10 MHz, period 999
- * = 100 us.  Same configuration as old code; kept here for clarity. */
+ * = 100 us. */
 #define FREQDET_TIM7_PRESCALER    19U
 #define FREQDET_TIM7_PERIOD       999U
 
-/* TIM1 prescaler set in hw_pinmap.h (#define ETR_FREQDET_PRESCALER 31). */
+/* Sliding-window parameters.  The window holds 3 samples; we accept
+ * the result when the *spread* (max - min across the filled slots) is
+ * <= SPREAD_MAX_LSB.  With LSB = 10 kHz and SPREAD_MAX_LSB = 2 the
+ * accepted frequency agrees with the true value within +/- 1 LSB. */
+#define FREQDET_WINDOW_SIZE       3U
+#define FREQDET_SPREAD_MAX_LSB    2U
+
+/* Band-edge guard band for the mismatch check.  See the file comment
+ * for the rationale; raw frequency_to_band() does NOT use this. */
+#define BAND_EPS_HZ               500000U   /*!< 500 kHz */
+
+/*============================================================================
+ *  Private helpers
+ *============================================================================*/
+
+/* Sort s_window[0..fill-1] in place using a 3-element insertion sort.
+ * The window is tiny and the function is called from the ISR; an O(n^2)
+ * sort is faster here than any binary-search or heap dance, and the
+ * compiler keeps the whole thing in registers. */
+static void sort_window(uint16_t *w, uint8_t n)
+{
+    for (uint8_t i = 1U; i < n; i++) {
+        uint16_t key = w[i];
+        uint8_t  j   = i;
+        while (j > 0U && w[j - 1U] > key) {
+            w[j] = w[j - 1U];
+            j--;
+        }
+        w[j] = key;
+    }
+}
+
+/* Map an accepted frequency (Hz) into a band, but with each band
+ * widened by BAND_EPS_HZ on both sides.  The point is to absorb the
+ * quantisation band (see the file comment) so a measurement parked on
+ * a band edge does not bounce between two band classifiers. */
+static BandType frequency_to_band_wide(uint32_t frequency_hz)
+{
+    /* The band table lives in opa2000.h.  We use signed offsets so
+     * the comparison does not underflow when the lower band goes
+     * below 0; the input is always > 0 in practice. */
+    const uint32_t eps = BAND_EPS_HZ;
+
+    /* Same precedence order as frequency_to_band(), but with each
+     * MIN shifted down by eps and each MAX shifted up by eps. */
+    if (frequency_hz + eps < BAND_160M_MIN)  return BAND_NONE;
+    if (frequency_hz <= BAND_160M_MAX + eps) return BAND_160M;
+    if (frequency_hz < BAND_80M_MIN - eps)   return BAND_FAULT;
+    if (frequency_hz <= BAND_80M_MAX + eps)  return BAND_80M;
+    if (frequency_hz < BAND_40M_30M_MIN - eps) return BAND_FAULT;
+    if (frequency_hz <= BAND_40M_30M_MAX + eps) return BAND_40M_30M;
+    if (frequency_hz < BAND_20M_17M_MIN - eps)  return BAND_FAULT;
+    if (frequency_hz <= BAND_20M_17M_MAX + eps) return BAND_20M_17M;
+    if (frequency_hz < BAND_15M_10M_MIN - eps)  return BAND_FAULT;
+    if (frequency_hz <= BAND_15M_10M_MAX + eps) return BAND_15M_10M;
+    return BAND_FAULT;
+}
 
 /*============================================================================
  *  Public API
@@ -55,8 +170,14 @@ static volatile bool     s_mismatch_alerted = false;
 void freq_detect_init(void)
 {
     s_measured_freq      = 0U;
+    s_raw_sample         = 0U;
     s_last_counter       = 0U;
     s_first_check        = true;
+    s_window[0]          = 0U;
+    s_window[1]          = 0U;
+    s_window[2]          = 0U;
+    s_window_fill        = 0U;
+    s_accepted_lsb       = 0U;
     s_mismatch_latched   = false;
     s_mismatch_alerted   = false;
 
@@ -67,7 +188,7 @@ void freq_detect_init(void)
 
 void freq_detect_start(void)
 {
-    /* Configure TIM7 100 us tick.  Same pattern as legacy code. */
+    /* Configure TIM7 100 us tick. */
     HAL_TIM_Base_Stop_IT(&htim7);
     htim7.Instance->PSC = FREQDET_TIM7_PRESCALER;
     htim7.Instance->ARR = FREQDET_TIM7_PERIOD;
@@ -75,10 +196,14 @@ void freq_detect_start(void)
     __HAL_TIM_CLEAR_FLAG(&htim7, TIM_IT_UPDATE);
     HAL_TIM_Base_Start_IT(&htim7);
 
-    /* Reset TIM1 ETR counter + flip the first-check flag. */
+    /* Reset TIM1 ETR counter + flip the first-check flag and clear
+     * the sliding window so we do not start mid-stream. */
     __HAL_TIM_SET_COUNTER(&htim1, 0);
     s_first_check  = true;
     s_last_counter = 0U;
+    s_window_fill  = 0U;
+    s_accepted_lsb = 0U;
+    s_measured_freq = 0U;
 }
 
 void freq_detect_stop(void)
@@ -103,17 +228,92 @@ void freq_detect_isr(void)
                      : (uint16_t)((0xFFFFU - s_last_counter) + cur + 1U);
     s_last_counter = cur;
 
-    /* freq = delta / 100us = delta * 10000 Hz */
-    uint32_t freq = (uint32_t)delta * 10000U;
-    s_measured_freq = freq;
-    g_radio_freq_hz = freq;
+    /* Always publish the raw sample for debug / tests, even before the
+     * window accepts it - the host test fixture injects a delta
+     * directly and wants to read it back. */
+    s_raw_sample = (uint32_t)delta * 10000U;
 
-    /* Band-mismatch check only valid when we have a real signal and
-     * the amp is currently transmitting. */
-    if (freq >= FREQDET_MIN_VALID_FREQ_HZ &&
-        g_tx_active &&
-        !s_mismatch_latched) {
-        BandType measured = frequency_to_band(freq);
+    /* ----------------------------------------------------------------
+     * Sliding window:  push delta into s_window (FIFO).  Once we have
+     * at least 2 samples and the spread is <= FREDQDET_SPREAD_MAX_LSB
+     * (= 2 LSB), accept the median as the canonical frequency.
+     *
+     * Median of 3 is robust against one outlier (relay bounce, EMI
+     * pulse) - if one of the three differs from the other two by
+     * more than 2 LSB the spread is > 2 LSB and we discard the whole
+     * window for that tick; a fresh sample fills the slot.
+     * ---------------------------------------------------------------- */
+    if (s_window_fill < FREQDET_WINDOW_SIZE) {
+        s_window[s_window_fill++] = delta;
+    } else {
+        s_window[0] = s_window[1];
+        s_window[1] = s_window[2];
+        s_window[2] = delta;
+    }
+
+    if (s_window_fill >= 2U) {
+        uint16_t sorted[FREQDET_WINDOW_SIZE];
+        uint8_t  n = (s_window_fill <= FREQDET_WINDOW_SIZE)
+                     ? s_window_fill : FREQDET_WINDOW_SIZE;
+        for (uint8_t i = 0U; i < n; i++) {
+            sorted[i] = s_window[i];
+        }
+        sort_window(sorted, n);
+        uint16_t spread = (uint16_t)(sorted[n - 1U] - sorted[0U]);
+        if (spread <= FREQDET_SPREAD_MAX_LSB) {
+            /* Median.  For n == 2 we take the lower (== average within
+             * 2 LSB); for n == 3 we take the middle element. */
+            uint16_t median = (n == 2U) ? sorted[0U]
+                                        : sorted[1U];
+            s_accepted_lsb = median;
+            uint32_t freq  = (uint32_t)median * 10000U;
+            s_measured_freq = freq;
+            g_radio_freq_hz = freq;
+        }
+        /* else: spread too big, keep the previous s_measured_freq.
+         * The LSB delta is +/- 1; a spread of 3+ LSB is a real glitch
+         * (relay bounce, spark, etc.) and we wait for it to settle.
+         *
+         * Reject is a *pure* window-maintenance step:  it does not
+         * publish a frequency, does not advance any protection
+         * state, and does NOT participate in band-mismatch
+         * detection.  The mismatch check below is gated on a
+         * successful accept by tracking whether s_measured_freq
+         * changed this tick (see s_freq_published_this_tick). */
+        else {
+            return;
+        }
+    }
+    else {
+        /* First 1-2 samples after start - no published frequency yet,
+         * no band-mismatch decision can be made. */
+        return;
+    }
+
+    /* ----------------------------------------------------------------
+     * Band-mismatch check.  Reached only when this tick published a
+     * new frequency (window accepted the median).  Guarded by:
+     *
+     *  1. Sample is in the valid RF range (1 MHz .. 60 MHz).  Below
+     *     1 MHz means "no signal" or "noise" - not a band we are
+     *     supposed to be on.  Above 60 MHz means a harmonic / spur /
+     *     out-of-band spur; we do not want to alert on those either
+     *     because frequency_to_band() returns BAND_FAULT for them
+     *     and the only action would be a false-positive shutdown.
+     *  2. The amp is actually keying.  At idle any RFI looks like a
+     *     mismatch and would alert spuriously.
+     *  3. The latch is not already set, so we do not pile up
+     *     protection_trigger_locked() calls while the operator has
+     *     not yet dismissed.
+     *
+     * The band classification uses the wide-edge version
+     * (frequency_to_band_wide) so a measurement sitting in the
+     * quantisation band right on top of a boundary does not bounce.
+     * ---------------------------------------------------------------- */
+    if (g_tx_active && !s_mismatch_latched &&
+        s_measured_freq >= FREQDET_MIN_VALID_FREQ_HZ &&
+        s_measured_freq <  FREQDET_MAX_VALID_FREQ_HZ) {
+        BandType measured = frequency_to_band_wide(s_measured_freq);
         if (measured != BAND_NONE &&
             measured != BAND_FAULT &&
             measured != g_current_band) {
@@ -125,18 +325,23 @@ void freq_detect_isr(void)
 
 void freq_detect_check(void)
 {
-    /* LPF band follow: switch band when measured band differs. */
+    /* LPF band follow: use the *raw* (non-widened) classifier so the
+     * LPF switches crisply when the radio leaves a band; the
+     * quantisation oscillation lives only in the mismatch path. */
     BandType measured = frequency_to_band(s_measured_freq);
     if (measured != BAND_NONE && measured != BAND_FAULT &&
         measured != g_current_band) {
         switch_band(measured);
     }
 
-    /* Alert state machine: clear the latch once conditions normalise. */
+    /* Clear the latch once the conditions that set it are gone.
+     * Either the radio dropped the carrier (g_tx_active false) or the
+     * measured frequency fell out of the valid window (signal lost /
+     * LO dropped).  In both cases the mismatch is moot. */
     if (s_mismatch_latched) {
-        if (s_measured_freq < FREQDET_MIN_VALID_FREQ_HZ ||
-            !g_tx_active) {
-            /* Signal gone or no longer transmitting - clear latch. */
+        if (!g_tx_active ||
+            s_measured_freq < FREQDET_MIN_VALID_FREQ_HZ ||
+            s_measured_freq >= FREQDET_MAX_VALID_FREQ_HZ) {
             s_mismatch_latched = false;
             s_mismatch_alerted = false;
         }
@@ -144,3 +349,15 @@ void freq_detect_check(void)
 }
 
 uint32_t freq_detect_get_frequency(void) { return s_measured_freq; }
+
+/* HOST_TEST_NATIVE hook: read the raw last sample even when the sliding
+ * window has not accepted it yet.  Useful for the unit tests that
+ * inject a single delta and want to assert what landed in the window. */
+#if defined(HOST_TEST_NATIVE)
+uint16_t freq_detect_test_window(uint8_t idx)
+{
+    return (idx < FREQDET_WINDOW_SIZE) ? s_window[idx] : 0U;
+}
+uint8_t  freq_detect_test_window_fill(void) { return s_window_fill; }
+uint16_t freq_detect_test_accepted_lsb(void) { return s_accepted_lsb; }
+#endif

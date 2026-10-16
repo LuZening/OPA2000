@@ -1212,12 +1212,23 @@ TEST_CASE(power_init_outputs_leaves_everything_inactive)
 
 /*============================================================================
  *  Fan speed hysteresis
- *============================================================================*/
+ *==========================================================================*/
+
+/* power_update_fan() reads g_adc_data.adc2_inj_ntc_core_raw to detect a dead
+ * sensor (open = 4095, short = 0) and pins the fan at 100 % when it sees
+ * either.  The default 0 would trip that branch, so every case below
+ * publishes a healthy mid-scale reading first.  20500 codes is roughly
+ * 25 C on the 2.5 V / 16-bit NTC divider. */
+static void fan_test_ntc_ok(void)
+{
+    g_adc_data.adc2_inj_ntc_core_raw = 20500U;
+}
 
 TEST_CASE(fan_speed_starts_at_50_percent_below_60c)
 {
     /* power_init_fan_pwm() sets TIM3 CCR3; verify mapping only. */
     power_init_fan_pwm();
+    fan_test_ntc_ok();
 
     /* 59.9 C -> still 50 % */
     power_update_fan(599);
@@ -1231,6 +1242,7 @@ TEST_CASE(fan_speed_starts_at_50_percent_below_60c)
 TEST_CASE(fan_speed_reaches_100_above_70c)
 {
     power_init_fan_pwm();
+    fan_test_ntc_ok();
     power_update_fan(700);
     ASSERT_EQ(g_fan_speed, FAN_SPEED_HIGH);
 }
@@ -1238,6 +1250,7 @@ TEST_CASE(fan_speed_reaches_100_above_70c)
 TEST_CASE(fan_speed_holds_100_until_60c_on_the_way_down)
 {
     power_init_fan_pwm();
+    fan_test_ntc_ok();
 
     /* Ramp up to 100 % */
     power_update_fan(750);
@@ -1253,10 +1266,48 @@ TEST_CASE(fan_speed_holds_100_until_60c_on_the_way_down)
 TEST_CASE(fan_speed_drops_to_50_below_50c_on_the_way_down)
 {
     power_init_fan_pwm();
+    fan_test_ntc_ok();
     power_update_fan(750);      /* 100 % */
     power_update_fan(700);      /* 100 % (still above the 60 C release point) */
     power_update_fan(500);      /* <= 50 C -> 50 % */
     ASSERT_EQ(g_fan_speed, FAN_SPEED_LOW);
+}
+
+/* A dead NTC (open or short) must pin the fan at 100 % regardless of the
+ * temperature argument - a hot PA with a cut sensor is exactly the case
+ * that must not run slow. */
+TEST_CASE(fan_pins_full_speed_when_the_ntc_reads_open)
+{
+    power_init_fan_pwm();
+    g_adc_data.adc2_inj_ntc_core_raw = 65535U;   /* open circuit */
+    power_update_fan(250);                       /* would be LOW normally */
+    ASSERT_EQ(g_fan_speed, FAN_SPEED_HIGH);
+    ASSERT_TRUE(power_fan_ntc_fault());
+}
+
+TEST_CASE(fan_pins_full_speed_when_the_ntc_reads_short)
+{
+    power_init_fan_pwm();
+    g_adc_data.adc2_inj_ntc_core_raw = 0U;       /* short to ground */
+    power_update_fan(250);
+    ASSERT_EQ(g_fan_speed, FAN_SPEED_HIGH);
+    ASSERT_TRUE(power_fan_ntc_fault());
+}
+
+TEST_CASE(manual_fan_speed_ignores_temperature_and_sensor_faults)
+{
+    power_init_fan_pwm();
+    g_adc_data.adc2_inj_ntc_core_raw = 0U;       /* dead sensor */
+    power_set_fan_manual(40U);
+    power_update_fan(250);
+    ASSERT_EQ(power_get_fan_mode(), FAN_MODE_MANUAL);
+    /* The operator's choice stands: no temperature curve, no sensor veto. */
+    ASSERT_EQ(g_fan_speed, FAN_SPEED_LOW);
+    /* Back to AUTO, the dead sensor takes over immediately. */
+    power_set_fan_mode(FAN_MODE_AUTO);
+    power_update_fan(250);
+    ASSERT_EQ(g_fan_speed, FAN_SPEED_HIGH);
+    ASSERT_TRUE(power_fan_ntc_fault());
 }
 
 /*============================================================================
@@ -1365,6 +1416,9 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(fan_speed_reaches_100_above_70c),
     TEST_ENTRY(fan_speed_holds_100_until_60c_on_the_way_down),
     TEST_ENTRY(fan_speed_drops_to_50_below_50c_on_the_way_down),
+    TEST_ENTRY(fan_pins_full_speed_when_the_ntc_reads_open),
+    TEST_ENTRY(fan_pins_full_speed_when_the_ntc_reads_short),
+    TEST_ENTRY(manual_fan_speed_ignores_temperature_and_sensor_faults),
     TEST_ENTRY(fan_pwm_duty_matches_speed_percent),
     TEST_ENTRY(fan_speed_percent_is_clamped_to_100),
     TEST_ENTRY(pump_pwm_duty_matches_speed_percent),

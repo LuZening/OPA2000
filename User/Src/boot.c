@@ -60,14 +60,10 @@ void boot_gpio_safe_state(void)
     /* --- 1. RF path must stay de-energised while we boot ---------- */
     RF_BIAS_DISABLE();          /* PG2 low  - PA bias off          */
     PWR_ON_DISABLE();           /* PG7 low  - HV supply off        */
-    PSU_ON_PWR_OFF();           /* PG5 low  - PSU latch released   */
     RELAY1_OFF();               /* PG4 low  - antenna disconnected */
     RELAY2_OFF();               /* PG3 low  - PA disconnected      */
     PTT_OUT_OFF();              /* PC15 low - keying feedback off  */
 
-    /* --- 2. Keep the unit powered (soft-off is an active-low line) - */
-    HAL_GPIO_WritePin(REAR_RESERVED1_GPIO_Port, REAR_RESERVED1_Pin,
-                       GPIO_PIN_SET);
 
     /* --- 3. Blank the screen until the GUI has something to show ---- */
     /* BL_PWM is TIM4 CH3 (PD14).  MX_TIM4_Init() already ran, so the
@@ -156,5 +152,23 @@ void boot_backlight_on(void)
      * make the calibration feel worse.  One named constant so the level
      * can be retuned in one place. */
     power_set_backlight_duty(BOOT_BACKLIGHT_PCT);
+
+    /* Bring the panel out of standby on the same handshake.  Without
+     * this the backlight is on but the LTDC source/gate drivers stay
+     * blanked - the operator sees a uniformly lit white (or black)
+     * panel with no UI.  See hw_pinmap.h for the polarity note. */
+    TFT_DISP_ENABLE();
+#endif
+}
+
+void boot_panel_off(void)
+{
+#ifndef LVGL_SIM
+    /* Mirror of boot_backlight_on(), called on power_soft_off() so the
+     * panel darkens in step with the supply rather than glowing after
+     * the rail has dropped.  Order matters: blank the source drivers
+     * (TFT_DISP) BEFORE killing the backlight PWM, so the panel does
+     * not flash a frozen frame at full brightness during the collapse. */
+    TFT_DISP_DISABLE();
 #endif
 }

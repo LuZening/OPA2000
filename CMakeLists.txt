@@ -102,6 +102,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     User/Src/fan_tach.c
     User/Src/flash_eeprom.c
     User/Src/freq_detect.c
+    User/Src/freertos_hooks.c
     User/Src/gui.c
     User/Src/lv_port_disp.c
     User/Src/key.c
@@ -165,6 +166,13 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
+    FreeRTOS
+    STM32_Drivers
+    USB_Device_Library
 
     # Add user defined libraries
+    m
+    nosys
+    gcc
+    c
 )

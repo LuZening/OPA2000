@@ -172,12 +172,16 @@ bool config_save(void)
 void config_reset_default(void)
 {
     /* Start from a clean slate: the reserved[] padding must be zero or the
-     * CRC of an otherwise-identical blob would differ between runs. */
-    memset(&g_config, 0, sizeof(g_config));
+     * CRC of an otherwise-identical blob would differ between runs.
+     * Cast through (void *) to drop the volatile qualifier: g_config is
+     * volatile for the benefit of the multi-task readers, but this
+     * function is the single writer and is called from task context, so
+     * memset's lack of volatile reload is not a correctness issue here. */
+    memset((void *)&g_config, 0, sizeof(g_config));
 
     g_config.pc_baud_rate    = DEFAULT_PC_BAUD_RATE;
     g_config.radio_type      = RADIO_TYPE_UNKNOWN;
-    g_config.radio_baud_rate = 19200U;
+    g_config.radio_baud_rate = DEFAULT_RADIO_BAUD_RATE;
 
     /* Protection defaults - these mirror the DEFAULT_PROTECT_* / MAX_* in
      * opa2000.h; protection.c and boot.c read them back out of g_config and

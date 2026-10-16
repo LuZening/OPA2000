@@ -28,8 +28,15 @@
 #include "stm32h7xx_hal_stub.h"
 
 #include <stddef.h>
+#include <stdbool.h>
 
 extern TIM_HandleTypeDef htim15;
+
+/* Recorded by comm_host_stub.c, which stands in for the CAT link's
+ * alert-event publisher (see stubs/comm_host_stub.c). */
+extern unsigned int       comm_stub_event_count;
+extern volatile AlertSeverity comm_stub_last_severity;
+extern volatile bool      comm_stub_last_on;
 
 /*============================================================================
  *  Helpers
@@ -493,8 +500,9 @@ TEST_CASE(clear_releases_the_latch_pin_and_buzzer)
               GPIO_PIN_RESET_E);
     ASSERT_FALSE(buzzer_is_active());
     ASSERT_FALSE(buzzer_sounding());
-    /* Still latched out of RF until the operator re-calibrates. */
-    ASSERT_FALSE(g_allow_rf);
+    /* Dismiss re-arms RF: the CC6920 zero offset is unaffected by the
+     * fault, so the original calibration stays valid. */
+    ASSERT_TRUE(g_allow_rf);
 }
 
 TEST_CASE(clear_without_a_fault_is_harmless)
@@ -505,6 +513,172 @@ TEST_CASE(clear_without_a_fault_is_harmless)
 
     ASSERT_FALSE(protection_is_active());
     ASSERT_FALSE(buzzer_is_active());
+}
+
+/*============================================================================
+ *  Severity-driven behaviour (P0 = emergency, P1 = mild)
+ *==========================================================================*/
+
+TEST_CASE(severity_mapping_classifies_each_cause)
+{
+    ASSERT_EQ(alert_severity(ALERT_SWR_HIGH),            ALERT_SEV_P0);
+    ASSERT_EQ(alert_severity(ALERT_REFLECT_POWER_HIGH),  ALERT_SEV_P0);
+    ASSERT_EQ(alert_severity(ALERT_CURRENT_HIGH),        ALERT_SEV_P0);
+    ASSERT_EQ(alert_severity(ALERT_HARDWARE_FAULT),      ALERT_SEV_P0);
+    ASSERT_EQ(alert_severity(ALERT_OVERDRIVE),           ALERT_SEV_P0);
+    ASSERT_EQ(alert_severity(ALERT_FREQ_MISMATCH),       ALERT_SEV_P0);
+    ASSERT_EQ(alert_severity(ALERT_VBIAS_FAULT),         ALERT_SEV_P0);
+    ASSERT_EQ(alert_severity(ALERT_NTC_OVERHEAT),        ALERT_SEV_P1);
+    ASSERT_EQ(alert_severity(ALERT_FAN_FAULT),           ALERT_SEV_P1);
+    ASSERT_EQ(alert_severity(ALERT_NONE),                ALERT_SEV_NONE);
+}
+
+TEST_CASE(p1_thermal_fault_leaves_rail_up_and_only_blocks_ptt)
+{
+    prot_establish_ready_state();
+    stub_gpio_reset_counters();
+    unsigned int ev0 = comm_stub_event_count;
+
+    protection_trigger_locked(ALERT_NTC_OVERHEAT);
+
+    ASSERT_TRUE(protection_is_active());
+    ASSERT_EQ(g_alert_active, ALERT_NTC_OVERHEAT);
+    ASSERT_EQ(g_alert_severity, ALERT_SEV_P1);
+    /* The CAT link must learn about the raise immediately, not on the next
+     * 100 ms status poll. */
+    ASSERT_EQ(comm_stub_event_count, ev0 + 1U);
+    ASSERT_TRUE(comm_stub_last_on);
+    ASSERT_EQ(comm_stub_last_severity, ALERT_SEV_P1);
+    /* P1 must NOT drive the RF board protection bus - the PA temperature
+     * is a local concern, no need to latch the RF deck. */
+    ASSERT_EQ(stub_gpio_get_last(RF_IN_PROTECT_GPIO_Port, RF_IN_PROTECT_Pin),
+              GPIO_PIN_RESET_E);
+    /* P1 must NOT clobber g_allow_rf - the IMain zero offset is unaffected
+     * by PA temperature. */
+    ASSERT_TRUE(g_allow_rf);
+    /* P1 must NOT cut PWR_ON or RF_BIAS - the PA stays biased and ready
+     * to go the moment the operator dismisses.  prot_establish_ready_state
+     * already engaged the rail (PG5/PG7/PG2), so the last-written level
+     * for these pins is SET. */
+    ASSERT_EQ(stub_gpio_get_last(PWR_ON_GPIO_Port, PWR_ON_Pin), GPIO_PIN_SET_E);
+    ASSERT_EQ(stub_gpio_get_last(RF_BIAS_GPIO_Port, RF_BIAS_Pin), GPIO_PIN_SET_E);
+    /* P1 drops PTT_OUT (the only thing it does, alongside clearing
+     * g_tx_active below). */
+    ASSERT_EQ(stub_gpio_get_last(PTT_OUT_GPIO_Port, PTT_OUT_Pin), GPIO_PIN_RESET_E);
+    /* Buzzer started (P1 = single mid-tone, 1 s). */
+    ASSERT_TRUE(buzzer_is_active());
+    /* The g_alert_flag gate is what actually keeps the operator from
+     * keying again while the alert is up. */
+    ASSERT_TRUE(g_alert_flag);
+    ASSERT_FALSE(g_tx_active);
+}
+
+TEST_CASE(p1_dismiss_does_not_touch_protect_pin)
+{
+    prot_establish_ready_state();
+    unsigned int ev0 = comm_stub_event_count;
+    protection_trigger_locked(ALERT_NTC_OVERHEAT);
+    /* Drive the pin high by hand to simulate the surrounding hardware:
+     * P1 path never touched it, so dismiss must not clear it. */
+    HAL_GPIO_WritePin(RF_IN_PROTECT_GPIO_Port, RF_IN_PROTECT_Pin,
+                      GPIO_PIN_SET_E);
+
+    protection_clear();
+
+    /* Pin still set - P1 dismiss did not toggle it. */
+    ASSERT_EQ(stub_gpio_get_last(RF_IN_PROTECT_GPIO_Port, RF_IN_PROTECT_Pin),
+              GPIO_PIN_SET_E);
+    /* But the latch state is released. */
+    ASSERT_FALSE(protection_is_active());
+    ASSERT_FALSE(buzzer_is_active());
+    /* And the CAT link got the matching "cleared" event. */
+    ASSERT_EQ(comm_stub_event_count, ev0 + 2U);   /* raise + clear */
+    ASSERT_FALSE(comm_stub_last_on);
+}
+
+TEST_CASE(buzzer_stops_after_10s_even_undismissed)
+{
+    prot_establish_ready_state();
+    /* The default buzzer_start() path caps at 10 s.  Manually advance the
+     * wall clock past the deadline and tick. */
+    protection_trigger_locked(ALERT_CURRENT_HIGH);
+    ASSERT_TRUE(buzzer_is_active());
+    /* Simulate the deadline being reached by pushing it into the past:
+     * the host test cannot wait 10 s. */
+    buzzer_test_expire_deadline();
+    buzzer_tick();
+    ASSERT_FALSE(buzzer_is_active());
+    ASSERT_FALSE(buzzer_sounding());
+}
+
+/*============================================================================
+ *  Buzzer re-trigger guard
+ *  Note: protection_trigger_locked() itself short-circuits on
+ *  s_protection_active, so the "second trigger while latched" path is
+ *  exercised directly against the buzzer API.
+ *==========================================================================*/
+
+TEST_CASE(buzzer_repeat_p0_does_not_reset_the_deadline)
+{
+    prot_establish_ready_state();
+    buzzer_stop();                             /* drop any leftover state */
+    buzzer_start();
+    ASSERT_TRUE(buzzer_is_active());
+
+    uint32_t first_deadline = buzzer_test_get_deadline();
+    /* Pretend 3 s have passed: deadline is now first_deadline - 3000. */
+    buzzer_test_set_deadline(first_deadline - 3000U);
+
+    /* Second P0 call while the buzzer is already running.  Must NOT reset
+     * the deadline back to "now + 10 s" - that would let a chatter source
+     * keep the buzzer alive past 10 s forever. */
+    buzzer_start();
+
+    ASSERT_TRUE(buzzer_is_active());
+    ASSERT_EQ(buzzer_test_get_deadline(), first_deadline - 3000U);
+}
+
+TEST_CASE(buzzer_repeat_p1_is_suppressed_while_p0_sounding)
+{
+    prot_establish_ready_state();
+    buzzer_stop();                             /* drop any leftover state */
+    buzzer_start();                            /* P0 owns the buzzer */
+    ASSERT_TRUE(buzzer_is_active());
+    extern TIM_HandleTypeDef htim15;
+    fprintf(stderr, "[trace] buzzer_start: ARR=%u se=%u s_deadline=%u\n",
+            htim15.Instance->ARR, (unsigned)comm_stub_last_severity, buzzer_test_get_deadline());
+    /* P0 starts on the high note; capture ARR as the "P0 fingerprint". */
+    uint16_t p0_arr = htim15.Instance->ARR;
+    fprintf(stderr, "[trace] p0_arr=%u (expected %u)\n",
+            p0_arr, 12500000U / BUZZER_NOTE_HIGH_HZ);
+    ASSERT_EQ(p0_arr, 12500000U / BUZZER_NOTE_HIGH_HZ);
+
+    /* P1 trying to come in while P0 owns the buzzer must NOT downgrade
+     * the loop to a 1 s single tone. */
+    buzzer_start_p1();
+
+    ASSERT_TRUE(buzzer_is_active());
+    ASSERT_EQ(htim15.Instance->ARR, p0_arr);
+}
+
+TEST_CASE(buzzer_p1_upgrades_to_p0_when_p0_fires)
+{
+    prot_establish_ready_state();
+    buzzer_stop();                             /* drop any leftover state */
+    buzzer_start_p1();                         /* P1 owns the buzzer */
+    ASSERT_TRUE(buzzer_is_active());
+    extern TIM_HandleTypeDef htim15;
+    /* P1 is the single mid-tone. */
+    ASSERT_EQ(htim15.Instance->ARR,
+              12500000U / BUZZER_NOTE_MID_HZ);
+
+    /* P0 fires while P1 is sounding - the operator gets the full P0
+     * 3-tone loop, starting on the high note. */
+    buzzer_start();
+
+    ASSERT_TRUE(buzzer_is_active());
+    ASSERT_EQ(htim15.Instance->ARR,
+              12500000U / BUZZER_NOTE_HIGH_HZ);
 }
 
 /*============================================================================
@@ -560,6 +734,13 @@ const test_entry_t g_suite_protection[] = {
     TEST_ENTRY(backstop_does_nothing_when_healthy),
     TEST_ENTRY(clear_releases_the_latch_pin_and_buzzer),
     TEST_ENTRY(clear_without_a_fault_is_harmless),
+    TEST_ENTRY(severity_mapping_classifies_each_cause),
+    TEST_ENTRY(p1_thermal_fault_leaves_rail_up_and_only_blocks_ptt),
+    TEST_ENTRY(p1_dismiss_does_not_touch_protect_pin),
+    TEST_ENTRY(buzzer_stops_after_10s_even_undismissed),
+    TEST_ENTRY(buzzer_repeat_p0_does_not_reset_the_deadline),
+    TEST_ENTRY(buzzer_repeat_p1_is_suppressed_while_p0_sounding),
+    TEST_ENTRY(buzzer_p1_upgrades_to_p0_when_p0_fires),
     TEST_ENTRY(fault_strings_are_distinct_and_non_empty),
     TEST_SUITE_END
 };

@@ -183,19 +183,39 @@ OPA2000功放控制器H7版代码设计要求，使用STM32H7B0ZBT6 MCU（LQFP14
       标定方案与回填数据见 User/TODO-COMP1标定待办.txt。
 
 7.5.2 触发后的动作（中断上下文，0 延迟，只有第一次触发生效，后到的源不覆盖原因）
+    按告警级别走不同动作（单一来源映射表见 opa2000.c: alert_severity()）：
+
+    【P0 紧急级：功率 / 过流 / 过压 / 外部硬件故障】
     1) RF_IN_PROTECT_RAISE()  PB13 置高，最先通知 RF 板开展自己的保护动作
-       （提到最前：RF 板先锁硬件总线，其余动作都在本 MCU 内部，可随后执行）
     2) RELAY1_OFF + RELAY2_OFF + PTT_OUT 拉低（PC15 高有效）+ ptt_state = IDLE
     3) PWR_ON_DISABLE()  断高压
     4) RF_BIAS_DISABLE() 断 PA 偏置
-    5) buzzer_start()          PWM 驱动的经典 3 音阶警示音，开始循环播放
-    6) g_alert_active = 原因、g_alert_flag = true、g_allow_rf = false、g_tx_active = false
+    5) buzzer_start()          PWM 驱动的经典 3 音阶警示音，10s 上限（即使不 dismiss 也自动停）
+    6) g_alert_active = 原因、g_alert_severity = P0、g_alert_flag = true、
+       g_allow_rf = false、g_tx_active = false
     只要 g_alert_flag 为真，**任何 PTT 动作都被拒绝**（EXTI PTT、TIM7 轮询兜底、
     power_tx_enable() 三条路径都有联锁检查）。
 
+    【P1 温和级：温度 / 风扇 / 水泵（风扇 tach 暂未接线，ALERT_FAN_FAULT 是占位）】
+    P1 路径只做一件事：拒绝新的 PTT。所有"在轨"硬件（PWR_ON / RF_BIAS / 继电器 / PB13）
+    保持原状，PA 仍然带电待命。
+    1) 跳过 RF_IN_PROTECT_RAISE() —— PA 温度是本 MCU 自己的事，不必通知 RF 板
+    2) 跳过 RELAY1/RELAY2_OFF、PWR_ON_DISABLE、RF_BIAS_DISABLE —— PA 保持在 ready
+    3) PTT_OUT 拉低 + ptt_state = IDLE
+    4) buzzer_start_p1()       单长音 1500Hz 持续 1s（10s 上限内的更短促提醒）
+    5) g_alert_active = 原因、g_alert_severity = P1、g_alert_flag = true、
+       g_tx_active = false
+    【不】动 g_allow_rf —— CC6920 零点与温度无关，原标定值依然有效；dismiss 后立即可发射。
+    屏蔽 PTT 的实际机制是 [protection.c:protection_trigger_locked] 置 g_alert_flag，
+    ptt_apply_level() 的 `if (... || g_alert_flag)` 把请求拦掉；只要 dismiss 清掉
+    g_alert_flag，下次按 PTT 就能正常上高压发射。
+
+    蜂鸣器最大时长硬上限 10s（设计要求："哪怕不 dismiss 也不能一直鸣响"）。
+
 7.5.3 蜂鸣器（TIM15_CH2 PWM，整数实现，由 TIM7 的 100µs tick 推进状态机）
-    音阶：高音 2500Hz / 中音 1500Hz / 低音 800Hz，每个 300ms，
-          然后静音 3s，再从头循环，直到用户完成解除动作。
+    P0: 高音 2500Hz / 中音 1500Hz / 低音 800Hz，每个 300ms，
+        然后静音 3s，再从头循环，最长 10s（HAL_GetTick() 硬上限，buzzer_tick() 自检）
+    P1: 中音 1500Hz 连续 1s 一次
     时钟 = APB1 200MHz / 16 = 12.5MHz，ARR = 12.5e6 / f，CCR2 = ARR/2（50% 占空）。
     buzzer_stop() 由 protection_clear() 调用，不要在别处重复调用。
 
@@ -203,9 +223,11 @@ OPA2000功放控制器H7版代码设计要求，使用STM32H7B0ZBT6 MCU（LQFP14
     保护一旦触发就锁存，不会自动恢复。解除只有两条路：
     · GUI：监听 g_alert_flag/g_alert_active 弹模态告警框，用户点确定后调 protection_clear()
     · 通信：CAT 串口或 SPI6 数据包里收到"解除告警"命令后调 protection_clear()
-    protection_clear() 一次性做三件事：清内部锁存与 g_alert_*、
-    RF_IN_PROTECT_CLEAR() 拉低 PB13、buzzer_stop() 静音蜂鸣器。
-    **解除后 g_allow_rf 仍是 false**，必须让用户重跑 IM 零点校准才重新允许发射；
+    protection_clear() 一次性做四件事：清内部锁存与 g_alert_*、
+    buzzer_stop() 静音蜂鸣器、（仅 P0）RF_IN_PROTECT_CLEAR() 拉低 PB13、
+    g_allow_rf = true。
+    P1 解除后 PB13 本来就未动；g_allow_rf 本来就未动；操作员立即可再次发射。
+    P0 解除后恢复射频——CC6920 零点与本次故障无关，原标定值继续有效；
     g_hv_on 不动（面板仍显示就绪），要真正重新上高压得显式调 power_hv_disable() → power_hv_enable()。
     详细分工与代码示例见 docs/AGENT_BRIEFING.md 的 5.4（GUI）/ 5.5（通信）/ 5.6（责任边界）。
 

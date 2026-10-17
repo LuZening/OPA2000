@@ -49,12 +49,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 # Add USB MSC source files
-file(GLOB USB_MSC_SOURCES
-    "Middlewares/ST/STM32_USB_Device_Library/Class/MSC/Src/usbd_msc.c"
-    "Middlewares/ST/STM32_USB_Device_Library/Class/MSC/Src/usbd_msc_bot.c"
-    "Middlewares/ST/STM32_USB_Device_Library/Class/MSC/Src/usbd_msc_data.c"
-    "Middlewares/ST/STM32_USB_Device_Library/Class/MSC/Src/usbd_msc_scsi.c"
-)
+# (moved to cmake/stm32cubemx/CMakeLists.txt - now part of the
+#  USB_Device_Library OBJECT library alongside the CDC class)
 
 # Add LVGL core sources
 file(GLOB_RECURSE LVGL_CORE_SOURCES
@@ -84,7 +80,6 @@ file(GLOB_RECURSE LVGL_GPU_SOURCES
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    ${USB_MSC_SOURCES}
     ${LVGL_CORE_SOURCES}
     ${LVGL_DRAW_SOURCES}
     ${LVGL_HAL_SOURCES}
@@ -113,18 +108,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     User/Src/protection.c
     User/Src/radio_band.c
     User/Src/radio_uart.c
-    # Excluded until CubeMX generates the FatFs middleware: the current build
-    # has no FatFs include directory at all, so sdcard_storage.h's
-    # "#include <ff.h>" cannot resolve.  usbd_msc_if.c includes the same
-    # header, so it goes with it.  Re-add both once FatFs (and USB_DEVICE,
-    # for the MSC stack) are enabled in the .ioc and the code regenerated.
-    # User/Src/sdcard_storage.c
-    # User/Src/usbd_msc_if.c
+    # FatFs is enabled in the .ioc again, so sdcard_storage.c can resolve
+    # its "#include <ff.h>" and is back in the build.
+    User/Src/sdcard_storage.c
     User/Src/touch.c
     User/Src/ns2009.c
     User/Src/user_adc.c
-    User/Src/usbd_cdc_msc_wrapper.c
-    User/Src/usbd_composite_desc.c
     User/Src/usb_dma.c
     User/fonts/MyCJK_12.c
     User/fonts/MyCJK_16.c
@@ -135,23 +124,22 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/ST/STM32_USB_Device_Library/Class/MSC/Inc
-    ${CMAKE_SOURCE_DIR}/User/Inc
+    ${CMAKE_CURRENT_SOURCE_DIR}/User/Inc
     ${CMAKE_SOURCE_DIR}/User
     ${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/lvgl
     ${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/lvgl/src
+    ${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/FatFs/src
+    ${CMAKE_SOURCE_DIR}/FATFS/App
+    ${CMAKE_SOURCE_DIR}/FATFS/Target
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     LV_CONF_INCLUDE_SIMPLE
-    # CDC endpoint overrides for CDC+MSC composite device
+    # CDC endpoint overrides for CDC_HS virtual COM port
     CDC_IN_EP=0x82U
     CDC_OUT_EP=0x01U
     CDC_CMD_EP=0x81U
-    # MSC endpoint overrides for CDC+MSC composite device
-    MSC_EPIN_ADDR=0x83U
-    MSC_EPOUT_ADDR=0x03U
 )
 
 # Remove wrong libob.a library dependency when using cpp files

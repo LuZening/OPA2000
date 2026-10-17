@@ -2,6 +2,8 @@
 build/
 EWARM/
 cmake-build-*/
+Debug/
+Release/
 *.o
 *.obj
 *.su
@@ -10,6 +12,11 @@ cmake-build-*/
 *.elf
 *.hex
 *.bin
+
+# CubeIDE project metadata (regenerated on every import / tool update)
+.settings/
+.project
+.cproject
 
 # Host unit-test build trees (the ARM preset only covers build/)
 User/Tests/build*/

@@ -27,6 +27,7 @@
 #include "dma.h"
 #include "dma2d.h"
 #include "dts.h"
+#include "fatfs.h"
 #include "fdcan.h"
 #include "i2c.h"
 #include "usart.h"
@@ -155,6 +156,7 @@ int main(void)
   MX_SAI2_Init();
   MX_TIM4_Init();
   MX_SPI6_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   /* =========================================================================
    *  BOOT SEQUENCE (design spec 2026-10-14)

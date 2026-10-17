@@ -1,6 +1,6 @@
 /**
  * @file sdcard_storage.c
- * @brief SD Card Storage for USB MSC - uses FatFS disk layer
+ * @brief SD Card access layer on top of the FatFs disk driver
  */
 
 #include "sdcard_storage.h"

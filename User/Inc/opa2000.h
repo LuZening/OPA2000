@@ -20,7 +20,6 @@
 extern "C" {
 #endif
 
-typedef unsigned int uint32_t;
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>

@@ -66,7 +66,7 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../FATFS/Target/fatfs_platform.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../FATFS/Target/bsp_driver_sd.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../FATFS/Target/sd_diskio.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../startup_stm32h7b0xx.s
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Startup/startup_stm32h7b0zbtx.s
 )
 
 # FatFs engine.  R0.15c tree dropped in from the LLMC_DAC project (same

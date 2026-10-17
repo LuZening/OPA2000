@@ -78,11 +78,11 @@ int Write(uint32_t Address, uint32_t Size, uint8_t* buffer)
 {
 	__enable_irq(); //enable interrupts
 
-//    if (W25Q128_OCTO_SPI_Init(&hospi1, 1) != HAL_OK)
-//    {
-//    	__disable_irq();  //disable interrupts
-//        return LOADER_FAIL;
-//    }
+    if (W25Q128_OCTO_SPI_Init(&hospi1, 1) != HAL_OK)
+    {
+    	__disable_irq();  //disable interrupts
+        return LOADER_FAIL;
+    }
 
     if (W25Q128_OSPI_Write(&hospi1, (uint8_t*) buffer, (Address & (0x0fffffff)), Size) != HAL_OK)
     {
@@ -105,11 +105,11 @@ int SectorErase(uint32_t EraseStartAddress, uint32_t EraseEndAddress)
 {
 	__enable_irq(); //enable interrupts
 
-//    if (W25Q128_OCTO_SPI_Init(&hospi1, 1) != HAL_OK)
-//    {
-//    	__disable_irq();  //disable interrupts
-//        return LOADER_FAIL;
-//    }
+    if (W25Q128_OCTO_SPI_Init(&hospi1, 1) != HAL_OK)
+    {
+    	__disable_irq();  //disable interrupts
+        return LOADER_FAIL;
+    }
 
     if (W25Q128_OSPI_EraseSector(&hospi1, EraseStartAddress, EraseEndAddress) != HAL_OK)
     {
@@ -135,11 +135,11 @@ int MassErase(void)
 {
 	__enable_irq(); //enable interrupts
 
-//    if (W25Q128_OCTO_SPI_Init(&hospi1, 1) != HAL_OK)
-//    {
-//    	__disable_irq();  //disable interrupts
-//        return LOADER_FAIL;
-//    }
+    if (W25Q128_OCTO_SPI_Init(&hospi1, 1) != HAL_OK)
+    {
+    	__disable_irq();  //disable interrupts
+        return LOADER_FAIL;
+    }
 
     if (W25Q128_OSPI_Erase_Chip(&hospi1) != HAL_OK)
     {
@@ -251,11 +251,11 @@ uint64_t Verify(uint32_t MemoryAddr, uint32_t RAMBufferAddr, uint32_t Size, uint
     uint64_t checksum;
     Size *= 4;
 
-//    if (W25Q128_OCTO_SPI_Init(&hospi1, 0) != HAL_OK)
-//    {
-//    	__disable_irq();  //disable interrupts
-//        return LOADER_FAIL;
-//    }
+    if (W25Q128_OCTO_SPI_Init(&hospi1, 0) != HAL_OK)
+    {
+    	__disable_irq();  //disable interrupts
+        return LOADER_FAIL;
+    }
 
     if (W25Q128_OSPI_EnableMemoryMappedMode(&hospi1) != HAL_OK)
     {

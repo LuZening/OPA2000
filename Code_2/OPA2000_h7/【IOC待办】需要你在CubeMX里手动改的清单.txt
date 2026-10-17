@@ -1,0 +1,400 @@
+========================================================================
+  ★★★  OPA2000_H7  .ioc 手工修改清单  ★★★
+  文件：OPA2000_h7.ioc
+  整理时间：2026-10-14      整理人：Control Agent
+  看完并改完后请删除本文件
+========================================================================
+
+【怎么用这个文件】
+  我已经把 OPA2000_h7.ioc 的当前内容逐条和固件代码的需求对过了，
+  下面的每一节都标了 **当前 ioc 里是什么** / **要改成什么** / **不改的后果**。
+
+  分成四类：
+    A. 阻塞项 —— 不改，对应功能完全不工作（3 项）
+    B. 建议项 —— 不改能跑，但性能/安全性打折（3 项）
+    C. 已满足，只需核对 —— 我确认 ioc 里已经配好（7 项）
+    D. 重新 Generate Code 后要确认的 —— 源文件列表（1 项）
+
+  ⚠ 重要前提：改完 ioc 必须点 **Generate Code**。
+    现在 Core/Src/stm32h7xx_it.c 里还找不到 EXTI9_5 / UART4 /
+    DMA2_Stream6 / DMA2_Stream7 的 IRQHandler，Core/Src/gpio.c 里
+    也还没有 PF5 (PTT_INX) 的 EXTI 配置——说明生成代码是旧的，
+    ioc 改了但没重新生成过。生成后这些应该自动出现。
+
+
+========================================================================
+  A. 阻塞项（不改就不工作）
+========================================================================
+
+------------------------------------------------------------------------
+【A1】★★★ PF5 = PTT_INX 现在是单上升沿，踩下踏板进不了中断 ★★★
+------------------------------------------------------------------------
+当前 ioc：
+    PF5.GPIOParameters=GPIO_PuPd,GPIO_Label
+    PF5.GPIO_Label=PTT_INX
+    PF5.GPIO_PuPd=GPIO_PULLUP
+    PF5.Signal=GPXTI5
+  注意：这一行**没有** GPIO_ModeDefaultEXTI，CubeMX 默认给
+  External Interrupt Mode with **RISING** edge only。
+
+  而 PTT_INX 是低电平有效：
+      踩下 = 下降沿 → 现在不触发 → 功放起不了射
+      松开 = 上升沿 → 现在触发   → 只收到"松开"
+
+要改成：
+    [ ] GPIO Mode 选 **External Interrupt Mode with Rising / Falling
+        edge trigger detection**（生成的 main.c 里应变成
+        GPIO_MODE_IT_RISING_FALLING）
+
+代码侧已就绪：PTT ISR 读的是引脚实时电平，不区分哪个边沿，双边沿不会算错；
+松开的兜底轮询在 TIM7 tick 里，最多一个 tick 内也会对齐。
+
+------------------------------------------------------------------------
+【A2】★★★ NVIC 里根本没有 EXTI9_5_IRQn —— 只改 A1 也没用 ★★★
+------------------------------------------------------------------------
+当前 ioc：NVIC 列表里**没有** NVIC.EXTI9_5_IRQn 这一行。
+  EXTI5（PF5）属于 EXTI line[9:5] 组，NVIC 不开这一组，
+  就算边沿改成双边沿，中断也不会被 CPU 响应。
+
+要加：
+    [ ] NVIC → 勾 **EXTI line[9:5] interrupts**
+        抢占优先级 **1**，子优先级 0
+
+  这是最容易漏的一条。A1 和 A2 必须同时做。
+
+------------------------------------------------------------------------
+【A3】NVIC 里也没有 EXTI2_IRQn（GT911 触摸 INT，PF2）
+------------------------------------------------------------------------
+当前 ioc：
+    PF2.Signal=GPXTI2      （GT911 的 LCT_INT）
+  但 NVIC 里没有 NVIC.EXTI2_IRQn。
+
+  [ ] 可选：勾 **EXTI line[2] interrupts**，抢占优先级 5
+
+  说明：我查过 touch.c，touch_process() 是**轮询读触摸**的，
+  不依赖这个 INT 标志，所以不开也不影响触摸使用。
+  只有将来想用 INT 做低功耗唤醒时才需要开。优先级低，可以先跳过。
+
+
+========================================================================
+  B. 建议项（不改能跑，但打得折扣 / 有风险）
+========================================================================
+
+------------------------------------------------------------------------
+【B1】TIM5_IRQn / TIM7_IRQn 抢占优先级 2 → 1
+------------------------------------------------------------------------
+当前 ioc：
+    NVIC.TIM5_IRQn=true\:2\:0\:...
+    NVIC.TIM7_IRQn=true\:2\:0\:...
+  代码假设这两者应在 FreeRTOS 之上、硬件保护之下，即抢占优先级 1：
+    TIM5 = 继电器 15ms 延时 one-shot
+    TIM7 = 快速 tick（PTT 释放兜底 + 蜂鸣器音阶 + 风扇测速）
+
+  [ ] TIM5_IRQn 抢占优先级 2 → **1**
+  [ ] TIM7_IRQn 抢占优先级 2 → **1**
+
+  不改的后果：不致命。只是这两个 tick 可能被同优先级的 DMA/SPI 中断
+  拖延，PTT 释放兜底响应和风扇测速精度会略降。
+
+------------------------------------------------------------------------
+【B2】AWD 门限初值（代码会覆写，但上电瞬间有影响）
+------------------------------------------------------------------------
+当前 ioc：
+    ADC1.AWD1HighThreshold=32767
+    ADC1.AWD2HighThreshold=32767
+    ADC2.AWD1HighThreshold=32767
+  （LowThreshold 未设 = 0）
+
+  代码 adc_calibration.c 会在运行时用 adc_awd_set_*() 直接写
+  ADC1->HTR1/2/3、LTR1/2/3，所以 ioc 初值只影响"上电到第一次配置
+  之间"这一小段。建议顺手改成：
+    [ ] ADC1.AWD1HighThreshold = 0        （等波段配置写满再启用，避免误触发）
+    [ ] ADC1.AWD2HighThreshold = 64015    （30 A，OPA1000 模型反算）
+    [ ] ADC1.AWD3HighThreshold = 47757    （800 W）
+  ⚠ STM32H7B0 上 AWD1/AWD2/AWD3 各有独立 LTR1/HTR1、LTR2/HTR2、
+    LTR3/HTR3，互不干扰（与 H743 不同），可放心分别设限。
+
+------------------------------------------------------------------------
+【B3】TIM7 的 Prescaler / Period
+------------------------------------------------------------------------
+当前 ioc：
+    TIM7.IPParameters=Prescaler
+    TIM7.Prescaler=3        （Period 未列，约 1.3 ms/tick）
+
+  但 freq_detect_init() / fan_tach_init() 会在运行时重写
+  htim7->PSC / htim7->ARR，所以 ioc 里这个值实际上不影响运行。
+
+  [ ] 可以不改。若想 ioc 与代码一致，改成 Prescaler=19 / Period=999（100 µs）
+  ⚠ 注意代码内部目前对 TIM7 周期有冲突（freq_detect 要 100 µs、
+    fan_tach 要 500 µs），这是我接下来要修的代码问题，不是 ioc 问题，
+    见文末"代码侧顺手提醒"。
+
+
+========================================================================
+  C. 已满足 —— 请核对（我确认 ioc 里已经配好）
+========================================================================
+
+------------------------------------------------------------------------
+【C1】UART4（电台 CAT）+ DMA + NVIC   ✔ 已配
+------------------------------------------------------------------------
+    Mcu.IP35=UART4         PC10=UART4_TX  PC11=UART4_RX
+    NVIC.UART4_IRQn=true:5:0                ✔ 抢占优先级 5
+    Dma.UART4_RX.8 → DMA2_Stream7，PeriphToMemory，Circular，Byte/Byte，
+                    Priority=Low            ✔
+    Dma.UART4_TX.9 → DMA2_Stream6            （额外配了 TX DMA；代码用
+                                             阻塞发送也够，多占一个流但无冲突）
+  [ ] 核对波特率：UART4 当前参数设置应与代码 g_config.radio_baud_rate 一致
+      （默认按 9600 8N1；接上电台若不通再调 19200）
+  DMA 占用已核对无冲突：
+      DMA1_S0=SPI1_RX  S1=SPI1_TX  S2=I2C3_RX  S3=I2C3_TX  S6=ADC1  S7=ADC2
+      DMA2_S0=TIM2_CH1 S1=TIM2_CH2 S6=UART4_TX S7=UART4_RX   DMA2D=LCD
+
+------------------------------------------------------------------------
+【C2】TIM15 蜂鸣器   ✔ 已配
+------------------------------------------------------------------------
+    Mcu.IP34=TIM15
+    TIM15.Prescaler=15
+    TIM15.Channel-PWM Generation2 CH2=TIM_CHANNEL_2
+    PE6.Signal=S_TIM15_CH2，PE6.GPIO_Label=BUZZER      ✔
+  [ ] 确认 PE6 就是蜂鸣器 PWM 输出脚
+  [ ] 确认**没有**开 TIM15 更新中断（音阶状态机挂在 TIM7 上，开 TIM15
+      中断是多余的）
+
+------------------------------------------------------------------------
+【C3】保护路径中断   ✔ 已配
+------------------------------------------------------------------------
+    NVIC.ADC_IRQn=true:0:0        （AWD1/2/3 + DMA 完成 + 注入完成）
+    NVIC.COMP_IRQn=true:0:0       （COMP1 过驱 / COMP2 过流）
+    NVIC.EXTI15_10_IRQn=true:0:0  （HARDPWR_ERR）
+    PB12.Signal=GPXTI12，GPIO_MODE_IT_RISING，GPIO_PULLDOWN   ✔
+    PB13.Signal=GPIO_Output       （RF_IN_PROTECT_CPU_SIG）   ✔
+  [ ] 核对 PB13 是 GPIO **Output 推挽、初始电平 Low**
+  [ ] 核对 PB12 是 **Pull-Down**（高电平有效，上升沿报警）
+
+------------------------------------------------------------------------
+【C4】VREFBUF / ADC 分辨率   ✔ 已配
+------------------------------------------------------------------------
+    Mcu.IP36=VREFBUF，VREF+.Signal=VREFBUF_OUT         ✔
+  [ ] VREFBUF 保持 ENABLE
+  [ ] ADC1/ADC2 分辨率保持 **16 bit**（adc_calibration.c 全部按
+      16bit / 2500 mV 换算，改 VREF 会让功率/电流/温度全部偏移）
+
+------------------------------------------------------------------------
+【C5】ADC 模拟看门狗通道   ✔ 已配
+------------------------------------------------------------------------
+    ADC1: WatchdogChannel=AWD1=CH4（RF输入）
+          WDG2ChannelR2=AWD2=CH5（主电流 IMain）
+          WDG3ChannelR3=AWD3=CH6（耦合器1 反射 REV1）
+          AWD1/AWD2/AWD3 ITMode 均为 ENABLE
+    ADC2: WatchdogChannel=AWD1=CH0，WDG2ChannelR2=AWD2=CH1；
+          AWD3 disabled（ADC2 只有 2 个通道，合理）
+  与 hw_pinmap.h 的 AWD1_CHANNEL=CH4 / AWD2_CHANNEL=CH5 / AWD3_CHANNEL=CH6 一致 ✔
+
+------------------------------------------------------------------------
+【C6】LPF 波段引脚   ✔ 引脚已配，请核对波段顺序
+------------------------------------------------------------------------
+    PE1=LPF1  PE2=LPF2  PE3=LPF3  PE4=LPF4  PE5=LPF5  PC14=LPF6（备用）
+  代码 power_control.c 假设 **数字越小波长越短**：
+    LPF1 = 15-10 m     LPF2 = 20-17 m    LPF3 = 40-30 m
+    LPF4 = 80 m        LPF5 = 160 m      LPF6 = 备用
+  [ ] 请在 ioc 的 GPIO 标签里核对 PE1…PE5 接到 H3 的实际波段
+      顺序与上表一致
+  [ ] 如果 LPF6(PC14) 实际接了某个波段，请告诉我，代码里现在没用它
+
+------------------------------------------------------------------------
+【C7】PTT_OUT   ✔ 已配
+------------------------------------------------------------------------
+    PC15.Signal=GPIO_Output，GPIO_Label=PTT_OUT          ✔
+  （PTT_OUT 高电平有效，代码已按此实现）
+
+
+========================================================================
+  D. Generate Code 之后要确认的源文件列表
+========================================================================
+
+------------------------------------------------------------------------
+【D1】User/Src 里新增/删除的文件是否被自动收录
+------------------------------------------------------------------------
+  本次新增的 Control 源文件（我暂时用 CMakeLists.txt 里的
+  "USER CODE BEGIN (Control agent sources)" 块兜着）：
+      User/Src/adc_calibration.c
+      User/Src/alc_pwm.c
+      User/Src/buzzer.c
+      User/Src/fan_tach.c
+      User/Src/radio_band.c
+      User/Tests/... （host 测试，不进固件）
+
+  [ ] 生成后确认这 5 个 .c 都在 CMake 的源文件列表里
+  [ ] 生成后确认已删除的旧文件**不再**出现：
+      User/Src/pca9539.c
+      User/Src/eeprom.c
+  [ ] 如果 CubeMX 重新生成后已自动收录上面 5 个文件，可以把我加的
+      那个 USER CODE 块删掉（省得重复）
+
+
+========================================================================
+  附：不是 ioc 的事，但顺手提醒你（代码侧，我会处理）
+========================================================================
+  · TIM7 周期冲突：freq_detect.c 按 100 µs（PSC=19/ARR=999）算频率，
+    fan_tach.c 按 500 µs（PSC/ARR=4999）测转速，两者都写 htim7 →
+    后者覆盖前者。需要一个统一的 TIM7 周期或各自分频，我会修。
+  · comm.c 的 CMD_ALERT_OFF：现在只清 g_alert_active / g_alert_flag，
+    没调 protection_clear() → 锁存还在、PB13 仍高、蜂鸣器仍响。
+    应改成调 protection_clear()，我会修。
+  · radio_band.c（电台协议解析）：当前处于"去防抖"改动的半成品状态，
+    暂时编译不过（残留对已删变量的引用），我会在本文件交付后接着改完，
+    并同步更新 User/Tests/test_radio_band.c 里的防抖用例。
+
+========================================================================
+  第五轮：外部 OSPI FLASH 启动（app 工程）—— 2026-10-14
+========================================================================
+  背景：架构改为「内部 128KB FLASH 只放 bootloader，app 的代码/只读数据/
+  字库全部放在外部 OSPI（memory-mapped 0x90000000）里 XIP 运行」。
+  app 工程的链接脚本与构建已经改完（见文末），下面两项**必须在 CubeMX 里
+  改完并 Generate Code**，否则 app 被 bootloader 拉起后会立即 HardFault。
+
+------------------------------------------------------------------------
+【E1】★★★ 禁用 OCTOSPI1 —— 否则 app 一上电就 HardFault ★★★
+------------------------------------------------------------------------
+  当前 ioc：
+      Mcu.IP20=OCTOSPI1
+      VP_OCTOSPI1_VS_quad.Mode=quad_mode
+      PF6..PF10 / PG6 复用为 OCTOSPIM_P1
+  → CubeMX 会在 Core/Src/main.c 里生成并调用 MX_OCTOSPI1_Init()。
+
+  问题：app 的取指就跑在 OCTOSPI1 的 memory-mapped 映射里。MX_OCTOSPI1_Init()
+  一旦执行 HAL_OSPI_Init() 去写 OSPI 寄存器，映射当场失效 → 下一条取指即崩。
+  参考工程 LLMC_DAC 的 app main() 里**没有** MX_OCTOSPI1_Init 调用，OSPI 完全
+  交给 bootloader；本工程必须同样处理。
+
+  为什么我不直接改 main.c：它由 CubeMX 生成，重新 Generate 会恢复调用；
+  正确的永久做法是在 ioc 里禁用该外设。
+
+  [x] 已改。本 Agent 已核对生成代码：
+        · Core/Src/main.c 中已无 MX_OCTOSPI1_Init() 调用
+        · Core/Src/octospi.c 已不在 cmake 编译列表内
+      （磁盘上残留的 octospi.c/octospi.h 会在下次 Generate 时被 CubeMX 删除）
+
+------------------------------------------------------------------------
+【E2】★★★ MPU：OSPI 必须可缓存 + 允许取指；SRAM 划出不可缓存窗口 ★★★
+------------------------------------------------------------------------
+  你已在 ioc 里重设 MPU（生成代码 Region0..Region6）。本 Agent 按 app.ld 的
+  实际内存布局逐条核对，结论：**R4 和 R6 两处必须再改，其余已经正确**。
+
+  已正确：
+    R0  0x08000000  256KB   内部 FLASH（app 不用，保留无妨）
+    R1  0x90000000  128MB   CACHEABLE + INSTRUCTION_ACCESS_ENABLE   ← OSPI/XIP
+    R2  0x20000000  128KB   NOT_CACHEABLE（DTCM；TCM 本就不走 cache，无妨）
+    R3  0x24000000  1MB     CACHEABLE                              ← AXI SRAM
+    R5  0x30000000  128KB   CACHEABLE（D2 SRAM1，本工程未用）
+
+  ✗ (1) R4 = 0x24000000 / 512KB / AccessPermission = **NO_ACCESS**  ← 致命
+        它比 R3 编号高，会盖住 0x24000000-0x24080000；而 app.ld 恰好把
+        .framebuffer(0x24000000) 和 .dma_no_cache(0x24040000，装了 ADC/CAT/
+        USB/ALC/LVGL 的全部 DMA 缓冲) 放在这一段。NO_ACCESS 会让 CPU 一碰
+        就 MemManage fault（第一次 LCD 刷新 / USB 发送即挂）。
+      → AccessPermission 改成 **FULL_ACCESS**；IsCacheable/IsBufferable 保持
+        NOT_CACHEABLE/NOT_BUFFERABLE（这正是要的“不可缓存窗口”）。
+        DisableExec 保持 DISABLE 即可（纯数据窗口）。
+
+  ✗ (2) R6 = 0x38000000 / 32KB **继承了 R5 的 CACHEABLE**  ← 需改
+        这是 D3 域 SRAM4；app.ld 的 .d3_dma_buffer 把 LPUART1 的 BDMA2 接收
+        缓冲放在 0x38000000。BDMA 直接写内存、不维护 cache，若该区可缓存，
+        CPU 读到的会是陈旧数据。
+      → IsCacheable = **NOT_CACHEABLE**、IsBufferable = **NOT_BUFFERABLE**；
+        AccessPermission 保持 FULL_ACCESS。
+
+  背景（为什么 R1/R4/R6 是这三种属性）：
+    · 外部 OSPI（R1）必须 cacheable+可执行，否则 XIP 取指又慢又可能被 exec
+      位拦住；见 ST 对 H7 的说明：D3 只能被 D3 主线访问，TCM 只有 MDMA 能到。
+    · AXI SRAM（R3）默认 cacheable；只有 DMA 会碰的 framebuffer/DMA 窗口
+      （R4 = 0x24000000 起 512KB）单独挖成不可缓存。
+    · D3 SRAM4（R6）是 BDMA2 唯一能访问的存储，必须不可缓存。
+  ⚠ R4/R6 的基址与大小必须和 app.ld 对齐（地址由 app.ld 导出的
+    _framebuffer_start / _dma_no_cache_start / _d3_dma_buffer_start 固定，
+    不会漂移）：
+        .framebuffer    0x24000000  256KB
+        .dma_no_cache   0x24040000  ~56KB（R4 的 512KB 窗口内）
+        .d3_dma_buffer  0x38000000  256B
+
+  [ ] 改 R4、R6 两处 + 重新 Generate Code。
+  [ ] 生成后确认 Core/Src/main.c 的 MPU_Config() 里 R4 是 FULL_ACCESS +
+      NOT_CACHEABLE、R6 是 NOT_CACHEABLE。
+
+========================================================================
+  附：app 工程本轮**已完成**的改动（无需你操作）
+========================================================================
+  · app.ld：
+      FLASH 0x90000000 LENGTH=16M，.isr_vector/.text/.rodata/.font 全部 XIP；
+      .data/.bss 放 DTCM；0x24000000 固定 256KB .framebuffer；
+      0x24040000 起 .dma_no_cache（D1，收拢 .dma_buffer + .lvgl_buffer +
+      .usb_dma_buffer + alc_pwm 的 BSRR 载荷）；
+      0x38000000 起 .d3_dma_buffer（D3 SRAM4，BDMA2 用）；.CCMRAM_heap 放 DTCM；
+      含 7 条 ASSERT 校验。
+  · cmake/gcc-arm-none-eabi.cmake 里 -T 已指向 ${CMAKE_SOURCE_DIR}/app.ld。
+  · STM32H7B0XX_FLASH.ld 保持不动（留给 bootloader 工程）。
+  · **DMA 缓冲的总线域/缓存审计（已全部修正）**：
+      外设             DMA           域  缓冲位置（app.ld 段）
+      ADC1/ADC2        DMA1_S6/S7    D2  0x24040040 .dma_no_cache   ✓
+      UART4 (CAT)      DMA2_S7/S6    D2  0x24040000 .dma_buffer     ✓
+      TIM2 CH1/2 (ALC) DMA2_S0/S1    D2  0x2404DC20 .dma_no_cache   ✓（原 DTCM）
+      DMA2D / LTDC     （D1 总线主）  D1  0x24000000 / 0x240401A0    ✓
+      USB OTG HS CDC   内部 DMA       D2  0x2404CC20 / 0x2404D420    ✓（原 DTCM）
+      LPUART1          BDMA2         D3  0x38000000 .d3_dma_buffer  ✓（原 DTCM）
+    依据（ST 官方）：BDMA 只能访问 D3 的 SRAM4/Backup SRAM；DMA1/DMA2 与
+    USB 内部 DMA 都访问不到 ITCM/DTCM（TCM 只有 CPU 与 MDMA 能到）。
+    改动都落在 User 侧：comm.c（LPUART 缓冲→SRAM4）、alc_pwm.c（BSRR 载荷→
+    非缓存段）、新增 User/{Inc/usb_dma.h, Src/usb_dma.c}，并在 usbd_cdc_if.c 的
+    USER CODE 8/11/12 里把 USB 收发缓冲改指过去（Generate Code 不会丢）。
+  · 实测链接通过（GCC 14.3.1）：FLASH 954KB/16MB、DTCM 54%、RAM 30.4%、
+    SRAM4 256B。
+  · 待你确认：app.ld 里 OSPI 的 LENGTH=16M 是按 W25Q128 填的，请按实物芯片
+    核对容量（本工程原 octospi.c 的 DeviceSize=32 只是 CubeMX 占位值）。
+  · 向量表重定位（system_stm32h7xx.c：.isr_vector_ram 缓冲 + 从 0x90000000
+    memcpy 到 ITCM + 改写 VTOR）已在位；它在生成区外，每次 Generate Code 后
+    请按 CLAUDE.md「Vector Table Relocation」复查它没被覆盖。
+
+========================================================================
+  第六轮：触屏 NS2009 驱动（app 工程侧已完成，等你 ioc 同步）
+========================================================================
+  现状（app 改完，等 ioc）：
+    - User/Src/ns2009.c / User/Inc/ns2009.h 已写好：I2C2 0x48 探测 + 读 X/Y。
+      100 ms I2C 超时；读 0x82 (X) + 0x84 (Y) 两个 8-bit 寄存器。
+    - User/Src/touch.c 已支持三段探测：GT911（I2C3）→ NS2009（I2C2）→ XPT2046
+      （SPI1 兜底）。第一个 ACK 的赢。
+    - 触屏外部 API（touch_init / touch_process / touch_get_position /
+      touch_calibrate_*）未变，GUI 完全无感。
+    - 上电顺序在 main() 已改为：MX_*_Init → config_init → touch_init →
+      g_calibration_required 决策 → osKernelStart → GUI 任务按
+      g_calibration_required 路由（true → gui_show_calibration）。
+    - 触屏回调函数未新增：LVGL indev 的 read_cb 仍由 gui.c 维护，调
+      touch_get_position()（sim 下用 cal_sim_touch_cb，生产下用
+      lvgl 真板回调，自动选 GT911 或 NS2009）。
+
+  你需要在 ioc 里做的事（一次性，Generate Code 后生效）：
+    - I2C2：当前 main.c:151 已经 MX_I2C2_Init()（CubeMX 已生成了
+      默认 config），无需手动改 .ioc，Generate Code 后保持。
+    - 引脚：I2C2_SCL = PF1 / I2C2_SDA = PF0（hw_pinmap.h 已定义）。但 .ioc
+      不会自动把 PF0/PF1 配成 I2C2 AF——你需要打开 CubeMX 找到 I2C2 那个
+      外设，在 "I2C" 模式下把 PF0/PF1 设为 AF4。
+    - 完成后 Generate Code，PF0/PF1 的 AF 复用就会被 main.c 启动；STM32
+      上电后 NS2009 probe 即可在 100 ms 内 ACK 成功。
+
+  app 工程侧完全独立于这个 ioc 改动：即使暂时没启用 I2C2 AF，arm 端编
+  译仍能过（hi2c2 不存在会链接错，但 CMSIS 引导会卡；建议在你做完
+  ioc 之前不要烧录）。
+
+  ioc 改完后，自检流程：
+    1. main() 里 touch_init() 输出"NS2009" / "GT911" / "SPI-XPT2046"——
+       建议加到 touch.c 的 s_resistive_kind 判断后用一个 fprintf
+       / printf 到 ITM（如果没接 SWO 看不到，可以省）。
+    2. 启动后若 g_calibration_required 跳到校准界面：5 点校准，点完后
+       config_save 写入 g_config.touch.* + calibrated=1，下次启动
+       应直接到主屏。
+    3. 若 config_init 返回 false（首启 / 抹掉 config），校准自动
+       弹。
+    4. 若想强制重做校准：菜单 → Settings → 触屏校准（或短按 PF4 /
+       拔 config 一次）。当前 gui.c 里 gui_show_calibration() 仍
+       可手动调。
+
+========================================================================

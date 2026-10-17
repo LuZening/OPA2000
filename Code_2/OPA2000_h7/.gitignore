@@ -1,0 +1,64 @@
+# Build artifacts
+build/
+EWARM/
+cmake-build-*/
+Debug/
+Release/
+*.o
+*.obj
+*.su
+*.dep
+*.map
+*.elf
+*.hex
+*.bin
+
+# CubeIDE project metadata (regenerated on every import / tool update)
+.settings/
+.project
+.cproject
+
+# Host unit-test build trees (the ARM preset only covers build/)
+User/Tests/build*/
+
+# Screenshots and captured images
+#
+# Throwaway verification artefacts: simulator screen grabs under
+# User/gui_shots/ and ad-hoc captures.  They are regenerated in seconds by
+# the simulator sweep, so tracking them only bloats the repo and creates
+# merge noise on every re-capture.
+#
+# Note: the LVGL test fixtures under Middlewares/Third_Party/lvgl/tests/ were
+# tracked before this rule existed and stay tracked - .gitignore does not
+# apply retroactively.  They are upstream sources, not captures.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+
+# Tooling caches (do not track)
+.trae/
+.claude/
+.vscode/
+*.pyc
+__pycache__/
+auto_silks/
+
+# Local workspace notes
+KEY.md
+LCEDA.md
+reminders.txt
+Screenshot*.png
+STM32H7*.md
+
+# CMake / IDE generated
+compile_commands.json
+
+# Misc
+*.bak
+*.log
+*.tmp
+*.stackdump
+bash.exe.stackdump

@@ -1,0 +1,627 @@
+OPA2000功放控制器H7版代码设计要求，使用STM32H7B0ZBT6 MCU（LQFP144封装，lceda schematic 中标号 U5）。
+0.以下未明确内容请参考OPA2000基于STM32F4的旧版代码，里面有些md文件（包括CLAUDE.md）值得参考，路径：”d:/Projects/Radio/Projects/OPA1000/code"。
+1.只允许在User目录及其子目录下新建或修改代码，同时允许修改main.c和stm32h7xx_it.c中包含在/* User Code begin */ 和 /* User Code end */之间的代码。其他目录下代码由CubeMX自动生成，不可修改，否则会影响自动生成机制。尽量使用HAL api，实再不行再操作寄存器。
+2.注释请用英文，与我交流用英文。我在../../目录下创建了git，你认为你做出阶段性改进后，就要commit一版git，commit message要简洁但包含你更改的主要信息和涉及的功能模块，但是不允许push。
+3.使用lvgl 7作为GUI图形界面，请通过context7获取lvgl 7版本的documentations，注意7版本与8版本不兼容。显示缓冲区设计如下：lvgl使用partial buffer，尺寸为屏幕行数的1/5（约153kBytes)。屏幕分辨率为480x800x16bit。LTDC拥有1个全尺寸缓冲区（约768kBytes）。需要放在指定SRAM区域，请在声明变量的地方的注释里写好提示：framebuffer section
+4.代码使用freertos的CMSISv2 api编写。参考旧版OPA2000项目代码编写，旧版代码库位于 d:/Projects/Radio/Projects/OPA1000/code 路径下
+6.注释中提到的MCU 引脚标号遵循 lceda schematic 中 U5 的标号；下文 U5 即 MCU。
+
+7.PTT控制（PTT代表press to talk，是发射开始的信号，由用户踩踏板输入，低电平有效）：PTT_INX = PF5 = EXTI5，固件需在 EXTI5 上升沿/下降沿中断中处理 PTT 请求（与 GPIO_Input 上拉配置）。
+
+7.1 PTT 双边沿中断 + 松开轮询兜底（已定稿）：
+    PTT_INX = PF5 = EXTI5，低电平有效，在 ioc 里必须配成
+    "External Interrupt Mode with Rising, Falling edge trigger"（双边沿）。
+    下降沿 = 按下（请求发射），上升沿 = 松开。
+
+    · 下降沿优先级必须高于 FreeRTOS 任务（主优先级 1）；按下不做轮询兜底，
+      延迟做到最小。
+    · 上升沿（松开）必须有轮询兜底：把 power_ptt_poll() 挂在 TIM7 的快速 tick
+      里（约 0.1~1.3 ms），每次重新读 PTT_INX 电平并把继电器状态机对齐。
+      万一松开中断因 IRQ 被屏蔽、EXTI 配错或线上毛刺而丢失，功放也必须在
+      数毫秒内一定松开，绝不允许一直挂着发射。
+    · 两个方向都实现为"按引脚实时电平对齐状态机"（幂等）：按下过程中重复的
+      下降沿、未按下时重复的上升沿、抖动产生的连续边沿，都是空操作，不会
+      重置或重启 15 ms 延时定时器，最终状态只由引脚电平决定。
+
+    松开方向的三条路径都必须在同一 tick 内把 PTT_OUT 拉低：
+      EXTI 上升沿 → 轮询兜底 → 保护动作（protection_trigger_locked 直接拉低）。
+
+7.2 PTT_OUT 联动（已定稿）：PTT_OUT = PC15，**高电平有效**，是回送给电台的按键反馈信号。
+    - PTT_INX 按下（低电平）→ 继电器序列启动：RELAY2 立即合上，RELAY1 经 15 ms 延时合上；
+      **PTT_OUT 在这 15 ms 内保持低电平**，因为此时功放还没接通天线。
+    - 状态机进入 TX_RUNNING（RELAY1 已合、射频通路建立）→ PTT_OUT 置高。
+    - PTT_INX 松开（高电平）→ PTT_OUT **立即**拉低（不等 15 ms），随后 RELAY1 断开、再延时 15 ms 断开 RELAY2。
+    - 保护动作触发时，PTT_OUT 与两只继电器在同一时刻拉低，不经过任何延时。
+    - 标定未完成（allow_RF=false）或警报锁存时，PTT_INX 的任何请求都被拒绝，PTT_OUT 保持低电平。
+
+7.3 前面板电源 API（任务上下文，供 GUI / 按键 / CAT 调用）：
+    注意三条轨互不联动，函数名已按轨区分，勿再用 power_on/power_off 这类
+    含糊的名字：
+
+    【PG5 外部 PSU（Power Supply Unit）】
+    power_init()          上电初始化：全部输出置 inactive + 风扇/泵 PWM。
+                          **不锁存 PSU，也不通高压** —— PSU 主要由用户自己
+                          操作，固件不得擅自开机；PWR_ON/RF_BIAS 保持低，
+                          等用户按电源按钮。
+    power_psu_on/off()    外部 PSU 的底层开关，单拍、无时序、幂等。
+                          仅 power_soft_off()（关机）与远程 CAT 骨架会调。
+
+    【PG7 + PG2 高压轨】面板电源按钮控制的就是这条
+    power_hv_enable()     操作员"开机"：投入高压轨，带幂等判断
+    power_hv_disable()    操作员"关机"：撤高压轨。只动 PWR_ON/RF_BIAS，
+                          **不动继电器、不动主电源锁存**。若此刻在发射，
+                          继电器保持吸合、PA 带射频直接掉高压 —— 这是
+                          操作员的明确意图（要断高压，不是要退发射）
+    power_hv_on/off()     高压轨底层开关，分两拍（见 7.3a）
+    power_rail_step()     时序推进，由 app_monitor_task 每 10 ms 调一次
+    power_rail_busy()     时序进行中 → **拒绝发射**
+    power_rail_abort()    取消在途时序（不动引脚，ISR 安全，保护跳闸用）
+    power_standby()       从发射退回就绪：只断开发射通路，高压保持
+
+    【RELAY 射频通路】
+    power_relays_tx_on/off()  只管继电器，不碰任何电源
+
+    【共用的发射接口】
+    power_tx_enable()     任务侧请求发射（CAT/串口/屏幕），走与 PTT 完全相同的联锁：
+                          仅在 g_ptt_ready && allow_RF && 无警报
+                          && !power_rail_busy() 时才允许。
+                          **刻意不检查 g_psu_on / g_hv_on** —— PA 有没有电
+                          不归固件在"请求发射"这一刻裁决，操作员或 PSU 随时
+                          可能上电，拒绝只是徒增困扰。剩下的电源相关联锁都是
+                          硬件性质的：power_rail_busy() 拦偏置稳定中的 10 ms
+                          （真实瞬态），allow_RF/alert 拦安全原因。
+    power_tx_disable()    任务侧解除发射
+    power_get_ptt_state() 读 PTT_INX 电平（低=请求发射）
+    power_update_band(f)  按频率自动切波段（带外频率保持当前波段不动）
+    power_ptt_out_set(a)  直接驱动 PTT_OUT（保护用，跳过 15 ms 序列）
+    power_ptt_poll()      松开轮询兜底，挂 TIM7 快速 tick
+    power_soft_off()      软关机（整机下电，**永不返回**），与上面全不同
+
+7.3a 高压轨两拍时序（10 ms，非阻塞）
+    PA 偏置必须等高压稳定后再加，否则台阶重叠。断开时反过来。
+        上高压： PWR_ON(PG7) → [10 ms] → RF_BIAS(PG2)
+        下高压： RF_BIAS(PG2) → [10 ms] → PWR_ON(PG7)
+    实现：power_hv_on() 抛完第一拍立即返回（不 HAL_Delay、不忙等），
+    第二拍由 app_monitor_task 每 10 ms 调 power_rail_step() 完成。
+    为此该 task 的 tick 从 100 ms 改为 10 ms，PTT 边沿/风扇/转速用 slow_div
+    分频回 100 ms。
+    保护跳闸不走这条：protection_trigger_locked() 直落引脚（0 延迟）并调
+    power_rail_abort()，否则排队中的阶段会在故障后把刚切断的轨重新拉起来。
+
+7.3b 外部 PSU（PG5）—— 远程控制待定协议
+    PSU = Power Supply Unit，是**外部设备**，PG5 只是 MCU 进去的控制线。
+    硬件链路（见第 6 节原理图说明）：
+        PG5 ──> NPN Q9（反相）──> PC13 = PWR_WKUP4
+    Q9 反相，因此**从 MCU 的 GPIO 视角**看极性是「高电平开机」：
+        PG5 高 → Q9 导通 → PC13 拉到 GND → PSU 开机
+        PG5 低 → Q9 截止 → PC13 回上拉  → PSU 关机
+    ⚠ 别按"低有效"的直觉写反极性，板上 Q9 是反相的。
+
+    固件侧现状：
+    · power_psu_on() / power_psu_off() 已实现，单拍、无时序、幂等。
+    · **power_init() 不调 power_psu_on()**：PSU 主要由用户自己操作，固件
+      不得擅自开机。上电后 PG5 保持低（关机态）。
+    · 全工程唯一主动发起 PSU 动作的是 **power_soft_off()**（关机时关掉）。
+    · 远程控制走 CAT/LPUART 数据包，**协议尚未确定**，只留骨架：
+        comm.h 有 CMD_PSU_ON / CMD_PSU_OFF 两个枚举
+        comm.c 有对应分支与调用点，由 COMM_PSU_REMOTE_ENABLED 开关控制
+        comm_parse_command() 不认识任何 PSU 关键字，所以分支不可达
+      协议定下来后：在 comm_parse_command() 加关键字识别，把
+      COMM_PSU_REMOTE_ENABLED 置 1 即可。待定项清单见
+      User/TODO-PSU远程控制.txt（关键字写法、是否要状态查询、
+      是否要与本地联锁一致、是否需要软启动等待电压稳定）。
+
+7.4 全局状态有三个且互相独立，不要再合并：
+    g_psu_on     外部 PSU 已开机（PG5 高）。**只用于状态显示与诊断**，
+                 发射联锁不查它
+    g_hv_on      高压轨已投入（PG7+PG2）。比偏置早一拍置位，判断是否已到
+                 终态请用 power_rail_busy() 而非这个标志。发射联锁也不查它
+    g_tx_active  发射序列已启动（RELAY2 闭合）。松键后的 15 ms 断开延时期间
+                 仍保持为真，直到 RELAY2 真正断开才清零——这样保护在这段
+                 过渡时间里不会失效。
+    保护锁存只清 g_tx_active 并把 allow_RF 拉低，**不动 g_psu_on/g_hv_on**——
+    故障时电源实际仍然接着，面板应显示"故障"而不是"已关机"，且电源键仍是关机语义。
+
+7.5 保护功能（已定稿，Control 已实现 + 27 个 host 单元测试覆盖）
+7.5.1 保护源分两大类，判定在哪里做就在哪里关断
+  A) 数字量 —— EXTI 外部中断，**在 EXTI 中断里直接取消发射并关闭电源**
+     · HARDERR_PWR = PB12 / EXTI12，**高电平有效**（电源板报警）。
+       ISR 里必须重新读一次引脚，确认真的高了才动作，伪边沿/抖动不关机。
+     · 后续可能新增来自 RF deck 的数字量信号。这类信号统一调用
+       protection_digital_isr(cause)，**不要新写一条关断路径**。
+  B) 模拟量 —— 优先用 analog watchdog 做硬件比较；**没有接 AWD 的通道，
+     在 DMA 完成中断里做数值判断并执行保护**（不是放到 100ms task 里）
+     · AWD2 → CH5 IMain   门限 30A
+     · AWD3 → CH6 REV1    门限 800W（硬件最后防线）
+     · AWD1 → CH4 RF 输入 门限按波段表 10~20W
+     · 无 AWD → ADC1 DMA 完成中断内判断：REV2 400W、
+       （REV2 > 200W 且 SWR > 2.0）、FWD1 1100W、FWD2 1050W
+     · 无 AWD → ADC2 注入完成中断内判断：核心 NTC 90.0℃
+      （NTC 全时判，不看是否在发射）
+  另外 protection_check() 在 100ms task tick 上把所有比较再兜一遍底。
+  以上所有门限一律存在 config 里，保护代码不得出现任何硬编码常量。
+
+7.5.1b COMP 比较器的 DAC 参考电压（用户可调）
+    硬件事实（依据 RM0455 与 HAL 一手资料，勿凭印象改）：
+      · COMP 反相输入可选的 DAC 源**只有 DAC1_CH1 和 DAC1_CH2**。
+        DAC2 唯一能进 COMP 的通路是 TPSENS_DAC2CH1（温度传感器专用），
+        不是通用参考源。所以"两路 COMP 用 DAC1 和 DAC2"在硬件上不成立，
+        正确接法是两路都取自 DAC1 的两个通道。
+      · DAC1 为 **12 位**，满码 4095；参考电压是 **VDDA = 3.3V**，
+        **不是** ADC 用的 VREFBUF 2.5V —— 两条参考轨不同，不可混用。
+        1 LSB = 3300/4095 = 0.806 mV
+        换算： dac_code = ref_mV × 4095 / 3300
+      · 输出配置为「缓冲关闭 + DAC_CHIPCONNECT_INTERNAL」。缓冲关闭时
+        HAL 不允许用 DAC_CHIPCONNECT_BOTH，只有 INTERNAL 可用。
+
+    拓扑（原理图已核对）：
+      COMP1 正输入 = PB2 = ADC1_INP4 (PC4) 同节点 → RF1 经 D5/R40 峰值检波
+      COMP1 负输入 = DAC1_OUT1
+      COMP2 正输入 = PE9 = ADC1_INP5 (PB1) 同节点 → 主电流 IM（CC6920BSO-50A
+                    经 R111 → U20-B GS8552-SR 缓冲）
+      COMP2 负输入 = DAC1_OUT2
+
+    config 字段（单位：参考电压 mV，uint16_t）：
+      comp1_ref_mV   DAC1_CH1 → COMP1 负输入
+      comp2_ref_mV   DAC1_CH2 → COMP2 负输入
+
+    为什么存「参考电压」而不直接存「瓦 / 安」：
+      DAC 输出的是电压，而输入端前面是分压/检波/传感器，前级增益是**板级
+      属性**，必须台架标定，不能写成固件常量。存电压可以彻底避免"标定值
+      不对却悄悄生效"的风险。GUI 里用户在保护页调这两项，改完立即生效
+      （prot_save_cb → boot_apply_comp_thresholds()），不需要重启。
+
+    COMP2 可以顺带换算显示电流（CC6920BSO-50A 手册给定）：
+      Vout_mV = 1650 + I_A × 26.4
+      20A→2178mV  25A→2310mV  30A→2442mV
+    COMP2 上限取 2442mV（=30A 设计门限），同时也是该节点的 ADC 满量程
+    2500mV —— 再高的参考电压在电流上已无意义。
+
+    ⚠ COMP1 的 mV↔W 换算尚未标定（D5/R40 峰值检波链，增益未知）。
+      出厂默认 1500mV（约满量程 45%，远高于检波噪底），COMP1 只作兜底；
+      精确的 RF 输入门限由 AWD1 在软件里承担（按波段 10~20W）。
+      标定方案与回填数据见 User/TODO-COMP1标定待办.txt。
+
+7.5.2 触发后的动作（中断上下文，0 延迟，只有第一次触发生效，后到的源不覆盖原因）
+    按告警级别走不同动作（单一来源映射表见 opa2000.c: alert_severity()）：
+
+    【P0 紧急级：功率 / 过流 / 过压 / 外部硬件故障】
+    1) RF_IN_PROTECT_RAISE()  PB13 置高，最先通知 RF 板开展自己的保护动作
+    2) RELAY1_OFF + RELAY2_OFF + PTT_OUT 拉低（PC15 高有效）+ ptt_state = IDLE
+    3) PWR_ON_DISABLE()  断高压
+    4) RF_BIAS_DISABLE() 断 PA 偏置
+    5) buzzer_start()          PWM 驱动的经典 3 音阶警示音，10s 上限（即使不 dismiss 也自动停）
+    6) g_alert_active = 原因、g_alert_severity = P0、g_alert_flag = true、
+       g_allow_rf = false、g_tx_active = false
+    只要 g_alert_flag 为真，**任何 PTT 动作都被拒绝**（EXTI PTT、TIM7 轮询兜底、
+    power_tx_enable() 三条路径都有联锁检查）。
+
+    【P1 温和级：温度 / 风扇 / 水泵（风扇 tach 暂未接线，ALERT_FAN_FAULT 是占位）】
+    P1 路径只做一件事：拒绝新的 PTT。所有"在轨"硬件（PWR_ON / RF_BIAS / 继电器 / PB13）
+    保持原状，PA 仍然带电待命。
+    1) 跳过 RF_IN_PROTECT_RAISE() —— PA 温度是本 MCU 自己的事，不必通知 RF 板
+    2) 跳过 RELAY1/RELAY2_OFF、PWR_ON_DISABLE、RF_BIAS_DISABLE —— PA 保持在 ready
+    3) PTT_OUT 拉低 + ptt_state = IDLE
+    4) buzzer_start_p1()       单长音 1500Hz 持续 1s（10s 上限内的更短促提醒）
+    5) g_alert_active = 原因、g_alert_severity = P1、g_alert_flag = true、
+       g_tx_active = false
+    【不】动 g_allow_rf —— CC6920 零点与温度无关，原标定值依然有效；dismiss 后立即可发射。
+    屏蔽 PTT 的实际机制是 [protection.c:protection_trigger_locked] 置 g_alert_flag，
+    ptt_apply_level() 的 `if (... || g_alert_flag)` 把请求拦掉；只要 dismiss 清掉
+    g_alert_flag，下次按 PTT 就能正常上高压发射。
+
+    蜂鸣器最大时长硬上限 10s（设计要求："哪怕不 dismiss 也不能一直鸣响"）。
+
+7.5.3 蜂鸣器（TIM15_CH2 PWM，整数实现，由 TIM7 的 100µs tick 推进状态机）
+    P0: 高音 2500Hz / 中音 1500Hz / 低音 800Hz，每个 300ms，
+        然后静音 3s，再从头循环，最长 10s（HAL_GetTick() 硬上限，buzzer_tick() 自检）
+    P1: 中音 1500Hz 连续 1s 一次
+    时钟 = APB1 200MHz / 16 = 12.5MHz，ARR = 12.5e6 / f，CCR2 = ARR/2（50% 占空）。
+    buzzer_stop() 由 protection_clear() 调用，不要在别处重复调用。
+
+7.5.4 保护状态保持与解除（**由 GUI agent 和通信 agent 实现**）
+    保护一旦触发就锁存，不会自动恢复。解除只有两条路：
+    · GUI：监听 g_alert_flag/g_alert_active 弹模态告警框，用户点确定后调 protection_clear()
+    · 通信：CAT 串口或 SPI6 数据包里收到"解除告警"命令后调 protection_clear()
+    protection_clear() 一次性做四件事：清内部锁存与 g_alert_*、
+    buzzer_stop() 静音蜂鸣器、（仅 P0）RF_IN_PROTECT_CLEAR() 拉低 PB13、
+    g_allow_rf = true。
+    P1 解除后 PB13 本来就未动；g_allow_rf 本来就未动；操作员立即可再次发射。
+    P0 解除后恢复射频——CC6920 零点与本次故障无关，原标定值继续有效；
+    g_hv_on 不动（面板仍显示就绪），要真正重新上高压得显式调 power_hv_disable() → power_hv_enable()。
+    详细分工与代码示例见 docs/AGENT_BRIEFING.md 的 5.4（GUI）/ 5.5（通信）/ 5.6（责任边界）。
+
+8.风扇控制：根据核心温度NTC检测到的温度自动调整，默认50%转速，温度超过60摄氏度80%转速，超过70摄氏度100%转速。转速切换有黏滞性，转速升高后向下回落的温度阈值要减少10摄氏度，即在100%转速时，温度降至60摄氏度及以下，转速才回落至80%。涉及的引脚为FAN1这个连接到定时器的PWM发生器。用PWM高电平有效驱动，基准频率10KHz。
+FAN1_PWM = PC8 = TIM3_CH3（ioc 配置 PWM Generation2 CH3）。COMS PWM 输出，默认 50% 占空比。
+
+9.屏幕背光：屏幕背光由BL_PWM脚（PD14，TIM4_CH3）输出PWM控制，PWM经R2/R4分压滤波后接背光升压芯片U8(AP3019)的FB反馈脚调节LED电流实现调光（占空比与亮度的对应极性以实测为准），MCU复位后默认输出最大亮度。背光功率级由+5V_MAIN供电，主电源未开机时背光自然熄灭。
+
+9.1 风扇/泵转速检测（零中断轮询方案）：FAN1_SENSEX在PD4、PUMP_SENSEX在PD5，两个引脚在CubeMX中一律配置为普通GPIO_Input（外部FG信号上拉到3.3V/VDD），严禁配置为EXTI——EXTI4/EXTI5线分别归PF4(REAR_RESERVED1)和PF5(PTT_INX)使用，同线冲突。测速采用软件轮询：在0.5ms周期（2kHz采样率，保证最高500Hz FG信号每个下降沿至少2次采样）的定时器回调或高优先级周期任务中读取引脚电平，用整数状态机检测下降沿并累加脉冲计数；回调内只允许整数操作（读GPIO→比较上次电平→计数→清/存），不得出现任何浮点指令（Cortex-M7的FPU惰性压栈机制下，不含VFP指令的中断不会压FPU栈，中断开销与无FPU相同）。转速换算（rpm/流量）、滤波、显示更新放在100ms周期的低优先级任务中进行，该处可自由使用FPU。转速信号仅作监测/显示，不参与实时保护。
+
+9.2 泵PWM：PUMP_PWM在PD15（TIM4_CH4），与风扇同样10kHz基准频率、PWM高电平有效，调速策略参考风扇温度分段策略（若安装液冷泵）。
+
+10.波段切换：LPF波段切换通过LPF1~LPF6引脚实现（LPF1=PE1、LPF2=PE2、LPF3=PE3、LPF4=PE4、LPF5=PE5、LPF6=PC14，各经串联电阻 R45/R50/R51/R61/R62/R105 接至 H3-2~H3-7 排针、H3-1=+12V、波段继电器驱动连接器），**高电平有效**（MCU 引脚拉高使能对应波段继电器）。
+    **编号规则（已定稿）：LPF 数字越小，波长越短。**
+        LPF1 = 15-10m    LPF2 = 20-17m    LPF3 = 40-30m
+        LPF4 = 80m       LPF5 = 160m      LPF6 = 备用（只有 5 个合并波段）
+    该编号必须与 ioc 里 GPIO 标签旁的引脚一致，如需改动请同步 ioc 与 User/Inc/hw_pinmap.h。
+5个波段的频率范围如下，在GUI界面中应以频率范围显示可选波段
+const char* strFreqRanges[] = {
+	"1.800-2.100 MHz", // 160m
+	"3.500-3.900 MHz", // 80m
+	"7.000-10.150 MHz", // 40-30m
+	"14.000-18.168 MHz", // 20-17m
+	"21.000-29.700 MHz" // 15-10m
+};
+5个波段名称如下
+const char* strBands[] = {
+		"160m",
+		"80m",
+		"40-30m",
+		"20-17m",
+		"15-10m"
+};
+另外后续可能会增加波段，你不要在程序里写死，让波段数可以被较轻易地通过#define修改。
+频率与波段对照表如下
+band_t freq_to_band(uint32_t freqHz)
+{
+	band_t band;
+	if(freqHz < 1800000)
+		band = BAND_FAULT;
+	else if(freqHz < 2000000)
+		band = BAND_160M;
+	else if(freqHz < 3900000)
+		band = BAND_80M;
+	else if(freqHz < 10150000)
+		band = BAND_40M_30M;
+	else if(freqHz < 18168000)
+		band = BAND_20M_17M;
+	else if(freqHz < 29700000)
+		band = BAND_15M_10M;
+	else
+		band = BAND_FAULT;
+	return band;
+}
+
+实施波段切换的代码如下（高电平有效）
+void switch_band(band_t band)
+{
+	// Release all relays (LPF 高电平有效，默认全部拉低)
+	HAL_GPIO_WritePin(LPF1_GPIO_Port, LPF1_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(LPF2_GPIO_Port, LPF2_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(LPF3_GPIO_Port, LPF3_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(LPF4_GPIO_Port, LPF4_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(LPF5_GPIO_Port, LPF5_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(LPF6_GPIO_Port, LPF6_Pin, GPIO_PIN_RESET);
+	switch(band)
+	{
+	case BAND_160M:
+		HAL_GPIO_WritePin(LPF5_GPIO_Port, LPF5_Pin, GPIO_PIN_SET);
+		break;
+	case BAND_80M:
+		HAL_GPIO_WritePin(LPF4_GPIO_Port, LPF4_Pin, GPIO_PIN_SET);
+		break;
+	case BAND_40M_30M:
+		HAL_GPIO_WritePin(LPF3_GPIO_Port, LPF3_Pin, GPIO_PIN_SET);
+		break;
+	case BAND_20M_17M:
+		HAL_GPIO_WritePin(LPF2_GPIO_Port, LPF2_Pin, GPIO_PIN_SET);
+		break;
+	case BAND_15M_10M:
+		HAL_GPIO_WritePin(LPF1_GPIO_Port, LPF1_Pin, GPIO_PIN_SET);
+		break;
+	default: // BAND_FAULT
+		HAL_GPIO_WritePin(LPF1_GPIO_Port, LPF1_Pin, GPIO_PIN_SET);
+		break;
+	}
+}
+刚上电若config损坏或BAND_FAULT时默认将LPF切换至BAND_15M_10M上。
+
+11.反射功率显示：显示ADC数据中发射功率2和反射功率2的数据，SWR的计算在反射功率小于10W时一率显示为1.0。避免小信号时SWR值虚高。
+
+12.定向耦合器功率换算：**不做每通道一元线性回归校准**，直接沿用上一代 OPA1000 的算法（DC_TURNS=31、DC_ATTEN_RATIO=(330+100)/100=4.3、Vf=0.3V、Z0=50Ω，P=VRF²/Z0/2），仅把 ADC 基准从 3.28V/12bit 换成 VREFBUF 2.5V/16bit，整数形式见 ADC 章节。这样 config 里不再保存 fwd1/fwd2/rev1/rev2 的斜率截距。RF 输入检波（INP4，无耦合器）暂时沿用同一条曲线，若实测偏差明显，只在该通道上加修正系数，不要改动曲线形状。
+    仍需要标定的只有主电流零点（见主电流零点校准算法），其结果写入 [config] 的 im_zero_offset_adc。
+    （保留说明：早期设想过的"串口下发校准指令→状态机提示用户 OK→两阶段记录读数→线性回归"方案，
+      在采用 OPA1000 固定算法后不再需要实现；若将来要做每通道微调，可在此基础上扩展。）
+
+13.软件保护（硬件外设以原理图实际接线为准）：条件1：反射功率2(ADC1_INP9/PB0)大于[config]400W（反射功率2无独立比较器，由ADC软件判读）；2.反射功率2大于[config]200W，且SWR大于[config]2.0；3.反射功率1(ADC1_INP6/PF12)大于[config]600W（软件提前量；硬件最后防线由ADC1 Watchdog3即AWD3监视CH6承担，阈值对应约800W，两级保护）；4.主电流(ADC1_INP5/PB1，U20-B缓冲)大于[config]30A（由ADC1 Watchdog2即AWD2监视CH5 + COMP2比较器双重硬件门限实现，[config]不得超过30A；主电流采样芯片为 CC6920BSO-50A，零电流输出 1.65V（50% VCC）、灵敏度 26.4 mV/A）；5.HARDPWR_ERR(PB12)上升沿中断触发；6.COMP1比较器触发——COMP1正输入PB2与ADC1_INP4(PC4)短接，监视RF1电台输入包络峰值即RF输入过驱，负输入为DACOUT1，用作RF输入过功率硬件跳闸；7.COMP2比较器触发——COMP2正输入PE9与ADC1_INP5(PB1，主电流U20-B)短接，监视主电流，负输入为DACOUT2，用作过流硬件跳闸；（原条件8"Overdrive输入上升沿中断"已取消：RF输入过驱改由COMP1硬件比较+ADC1_INP4软件判读；PA输出包络改从ADC2_INP0"输出检波采样"读取，见"保护"章节b条）COMP1_OUT(PE12)经D1、COMP2_OUT(PE8)经D6、MCU软件故障脚PB13(RF_IN_PROTECT_CPU_SIG)经D7，三只二极管在同一总线线或，共同触发RF_IN_PROTECT_MIXED故障锁存。记住，外部中断的优先级高于FreeRTOS，因此不可以使用FreeRTOS的api，但是可以直接把PTT切断，且立即将PB13(RF_IN_PROTECT_CPU_SIG，MCU对外的故障输出脚，经D7进入硬件故障锁存总线)置高电平。通知外部电路有故障。后续GUI的更新可以使用flag变量传递信息，进入GUI task后再处理。
+
+外部通信的要求如下：
+1.USB和串口通信：该功放主机可以通过USB CDC虚拟串口或LPUART1与PC通信，用户可以在PC上发送指令控制功放行为。USB串口和LPUART1上RX和TX的数据包都是共享的，共用一个循环队列，数据处理和协议都是一样的，从功放主机发出去的数据包都是同步发到USB串口上和LPUART1上。波特率默认19200，可以修改[config]PC通信的波特率。LPUART1 时钟源 ioc 配为 CSI（4MHz），保留现状（精度足够用于 19200~115200 调试）；若需高精度应用，需手动改为 LSE（32.768kHz）或 PLL 派生时钟。
+
+2.波段通信：UART4（PC10=TX，PC11=RX；注：旧文档写USART1，以ioc实际配置为准，USART1引脚已被USB/LTDC占用）用来与电台通信，从电台处获取实时波段信息。目前需支持ICOM CIV通信格式、Yaesu通信格式和Kenwood通信格式。用户可以在[config]指定电台型号，[config]波特率，也可以在电台主动发来数据包时，通过尝试不同的解包方法，推断电台型号。该方案在旧版代码中已有实现，可以参考。
+
+3.频率检测：除了与电台串口通信的方式获取波段信息，还有一个类似于频率计的频率探测功能（ETR_FREQDET引脚，PE7=TIM1_ETR；信号来自RF1电台输入采样，经R22/R24/R25衰减偏置、D3钳位、U2施密特反相器(74LVC1G14)整形后送入），使用定时器的ETR计数功能计数（ioc 已配 ClockSourceETR_Mode2，S_TIM1_ETR）。主机每100us检查一次计数器的数值，将计数值乘以10000（1秒除以100微秒）与波段范围对比，若波段与当前LPF设置的波段不符，则立即抑制PTT输出并弹窗提示且报警(Alert)，直到用户解除弹窗或通过PC串口发送Alert off（不区分大小写以用不考虑空格，所有串口指令都是这样）。
+
+4.配置保存：配置以二进制方式保存在FatFS文件系统中的config文件中，参考旧版代码的Config的实现。上电时需读取config，验证是否有效，无效则初始化。所有带[config]标签的字段都需要保存在config中。
+
+5.I2C接口（I2C2：PF0=SDA、PF1=SCL，总线已有上拉）上挂载了2个设备（没有EEPROM了）——1:NS2009电阻触摸屏控制器（板载U3），2:GT911电容触摸屏芯片（经FPC1排线座连接到外接电容屏，INT接PF2、RST接PF3）。使用不同的I2C地址与两个芯片通信。两个芯片在发送和接收时使用DMA轮询进行。这两个芯片在固定的轮询指令下，返回的信息应该是定长的，因此DMA只需留有定长空间，写满后通知某个task处理。PF4 不再用于 PENIRQ 中断（ioc 改为 GPIO_Input，仅作 REAR_RESERVED1 跳针位），NS2009 的触摸数据完全由 I2C 周期轮询驱动，参考 E:\Projects\You\LLMC\LLMC_DAC 项目的轮询方法。（注意区分：I2C3是音频总线，挂载SI5351时钟芯片与ES8388编解码器）
+
+6.电源控制：完整的开关机链路如下——USB插入即产生+3V3维持MCU存活（MCU平时进入Standby待机，唤醒源WKUP4=PC13）；外部机械开机键接KEY1_WKUP（PC13，PWR_WKUP4，经U18外部按键口引出，按下短接到地，外部按键口同时提供+3V3与GND供按键模块使用），按机械键唤醒MCU后，固件置高RELAY1（PG4，高电平使能；经R27/Q1低边拉低H8-1华为电源模块PSU_ON，低有效）使主电源开机（+12V→U7降压→+5V_MAIN全系统上电）；MAIN_PSU_ON_SIG（PG5，默认 Low；软件开机：PG5 拉高 → NPN Q9 导通 → 把 PC13 拉到 GND → 等效模拟一次按键，触发 PSU 开机链路；软件关机：PG5 拉低 → Q9 截止 → PC13 回到默认上拉 → 等效模拟按键抬起，触发 PSU 关机）；RELAY2（PG3，高电平使能；经R29/Q2低边开关H9-1）控制+12V开关输出。开机完成后，按下SW键或点击屏幕顶部的准备按键，则输出PWR_ON信号（PG7→H1-2，功放板高压电源使能）和RF_BIAS_ON信号（PG2 高电平使能；PG2→R47→H5-3 排针偏置使能），同时GUI的颜色发生变化。参考旧版设计的GUI代码。
+所有 GPIO 默认 PinState=RESET (Low) 与上述"高使能"语义一致，ioc 不需要额外配置 PinState。
+
+ADC1&2（以原理图实际接线为准，网络名必须与.ioc一致）:
+ADC1有9个外部输入通道（continuous scan + DMA循环更新），网络名/引脚为：ADC1_INP4=PC4、ADC1_INP5=PB1、ADC1_INP6=PF12、ADC1_INP8=PC5、ADC1_INP9=PB0、ADC1_INP15=PA3、ADC1_INP16=PA0、ADC1_INP17=PA1、ADC1_INP14=PA2。各通道实际信号：INP4(PC4)=RF输入功率（RF1经D5/R40峰值检波，PB2/COMP1_INP与此节点短接供COMP1过驱比较）；INP5(PB1)=主电流IM（H1-3 IM_SENSE经R111、U20-B缓冲，PE9/COMP2_INP与此节点短接供COMP2过流比较；CC6920BSO-50A 输出 0A=1.65V，灵敏度 26.4mV/A）；INP6(PF12)=反射功率1 REV1（耦合器1：PA→LPF之间，H4-2经R112分压）；INP8(PC5)=发射功率1 FWD1（耦合器1，H4-4经R113）；INP9(PB0)=反射功率2 REV2（耦合器2：LPF→天线之间，H15-2经R114；REV2 无 AWD 监视，仅靠 ADC 软件判读）；INP15(PA3)=发射功率2 FWD2（耦合器2，H15-4经R115）；INP16(PA0)=主电压VM（H1-4 VM_SENSE经R110、U20-A缓冲）；INP17(PA1)=外部按键电阻分压(H5-4，多键电阻网络，不再走 I2C 扩展按键)；INP14(PA2)=PA偏置电压监测 VBIAS_SENSE（H5-5经R32限流、C65低通滤波）。即ADC1的7路监测信号为：发射功率1、反射功率1、发射功率2、反射功率2、RF输入功率、主电流、主电压，另加按键分压(INP17)与PA偏置监测(INP14)。其中INP17/INP14是FAN1_SENSEX/PUMP_SENSEX迁至PD4/PD5轮询后释放的通道。
+ADC1硬件看门狗（只开Watchdog中断）：AWD1监视CH4(RF输入功率)、AWD2监视CH5(主电流)、AWD3监视CH6(反射功率1)。主电流超限（[config]≤30A）由AWD2+COMP2双重门限承担，反射功率1约800W硬件防线由AWD3承担。
+ADC2：5路实际配置 = 2路常规（continuous scan + DMA）+ 3路注入（注入完成回调处理）。PC2_C(INP0)、PC3_C(INP1)为常规转换；PF13(INP2)、PF14(INP6)、ADC_CHANNEL_TEMPSENSOR 为注入转换。各通道实际信号：INP0(PC2_C)=RF2/PA输出中频采样（RF2经Q4与SI5351 LO1混频得到455kHz中频，Q4集电极经C77耦合、U21缓冲后送ADC，软件对中频做包络/相干解调，测输出功率与AM音频）；INP1(PC3_C)=RF1/电台输入中频采样（RF1经Q6与SI5351 LO2混频得到455kHz中频，Q6集电极经C78耦合、U11缓冲后送ADC）；INP2(PF13)=核心NTC温度传感器(H2)；INP6(PF14)=第二NTC/模拟量预留(U18-3)；TEMPSENSOR=MUC内部温度传感器。注意：主电流/主电压已改由ADC1采集（见上），ADC2常规通道采样的是455kHz中频波形（不是包络直流），软件解调后得到包络。ES8388的AM音频不再经过ADC2：ES8388 LIN1/RIN1由独立的直接包络检波链提供（RF2经D23(1N5819WS)→C111→R136→C33隔直→LIN1；RF1经D22(1N5819WS)→C110→R138→C109隔直→RIN1；R136/R138/C33/C109 阻容值待 lceda 查询后填入），输入RF为2~30MHz、约2Vpp时检波输出约0.35V音频，包络带宽约5.5kHz。SI5351本振：CLK0=LO1(RF2通道)、CLK1=LO2(RF1通道)，固件先用TIM1_ETR频率计测得RF频率后，将两路LO编程为 f_RF±455kHz，信号消失时LO可停靠任意安全频率。
+ADC基准：VREF+引脚使用内部VREFBUF输出2.5V（引脚仅接退耦电容C31/C89），CubeMX中需启用VREFBUF，ADC满量程按2.5V计算。
+
+主电流转换公式（CC6920BSO-50A）：
+Vout_mV = 1650 + I_A × 26.4
+I_mA = (Vout_mV − 1650) × 1000 / 26.4
+    = (ADC_raw × 2500 / 65535 − 1650) × 1000 / 26.4
+代码中应用整数运算避免浮点：
+I_mA = (ADC_raw × 2500 − 1650 × 65535) / (0.0264 × 65535)
+    = (ADC_raw × 2500 − 108132750) / 1730.124
+推荐简化为 32 位定点除法（分子分母均取 1024 近似）：
+I_mA ≈ (ADC_raw × 39063 − 1650 × 1024) / 270.3
+实际值由代码校验后定型。
+
+主电流零点校准算法：
+- 上电后 RF_BIAS_ON (PG2)、PWR_ON_SIG (PG7) 均为失能（默认 Low）；
+- 启动后开始计时，用 100~500ms 内的 ADC1_INP5 采样平均值作为 zero_offset_ADC（应接近 1650/2500×65535 ≈ 43254）；
+- 校准期间电流转换函数返回 0 mA，GUI 不展示电流值；
+- 通过全局 `volatile bool allow_RF`（默认 false）阻止 PWR_ON_SIG (PG7) 和 RF_BIAS_ON (PG2) 被拉高，仅当 `allow_RF == true` 时允许射频发射；
+- 校准完成后，将 zero_offset_ADC 写入 config（[config]）持久化；
+- 校准值合理性检查：若 |zero_offset_ADC − 43254| > 1048（1048 码 = 40mV/2500mV×65535，对应 ±40 mV），判定为不合理，状态机重置重新校准；若连续 3 次失败则报警提示硬件故障；
+- 校准过程不可阻塞主程序：用一个状态机+定时器（如 TIM7 的 0.5ms tick 或 100ms task tick）驱动，采样累加器在中断或 task 中累加，状态机推进；
+- 采样期间不可触发 PTT（射频发射）以免噪声干扰。
+
+用户输入输出的要求如下：
+1.触屏：触屏需兼容电阻屏与电容屏。电阻屏使用板载NS2009芯片（不是旧版的TCS2046/SPI方案），通过I2C2与MCU通信；完全由 I2C 周期轮询（不再依赖 PENIRQ 中断）。PF4 已不再配置 EXTI，仅作为 REAR_RESERVED1 跳针位（保留 ioc 默认 GPIO_Input + 上拉）。在主循环中每20ms轮询一次I2C读取最新的XYZ触摸信息。同时要兼容电容屏，电容屏是GT911芯片经FPC1排线座用I2C2与MCU通信，INT脚接PF2（EXTI2，上拉）、RST脚接PF3（GPIO输出，可用于复位芯片以及选择其I2C地址），电容屏和电阻屏读到的坐标都可以被LVGL的回调函数读取，他们合二为一。一般情况下只会连接其中一种屏，电容屏芯片检测不到时，就默认用电阻屏。电阻屏的校准采用5点校准法，在config无效初始化时，同时启动校准界面，在纯白背景屏幕上显示5个点，4个点位于距四角10%的位置，外加屏幕正中心一个点。对X方向和Y方向分别采用一元线性回归来得到校准参数，同时检查正中间的点的残差，残差超过真实值的10%提示校准不通过，重新校准。校准完毕后校准信息写入[config]中。参考 “E:\Projects\You\LLMC\LLMC_DAC”中的触屏校准算法。电容屏一般要不要校准我也不知道，你网上搜搜看看，需要的话可设计一下电容屏的校准代码和保存他的校准参数。
+
+2.蜂鸣器：当有警报(Alert)时，先立即抑制PTT功能，disable所有RELAY1和RELAY2，蜂鸣器通过PWM输出一段3个音符组成的警告音，警告音的频率参考经典设计，声调中、高、低，先扬后抑，每个音符持续300ms，间隔3秒循环播放，直至用户在屏幕上解除警报，或通过串口下达Alert Off指令。
+BUZZER = PE6 = TIM15_CH2 PWM Generation2 CH2（ioc 已配）。**3 音符切换间隔较长（300ms 音符 + 3s 间隔），不需要 DMA**；直接借用一个周期合适的定时器（推荐复用 TIM7 的 0.5ms tick，或单独使用 TIM6 1ms 周期 update 中断）作为状态机驱动。在 update 中断回调里推进状态机：
+- 状态 0：播放音符 1（频率 f_high，例如 2.5kHz），300ms 后进入状态 1
+- 状态 1：播放音符 2（频率 f_mid，例如 1.5kHz），300ms 后进入状态 2
+- 状态 2：播放音符 3（频率 f_low，例如 0.8kHz），300ms 后进入状态 3
+- 状态 3：静音 3 秒，回状态 0 循环
+中断回调中只允许整数操作（更新 PSC/ARR 切换频率、写 GPIO），不可使用浮点指令；状态机切换由一个 1ms 或 10ms tick 计数器驱动。alert 解除或 PTT 重新使能时立即停止 BUZZER。
+
+3.外部按键：第一个按键接KEY1_WKUPX（PC13，PWR_WKUP4）GPIOEXTI用于保留中断唤醒功能，其余按键通过电阻分压网络接在ADC1_INP17（PA1）通道上（注：旧文档写"ADC2上的某一通道"，ADC2 4个外部通道已全部分配无空闲，故改到新释放的ADC1_INP17）。不再使用 I2C 扩展按键方案。
+
+ALC_PWM_OUT (PG0)：通过普通 GPIO 输出频率约 200kHz 的高速 PWM 信号产生模拟 ALC 电压，输出连接到 CN4 第16脚（Interface 板 / ESP32 接口）。
+实现方式：TIM2 的 **CH1 与 CH2 均配置为 Output Compare No Output 模式 + 各开一条 DMA 通道**（ioc 现状已配 Output Compare1 No Output / Output Compare2 No Output，DMA 通道已分配给 TIM2_CH1 和 TIM2_CH2）。TIM2 计数器从 0 增计数到 ARR 后溢出回 0；每周期发生两次 DMA 触发：
+- 计数器达到 CCR1 时，触发 DMA 把 `BSRR = (1U << 0)` 写入 PG0 BSRR 寄存器 → PG0 拉高（上升沿）
+- 计数器达到 CCR2 时，触发 DMA 把 `BSRR = (1U << (0 + 16))` 写入 PG0 BSRR 寄存器 → PG0 拉低（下降沿）
+其中 ARR 决定 PWM 频率（Counter Period = PWM 周期 - 1），CCR1 = 上升沿时刻，CCR2 - CCR1 = 高电平宽度 → 占空比 = (CCR2 − CCR1) / (ARR + 1)。
+TIM2 不需要 update 中断做这个事——DMA 全自动搬运 BSRR 值。HAL/TIM 配置示例：`HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_1)`、`HAL_TIM_OC_Start_DMA(&htim2, TIM_CHANNEL_2, bsr_buf_2, 1)` 等。改占空比只需动态修改 `htim2.Instance->CCR1 / CCR2`。
+两个 DMA 通道各搬运 1 个 BSRR 单元字（半字/字均可，看 GDI 直发哪种 BSRR 位）。需要更高灵活性时也可在 BSRR 数组里摆运更多位字，每周期 DMA 触发多次（如 4 次以上翻转），但 2 次（上升沿 + 下降沿）是最常见的纯 PWM 形式。
+若要修改频率，调 TIM2 的 ARR；若要修改占空比，调 CCR1/CCR2。占空比/频率的修改不影响 DMA 工作，运行时可随时改。
+TIM2 中断可用于 PTT 继电器延时（独立功能），与 ALC_PWM 输出无冲突——ALC 输出完全由 DMA 搬运完成，不需要 CPU 干预。
+
+LIGHTNING_PROTECTION_A (PB9)、LIGHTNING_PROTECTION_B (PD9)：保留 ioc 中 GPIO_Output 配置，作为防雷功能外部跳针位，目前固件不主动控制（默认 Low）。
+
+USB复合设备：
+1.I provide you with an MSC implementation on the same MCU      chip, you can refer to ../OPA2000_h7_MSC_TEMPLATE folder      for MSC USB implementation and blend it with the existing     CDC implementation. Remember to make USB Configuration        descriptor correct for compound device. Refer to the          TaikoSensor Project for an example of compound device.  
+2.A duplicate of USB_DEVICE folder is under the User folder for free modification. Delete USB_DEVICE folder every time after CubeMX code generation.
+
+中断（NVIC 优先级分组方案，Priority Group = NVIC_PRIORITYGROUP_4）：
+主优先级 0（最高，可抢占 FreeRTOS SysTick/任务调度）：
+- ADC1_2_IRQn：覆盖 ADC1/ADC2 全局中断，承载 AWD1/2/3 保护（AWD 标志 + ADC1/ADC2 转换完成标志）
+- COMP_IRQn：覆盖 COMP1/COMP2 中断（硬件过流/过驱跳闸）
+- EXTI15_10_IRQn：覆盖 PB12=HARDPWR_ERR（电源故障，纳入 RF_IN_PROTECT_MIXED 锁存）
+主优先级 1（与 PTT 继电器延时/PTT 输入相关）：
+- TIM2_IRQn：PTT 继电器延时触发（文档 [9.1 节] 已明示）
+- TIM5_IRQn：PTT 继电器延时触发（用户确认扩展使用 TIM5 用于 PTT 延时）
+- TIM7_IRQn：风扇/泵转速 0.5ms 周期轮询（文档 [9.1 节]）
+- EXTI9_5_IRQn：覆盖 PF5=PTT_INX（PTT 输入检测）
+次优先级 / FreeRTOS 可管理中断：
+- TIM1_UP_IRQn：主优先级 5（ioc 默认），ETR 频率计数溢出中断
+- ETI2_IRQn（PF2=CTouch_INTX）/EXTI4_IRQn（PF4=REAR_RESERVED1，原 NS2009 PENIRQ，现已取消）/EXTI3/EXTI0/EXTI1（未用）
+- 触摸 I2C、DMA、UART 等中断保持 FreeRTOS 可管理（主优先级 ≥5）
+
+中断详细：
+1.USART只打开IDLE LINE interrupt, 其他中断屏蔽，靠DMA来传输数据
+2.ADC的中断只打开Watch Dog的中断，不打开其他中断。Watch Dog中断优先级极高（主优先级 0），不得在其中使用FreeRTOS API
+3.COMP比较器中断主优先级 0，也不可以使用FREERTOS
+4.风扇/泵转速轮询（见9.1）放在0.5ms周期的定时器更新中断中执行（TIM7，主优先级 1，中断内仅整数GPIO读写与计数），不得使用FPU指令；转速计算放100ms任务中。
+5.禁止在中断中Delay
+
+保护：
+1.保护机制通常使用极高优先级的中断，因此在中断中不可以调用FreeRTOS API，必须尽快停止对PTT_INX的响应以及立即（无延迟）地释放RELAY1和RELAY2，然后立即置位PB13(RF_IN_PROTECT_CPU_SIG，MCU对外故障输出脚，经D7进入硬件故障锁存总线)脚,然后立即关闭PWR_ON_SIG停止电源板上的高压供应。随后置位一个警报标志位，然后在后续FreeRTOS的低优先级task中触发buzzer和弹窗警告。在用户解除警告前不可以再响应PTT。
+2.保护信号的产生基于以下几个来源：
+    a.ADC Watchdog中断（均在ADC1，只开Watchdog中断）：AWD1监视CH4(RF输入功率)，RF输入功率超限（[config]在不同的波段不同，一般是10W~20W，波段频率越高这个数要越低）；AWD2监视CH5(主电流)，主电流超限（[config]不得超过30A，与COMP2比较器互为双保险）；AWD3监视CH6(反射功率1)，反射功率1超限（阈值对应约800W，硬件最后防线）。这部分可以通过调整Watchdog的threshold来调整灵敏度
+    b.EXTI输入，HARDPWR_ERR(PB12) pin：电源故障，(Overdrive的外部中断输入取消了：RF输入过驱改由COMP1比较器+ADC1_INP4软件判读，PA输出包络由ADC2_INP0"输出检波采样"读取)
+    c.COMP比较器中断，阈值通过代码调整对应DAC输出：COMP1正输入PB2与ADC1_INP4(PC4)短接，监视RF1电台输入包络峰值，用于RF输入过驱/过功率硬件跳闸（门限由DACOUT1设定）；COMP2正输入PE9与ADC1_INP5(PB1，U20-B缓冲主电流)短接，用于主电流过流硬件跳闸（门限由DACOUT2设定，[config]不得超过30A）。COMP1_OUT(PE12)/COMP2_OUT(PE8)/MCU软件故障脚PB13经D1/D6/D7线或，共同置位RF_IN_PROTECT_MIXED硬件故障锁存
+    d.ADC的输入分配如下，一共用了2个ADC单元，在continous scan模式下通过dma循环更新至指定内存数组，每次dma传输完毕时需调用中断服务函数处理数组中的新数据，该报警报警（以原理图实际接线为准：ADC1实际转换9个外部通道=7路监测信号+按键分压+1路VBIAS_SENSE；ADC2常规2路+注入3路（INP2/INP6/TEMPSENSOR），注入通道在注入转换完成回调中处理），
+        以下是各ADC监测信号名称（你在做变量名时请转成英文，在屏幕上显示时中英文都要能选，系统要支持中英双语的切换，所以对每个需显示在屏幕上的名称需要有相关代码简洁地维护多语言信息，英文你可以自己从中文翻译过去，但是要方便我后续在代码文件中人工校验改正）：
+        ADC1(7路监测)：发射功率1(FWD1/INP8)，反射功率1(REV1/INP6)，发射功率2(FWD2/INP15)，反射功率2(REV2/INP9)，RF输入功率(INP4)，主电流(IM/INP5)，主电压(VM/INP16)；另加按键分压(INP17)、PA偏置(VBIAS_SENSE/INP14)
+        ADC2：RF2/PA输出455kHz中频采样(INP0，软件解调出包络；ES8388 LIN1的AM音频由D23直接检波链独立提供)，RF1/电台输入455kHz中频采样(INP1，软件解调出包络；ES8388 RIN1的AM音频由D22直接检波链独立提供)，核心NTC温度传感器(INP2注入)，INP6注入预留(第二NTC)；内部温度传感器为ADC2内部注入通道（VBat 注入未启用）
+    e.ADC数值软件保护，用于对延迟不敏感的保护：核心NTC温度传感器不得超过[config]90摄氏度，发射功率1不得超过[config]1100W，发射功率2不得超过[config]1050W
+
+ADC:
+结合ioc文件中的引脚号和引脚label的对应关系，以及lceda里Control电路图里net label包含ADC的nets的连接方式，推断ADC每个通道接受什么信息。并在用circular DMA转换ADC时，记录对应的数组位置。对每个ADC通道，实现独立的function实现ADC值向真实值的转换，真实值尽量用整型数，比如电压的单位用毫伏，功率的单位用毫瓦，电流的单位用毫安，温度的单位用0.1摄氏度等。
+
+【重要】IOC 中 ADC1/ADC2 的 NVIC 中断行当前不存在（已用 grep 校验 OPA2000_h7.ioc）。需要你（手动在 STM32CubeMX 里）勾选 ADC1/2 global interrupt 并设置主优先级=0、NVIC Priority Group=4。最终 NVIC 行应为：
+- NVIC.ADC1_2_IRQn=true\:0\:0\:true\:false\:true\:false\:true\:true\:true
+- NVIC.COMP_IRQn=true\:0\:0\:true\:false\:true\:false\:true\:true\:true
+- NVIC.EXTI15_10_IRQn=true\:0\:0\:true\:false\:true\:false\:true\:true\:true
+- NVIC.TIM2_IRQn=true\:1\:0\:true\:false\:true\:false\:true\:true\:true
+- NVIC.TIM5_IRQn=true\:1\:0\:true\:false\:true\:false\:true\:true\:true
+- NVIC.TIM7_IRQn=true\:1\:0\:true\:false\:true\:false\:true\:true\:true
+- NVIC.EXTI9_5_IRQn=true\:1\:0\:true\:false\:true\:false\:true\:true\:true
+
+AWD/COMP 中断用于电路保护，必须能无延迟地接管 MCU。中断服务函数内不得调用 FreeRTOS API。TIM7 中断内仅允许整数 GPIO 读写与计数（无 FPU 指令）。
+
+注意：ioc 文件中 PF2（CTouch_INTX）、PF4（REAR_RESERVED1）、PF5（PTT_INX）三条线分别配置为 EXTI2/EXTI4/EXTI5；PF4 现已改为普通 GPIO_Input（不再作 PENIRQ），EXTI4 线被 PF4 闲置但保留定义；EXTI5 (PF5) 主优先级=1 与 PTT 处理一同抢占；EXTI2 (PF2) 与触摸相关，主优先级可保留 ioc 默认。
+
+ADC 拓扑（来自 OPA2000_h7.ioc + lceda Control 原理图 .trae/all_nets.json 双重核对）：
+
+外部耦合器/连接器编号定义（依用户口述）：
+- 定向耦合器 1：位于功放板（PA）与 LPF 之间，对应 Control 板上连接器 H4（WAFER-PH2.0-6PWB）
+- 定向耦合器 2：位于 LPF 与天线之间，对应 Control 板上连接器 H15（WAFER-PH2.0-6PWB）
+- H1（WAFER-PH2.0-4PWB）：高压板对接口，H1-3 = IM_SENSE（CC6920BSO-50A 输出），H1-4 = VM_SENSE（主电压分压端）
+
+IOC 引脚 ↔ ADC 通道映射表（已与 Control 原理图核对）：
+
+| MCU 引脚 | ADC 信号 | ioc Pin 信号 | GPIO Label (若指定) |
+|----------|----------|--------------|---------------------|
+| PA0  | ADC1_INP16 | ADC1_INP16 | — |
+| PA1  | ADC1_INP17 | ADC1_INP17 | — |
+| PA2  | ADC1_INP14 | ADCx_INP14  | — |
+| PA3  | ADC1_INP15 | ADC1_INP15 | — |
+| PB0  | ADC1_INP9  | ADCx_INP9   | — |
+| PB1  | ADC1_INP5  | ADCx_INP5   | — |
+| PB2  | (无ADC)    | COMP1_INP   | — |
+| PC2_C| ADC2_INP0  | ADC2_INP0   | — |
+| PC3_C| ADC2_INP1  | ADC2_INP1   | — |
+| PC4  | ADC1_INP4  | ADCx_INP4   | — |
+| PC5  | ADC1_INP8  | ADCx_INP8   | — |
+| PF12 | ADC1_INP6  | ADC1_INP6   | — |
+| PF13 | ADC2_INP2  | ADC2_INP2   | — |
+| PF14 | ADC2_INP6  | ADC2_INP6   | — |
+
+注意：ioc 中 PA2/PB0/PB1/PC4/PC5 的 Pin signal 写成 ADCx_INP*（通用前缀），实际功能与 ADC1_INP* 等价，CubeMX 生成代码时正确解析。文档统一按 ADC1_INP* / ADC2_INP* 表述。
+
+ADC1（9 路常规通道，DMA1_Stream6，Circular，连续扫描）：
+- dma_buf_adc1[0]  Rank 1 = ADC1_INP4  (PC4)   → RF1 输入功率检波（RF1 经 D5/R40 峰值检波，与 PB2/COMP1_INP 短接；COMP1 以此为正端做 RF 输入过驱比较）
+- dma_buf_adc1[1]  Rank 2 = ADC1_INP5  (PB1)   → 主电流 IM（H1-3 IM_SENSE 经 R111 进 U20-B（GS8552-SR，pin5/6/7）缓冲；PE9/COMP2_INP 与该节点短接，COMP2 以此为正端做过流比较）
+- dma_buf_adc1[2]  Rank 3 = ADC1_INP6  (PF12)  → 耦合器1反射功率 REV1（H4-2 经 R112 分压；AWD3 监视此通道，软件提前量阈值对应 ~600W，硬件最后防线阈值 ~800W）
+- dma_buf_adc1[3]  Rank 4 = ADC1_INP8  (PC5)   → 耦合器1发射功率 FWD1（H4-4 经 R113 分压）
+- dma_buf_adc1[4]  Rank 5 = ADC1_INP9  (PB0)   → 耦合器2反射功率 REV2（H15-2 经 R114 分压；软件判读 > [config]400W 触发保护；无 AWD）
+- dma_buf_adc1[5]  Rank 6 = ADC1_INP14 (PA2)   → PA 偏置电压监测 VBIAS_SENSE（H5-5 排针经 R32 限流输入，C65 在 R32 与 GND 间做低通滤波；用于监测外部 PA 偏置电压）
+- dma_buf_adc1[6]  Rank 7 = ADC1_INP15 (PA3)   → 耦合器2发射功率 FWD2（H15-4 经 R115 分压）
+- dma_buf_adc1[7]  Rank 8 = ADC1_INP16 (PA0)   → 主电压 VM（H1-4 VM_SENSE 经 R110 进 U20-A（GS8552-SR，pin1/2/3）缓冲）
+- dma_buf_adc1[8]  Rank 9 = ADC1_INP17 (PA1)   → 外部按键电阻分压（H5-4 排针，C91 滤波；多键解码走 ADC 单通道电阻分压网络，无 I2C 扩展按键方案）
+
+【定向耦合器编号约定（与上一代 OPA1000 一致，已定稿）】
+  耦合器 1 = 功放板 → LPF        连接器 H4
+  耦合器 2 = LPF     → 天线      连接器 H15
+  主屏幕 GUI 显示的是**耦合器 2** 的数据，因此：
+    - 界面上显示的发射功率、反射功率、SWR 全部取自耦合器 2（FWD2/REV2）
+    - 软件发射限值 [config]1050W（发射功率2）与反射限值 400W/SWR 判据都作用于耦合器 2
+    - 耦合器 1（FWD1/REV1）用于发射功率 1 的 1100W 限值与 AWD3 的 ~800W 硬件防线
+
+ADC1 看门狗分配（来自 ioc MonitoredBy-* 与 WatchdogChannel 字段）：
+- AWD1 监视 ADC_CHANNEL_4（dma_buf_adc1[0]，RF 输入功率）
+- AWD2 监视 ADC_CHANNEL_5（dma_buf_adc1[1]，主电流）
+- AWD3 监视 ADC_CHANNEL_6（dma_buf_adc1[2]，耦合器1反射功率）
+注：STM32H7B0 的 AWD1/AWD2/AWD3 各有独立的 LTR1/HTR1、2、3 寄存器，三路门限互不干扰。
+注：耦合器2反射功率 / 发射功率 1 / 发射功率 2 / VBIAS_SENSE / 主电压 / 按键均无独立 AWD；过流/过驱另有 COMP1/COMP2 硬件比较器辅助保护，耦合器2反射功率与发射功率 1/2 仅靠 ADC 软件判读。
+
+【功率换算算法（沿用上一代 OPA1000，VREF 改为 2500mV）】
+  定向耦合器取样圈数 DC_TURNS = 31，取样电阻分压比 DC_ATTEN_RATIO = (330+100)/100 = 4.3，
+  检波二极管 BAT54 压降 Vf = 0.3V，系统阻抗 Z0 = 50Ω：
+      VRF = (Vadc + Vf) × DC_ATTEN_RATIO × DC_TURNS
+      P(W) = VRF² / Z0 / 2
+  OPA2000 的 ADC 为 16 bit、VREF = VREFBUF 2.5V，代码用整数运算：
+      v_mV   = raw × 2500 / 65535
+      vrf_mV = (v_mV + 300) × 1333 / 10        （1333 = 4.3 × 31，Q1）
+      P_mW   = vrf_mV² / 100000                （Z0/2 = 100Ω）
+  由此 full scale（raw 65535）约对应 1390 W，1050W / 1100W 两档限值都在量程内。
+  参考点（OPA1000 实测 12bit/3.28V：100W→560、250W→1100、400W→1400）
+  换算到 OPA2000 的 16bit/2.5V 码值：100W→11800、250W→23226、400W→31468、
+  800W→47756、1100W→57355。raw < 100 落在检波死区内按 0 处理。
+  该模型对 FWD1/REV1/FWD2/REV2 以及 RF 输入检波一律适用，不做每通道系数标定；
+  若后续需要台面标定，只需在此处加每通道修正系数，不要改曲线形状。
+
+
+ADC2（2 路常规通道 + 3 路注入通道；DMA1_Stream7，Circular，连续扫描）：
+- dma_buf_adc2[0]  Rank 1 = ADC2_INP0  (PC2_C) → RF2/PA 输出 455kHz 中频采样（RF2 经 Q4 与 SI5351 LO1 混频得到 455kHz 中频，Q4 集电极经 C77 耦合、U21 TLV9061 缓冲，软件做包络/相干解调得到输出功率与 AM 音频）
+- dma_buf_adc2[1]  Rank 2 = ADC2_INP1  (PC3_C) → RF1/电台输入 455kHz 中频采样（RF1 经 Q6 与 SI5351 LO2 混频得到 455kHz 中频，Q6 集电极经 C78 耦合、U11 TLV9061 缓冲，软件解调包络；AWD2 监视此通道，INP1=ADC_CHANNEL_1，注意 ADC1 AWD2 与 ADC2 AWD2 是两个不同 ADC 实例上的独立硬件）
+- 注入通道（adc2_jranking，在 ADC 注入转换完成回调中处理）：
+  - InjectedRank 1 = ADC2_INP2  (PF13) → 核心 NTC 温度传感器（H2 HDR-F_2.54_1x2P 第1脚，外部 NTC 通过 2-pin 排针接入，R35 限流，C15 滤波，D12 3.3V 钳位）
+  - InjectedRank 2 = ADC2_INP6  (PF14) → 第二 NTC / 模拟量预留（U18 ZX-PH2.0-WT4P 第3脚，外部预留接入，C95 滤波）
+  - InjectedRank 3 = ADC_CHANNEL_TEMPSENSOR → MCU 内部温度传感器
+
+ADC 基准：VREF+ 引脚（pin 32）使用内部 VREFBUF 输出 2.5V（仅接退耦电容 C31/C89），ADC 满量程按 2.5V 计算（16bit 满量程 0xFFFF ≈ 65535）。
+
+ADC 各通道到真实值的转换函数（返回整型数；功率类统一用 OPA1000 定向耦合器模型，主电流/电压/温度各自独立）：
+
+公共换算（OPA1000 模型，16bit / VREF 2500mV）：
+    v_mV   = raw × 2500 / 65535
+    vrf_mV = (v_mV + 300) × 1333 / 10
+    P_mW   = vrf_mV² / 100000
+（raw < 100 视为检波死区，返回 0；full scale ≈ 1390 W）
+反算（保护门限写入 AWD 寄存器时用）：code = (sqrt(P_mW × 100000) × 10 / 1333 − 300) × 65535 / 2500，超量程钳到 65535。
+
+- int32_t adc1_raw_to_rf_in_mW(uint16_t raw)            // [0] RF 输入功率（D5/R40 峰值检波，无耦合器），单位 mW，暂用上述曲线，实测偏差大时另加修正系数
+- int32_t adc1_raw_to_im_mA(uint16_t raw)               // [1] 主电流 IM，单位 mA，CC6920BSO-50A：I_mA = (raw − zero_offset) × 25000000 / 17301240（26.4 mV/A）
+- int32_t adc1_raw_to_rev1_mW(uint16_t raw)             // [2] 耦合器1反射功率 REV1（PA→LPF 之间），OPA1000 模型
+- int32_t adc1_raw_to_fwd1_mW(uint16_t raw)             // [3] 耦合器1发射功率 FWD1，OPA1000 模型
+- int32_t adc1_raw_to_rev2_mW(uint16_t raw)             // [4] 耦合器2反射功率 REV2（LPF→天线之间，GUI 显示的就是这一路），OPA1000 模型
+- int32_t adc1_raw_to_vbias_sense_mV(uint16_t raw)      // [5] PA 偏置电压 VBIAS_SENSE，单位 mV，V = raw * 2500 / 65535（R32 限流 + C65 低通，无分压）
+- int32_t adc1_raw_to_fwd2_mW(uint16_t raw)             // [6] 耦合器2发射功率 FWD2，OPA1000 模型
+- int32_t adc1_raw_to_vm_mV(uint16_t raw)               // [7] 主电压 VM，单位 mV，由 R110 分压 + U20-A 增益决定（暂按满量程 50V）
+- uint16_t adc1_raw_to_key_adc_code(uint16_t raw)       // [8] 按键分压，原样返回 16 位 ADC 码，用于多按键解码
+- int16_t adc2_raw_to_if_pa_env_mV(uint16_t raw)        // dma_buf_adc2[0] PA 输出 455kHz 中频瞬时值，单位 mV，软件取滑动窗口峰值/均值得到输出功率
+- int16_t adc2_raw_to_if_radio_env_mV(uint16_t raw)     // dma_buf_adc2[1] RF1 输入 455kHz 中频瞬时值，单位 mV
+- int16_t adc2_inj_raw_to_core_ntc_tenth_c(uint16_t raw)   // ADC2 注入 INP2，核心 NTC 温度，单位 0.1°C，NTC 查表/B 值方程由 LUT 实现
+- int16_t adc2_inj_raw_to_aux_ntc_tenth_c(uint16_t raw)    // ADC2 注入 INP6，第二 NTC / 预留温度
+- int16_t adc2_inj_raw_to_mcu_internal_tenth_c(uint16_t raw) // ADC2 注入 TEMPSENSOR，MCU 内部温度，参考 ST 工厂校准常量 TS_CAL1/TS_CAL2 与温度公式
+
+ADC ↔ COMP ↔ DAC 拓扑（来自 ioc VP_* + lceda Control 原理图核对）：
+- COMP1 正输入 = PB2 = COMP1_INP = ADC1_INP4 (PC4) 同节点（RF1 输入功率检波后），负输入 = DAC1_OUT1（iDAC 模式），输出 PE12 = COMP1_OUT
+- COMP2 正输入 = PE9 = COMP2_INP = ADC1_INP5 (PB1) 同节点（U20-B 缓冲后），负输入 = DAC1_OUT2 或 DAC2_OUT1（iDAC 模式），输出 PE8 = COMP2_OUT
+- COMP1_OUT (PE12) 经 D1、COMP2_OUT (PE8) 经 D6、MCU 软件故障脚 PB13（RF_IN_PROTECT_CPU_SIG）经 D7，三只二极管线或为 RF_IN_PROTECT_MIXED 硬件故障锁存总线
+- VREF+ (pin 32) 内部 VREFBUF 2.5V，仅 C31/C89 退耦
+- 注入转换回调用 ADC1 内嵌 AWD（CH4/CH5/CH6）+ 软件看门狗（CH8/9/14/15/16/17 等无 AWD 的通道）双层保护
+
+ADC1 注入组态：当前 ioc 中 ADC1.EnableInjectedConversion=DISABLE，即 ADC1 不开注入。注入通道在 ADC2 上启用（3 个：INP2/INP6/TEMPSENSOR）。如果后续需要 ADC1 也跑温度等注入，需在 ioc 中开启 ADC1.EnableInjectedConversion=ENABLE 并按 ADC2 同样方式配置。
+
+ADC2 不启用 VBat 注入（ioc 当前 ADC2.InjNumberOfConversion=3，仅 INP2/INP6/TEMPSENSOR）；如需 VBat 监测需 ioc 增加 ADC_CHANNEL_VBAT 注入 rank=4。
+
+========================================================================
+【DMA 缓冲区的总线域与缓存要求（已定稿，2026-10-14）】
+========================================================================
+所有由 DMA 读/写的缓冲区，必须同时满足两件事：
+  (1) 落在「该 DMA 控制器能访问」的总线域；
+  (2) 落在 MPU 标为「不可缓存」的区域。
+二者缺一，DMA 传输都会失败，或出现 DMA 与 CPU 数据不一致（H7 的 D-Cache 不会
+为 DMA 自动做一致性维护，也没有任何代码做手动 cache clean/invalidate）。
+
+一、总线域约束（STM32H7B0，依据 RM0455 §2 TCM buses、§3 Bus-to-bus bridges 与 Table 2）
+  · 本芯片只有两个域，**不是** F4/H743 习惯说的 D1/D2/D3：
+      CD 域（CPU 域）：Cortex-M7 + ITCM/DTCM、AXI SRAM(0x24000000, 1MB)、
+        AHB-SRAM(0x30000000, 128KB)，以及绝大多数外设（DMA1、DMA2、DMA2D、
+        LTDC、SDMMC、USB OTG HS…）。
+      SRD 域（SmartRun 域）：SRD-SRAM(0x38000000, 32KB)、Backup SRAM、
+        BDMA1/BDMA2，以及低功耗外设（LPUART1 等）。
+  · **TCM（ITCM 0x00000000 / DTCM 0x20000000）只有 Cortex-M7 内核与 MDMA 能访问。**
+    RM0455 §2：「DTCM/ITCM 由专用 TCM 总线直接连到 Cortex-M7 内核，**MDMA
+    通过 AHBS 访问它们**」；§3：「Cortex-M7 的 **AHBS slave AHB** 提供 TCM
+    总线（ITCM/DTCM）翻译，**供 MDMA 控制器访问** ITCM 与 DTCM」。
+    → DMA1、DMA2、BDMA、**USB OTG HS 的内部 DMA**、DMA2D、LTDC、SDMMC
+      等全部主线**都访问不到 TCM**。
+  · SRD 域的主线（BDMA）只能访问 SRD 的从设备（SRD-SRAM 0x38000000、
+    Backup SRAM 及 SRD 外设），够不到 CD 域的 AXI SRAM。
+  · 本工程直接后果：
+      - LPUART1 在 SRD 域、其 DMA 是 BDMA2 → 收发缓冲放 SRD-SRAM
+        (0x38000000) 最稳妥（既在 BDMA 可达范围，也不依赖跨域桥）。
+      - ADC/UART4（CD 域外设，走 DMA1/DMA2）、TIM2(ALC)、USB OTG HS（CD 域，
+        内部 DMA）→ 缓冲放 AXI SRAM 非缓存窗口，**不能放 DTCM**。
+
+二、缓存约束（MPU）
+  · 被 DMA 访问的缓冲，其所在 MPU region 必须是 NOT_CACHEABLE +
+    NOT_BUFFERABLE；AccessPermission 必须是 FULL_ACCESS（不能是 NO_ACCESS，
+    否则 CPU 一访问就 MemManage fault）。
+  · 本工程做法：AXI SRAM 整体（R3=0x24000000 1MB）可缓存，但把
+    0x24000000 起 512KB（R4）单独挖成 FULL_ACCESS + NOT_CACHEABLE，供
+    framebuffer 与各 DMA 缓冲使用；SRAM4（R6=0x38000000 32KB）必须
+    NOT_CACHEABLE，供 BDMA2 使用；外部 OSPI（R1=0x90000000）必须
+    CACHEABLE + INSTRUCTION_ACCESS_ENABLE（XIP）。
+
+三、本工程地址约定（必须与 app.ld 保持一致；地址由 app.ld 的导出符号
+    _framebuffer_start / _dma_no_cache_start / _d3_dma_buffer_start 固定）
+  · .framebuffer    0x24000000  256KB   LTDC 层缓冲（DMA 只写）
+  · .dma_no_cache   0x24040000  ~56KB   AXI SRAM 非缓存窗口，收拢：
+        .dma_buffer      ADC1/ADC2（DMA1_S6/S7）、UART4 CAT（DMA2_S6/S7）
+        .lvgl_buffer     LVGL 双绘制缓冲（CPU 写、DMA2D 读）
+        .usb_dma_buffer  USB CDC 收发缓冲（USB OTG HS 内部 DMA）
+        .dma_no_cache    alc_pwm.c 的 BSRR 载荷（TIM2 CH1/2 DMA 源，DMA2_S0/S1）
+  · .d3_dma_buffer  0x38000000  256B     LPUART1 的 BDMA2 接收缓冲（SRAM4）
+  · .data/.bss/栈/LVGL 内存池(.CCMRAM_heap) 全在 DTCM(0x20000000)：只给 CPU 用。
+  ⚠ 上述三个 DMA 段都是 NOLOAD：不被 startup 赋初值/清零。需要初值的变量必须
+    在运行时显式赋值，或改放 .data（例如 alc_pwm.c 在 start/init 里赋值）。
+
+四、新增 DMA 缓冲时的做法（务必遵守）
+  1) 先确认该外设走哪个 DMA 控制器（见 .ioc 的 Dma.*/Bdma2.* 段，或
+     USB_DEVICE/Target/usbd_conf.c 的 dma_enable）；据此二选一：
+       · DMA1/DMA2 或 USB 内部 DMA（均属 CD 域主线）→ section(".dma_no_cache")
+       · BDMA2（SRD 域外设的 DMA，如 LPUART1）→ section(".d3_dma_buffer")
+  2) 在变量声明处加属性，例如：
+       static uint8_t buf[N] __attribute__((section(".dma_no_cache"), aligned(32)));
+  3) 触摸（SPI1）/I2C3 这类走「阻塞式 HAL 调用」的代码不是 DMA，不受本条约束。
+  4) 若新增 DMA 段越出现有窗口，需同步更新 app.ld 的 section 与 ASSERT，
+     以及 CubeMX MPU region 的基址/大小。

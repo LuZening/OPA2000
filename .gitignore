@@ -1,0 +1,91 @@
+# =============================================================================
+#  OPA2000 hardware project - parent repository
+#
+#  Tracks the hardware design sources (schematics, PCB, BOM, EDA projects).
+#  The firmware projects under Code_2/ are registered as git submodules, so
+#  their own build trees are ignored here as well - a submodule's .gitignore
+#  already covers its own tree, but these rules keep the parent repo clean
+#  while a submodule is not yet initialised.
+# =============================================================================
+
+# --- Firmware submodules ------------------------------------------------------
+# Code_2/* are real git submodules, each with its own GitHub remote.  Listing
+# them here is what stops `git add .` from recording a bare gitlink before
+# `git submodule add` has properly registered them.  Once a submodule is
+# registered, git ignores this rule for that path - the .gitmodules entry and
+# the index gitlink take over, and its contents come from the child repo.
+Code_2/OPA2000_h7/
+Code_2/OPA2000_h7_Bootloader/
+Code_2/OPA2000_h7_MSC_TEMPLATE/
+Code_2/H7B0ZB_W25Q128_HSI_ExternalLoader/
+Code_2/OPA2000_MCU_simple_test/
+
+# --- Vendor reference material (datasheets, vendor app notes) -----------------
+# 257 MB of PDFs and vendor documentation.  These are licensed third-party
+# documents, not our design work, and would bloat the repo without adding
+# recoverable value - they can be re-downloaded from the vendor.
+reference/
+
+# --- Build artefacts ----------------------------------------------------------
+build/
+cmake-build-*/
+Debug/
+Release/
+*.o
+*.obj
+*.su
+*.dep
+*.d
+*.map
+*.elf
+*.hex
+*.bin
+*.lst
+
+# --- IDE / tooling state ------------------------------------------------------
+.settings/
+.vscode/
+.project
+.cproject
+.mxproject
+.trae/
+.claude/
+compile_commands.json
+
+# --- EDA caches and autosaves -------------------------------------------------
+# Every tool rewrites these on open; tracking them creates a diff storm.
+fp-info-cache
+*-cache.lib
+*-bak/
+*-cache/
+*.bak
+*-bak
+_autosave-*
+*.lck
+*.kicad_prl
+*.pro-bak
+*.sch-bak
+*.kicad_pcb-bak
+prl_*.prl
+
+# Word / Office lock and temp files (~$doc.docx, ~WRL1580.tmp)
+~$*
+~WRL*.tmp
+
+# --- Simulation exports (regenerable, and large) ------------------------------
+# The .asc in the same folder is the actual AWR design source - keep that.
+# .fft is a 64 MB binary, .raw 13 MB; both are derived measurement data and
+# both are re-exported from the design in seconds.
+MCU_2/*.fft
+MCU_2/*.raw
+MCU_2/*.op.raw
+MCU_2/*.plt
+MCU_2/*.log
+MCU_2/InteractiveBOM_*.html
+RF_2/InteractiveBOM_*.html
+
+# --- Misc ---------------------------------------------------------------------
+*.bak
+*.log
+*.tmp
+*.stackdump

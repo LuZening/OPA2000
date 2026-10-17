@@ -1,0 +1,26 @@
+* E:\Projects\RADIO\Projects\OPA2000\MCU_2\RFsample.asc
+R1 N005 N009 1k
+C1 N006 N005 10n
+Q1 N002 N006 N007 0 2N3904
+R2 VCC N006 12k
+R3 N006 0 12k
+R4 N007 0 220
+R5 VCC N002 150
+C2 VCC N002 1p
+V2 VCC 0 3.3
+V1 N009 0 SINE(0 0.5 10455k)
+V3 N010 0 PULSE(0 3 0 0 0 0.05u 0.1u)
+R6 N008 N010 50
+C3 N007 N008 10n
+R7 N003 N002 12k
+R8 N004 N003 12k
+XU1 N001 N004 N001 opamp Aol=100K GBW=10Meg
+C4 N001 N003 33p
+C5 N004 0 18p
+.model NPN NPN
+.model PNP PNP
+.lib C:\Users\cpholzn\Documents\LTspiceXVII\lib\cmp\standard.bjt
+.tran 100u
+.lib opamp.sub
+.backanno
+.end

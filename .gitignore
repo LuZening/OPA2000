@@ -83,7 +83,4 @@ RF_2/InteractiveBOM_*.html
 *.stackdump
 
 # --- Local scratch ------------------------------------------------------------
-# Backup of the OPA2000_h7 standalone repo, kept until the subtree merge is
-# verified on a remote.  Delete once the push to GitHub is confirmed.
-.git_backup_opa2000_h7/
 reminders.txt

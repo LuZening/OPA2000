@@ -24,8 +24,13 @@
 #include <string.h>
 
 /* Per-sector bookkeeping the wear-leveling scheme needs on top of the
- * payload: magic, record id, payload length, CRC, commit marker. */
-#define EEPROM_RECORD_HEADER_BYTES 16U
+ * payload: magic, record id, payload length, CRC, commit marker.
+ *
+ * Derived from the authoritative EEPROM_HEADER_WORDS rather than written out
+ * as a literal.  A hard-coded 16 here is exactly how this test drifted out of
+ * sync with the real record geometry and stopped catching the payload
+ * overflow in eeprom_encode(). */
+#define EEPROM_RECORD_HEADER_BYTES (EEPROM_HEADER_WORDS * EEPROM_WORD_BYTES)
 
 /*============================================================================
  *  Record fits
@@ -98,6 +103,21 @@ TEST_CASE(touch_cal_stays_float_based)
      * fails here. */
     ASSERT_EQ(sizeof(touch_cal_t), 4U * sizeof(float) + 4U);
 }
+
+/*============================================================================
+ *  Suite registration
+ *==========================================================================*/
+
+const test_entry_t g_suite_config_layout[] = {
+    TEST_ENTRY(config_record_fits_in_the_eeprom_payload_cap),
+    TEST_ENTRY(config_record_is_word_aligned_after_the_header),
+    TEST_ENTRY(config_record_leaves_room_in_the_sector),
+    TEST_ENTRY(crc32_is_the_last_member_of_config),
+    TEST_ENTRY(crc32_really_is_a_trailing_uint32),
+    TEST_ENTRY(coupler_trim_is_exactly_two_int32),
+    TEST_ENTRY(touch_cal_stays_float_based),
+    TEST_SUITE_END,
+};
 
 /*============================================================================
  *  Printout helper (run manually, not part of the pass/fail set)

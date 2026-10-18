@@ -212,6 +212,28 @@ HAL_StatusTypeDef HAL_DAC_Start(DAC_HandleTypeDef *hdac, uint32_t Channel)
     return HAL_OK;
 }
 
+/*============================================================================
+ *  COMP stub
+ *==========================================================================*/
+
+static COMP_TypeDef s_comp1 = { 0U };
+static COMP_TypeDef s_comp2 = { 0U };
+
+COMP_HandleTypeDef hcomp1 = { &s_comp1 };
+COMP_HandleTypeDef hcomp2 = { &s_comp2 };
+
+HAL_StatusTypeDef HAL_COMP_Start_IT(COMP_HandleTypeDef *hcomp)
+{
+    if (hcomp == NULL || hcomp->Instance == NULL) {
+        return HAL_ERROR;
+    }
+    /* EN bit, as the real HAL would set.  user_adc.c only checks the
+     * return value, but leaving the register observable keeps the stub
+     * honest. */
+    hcomp->Instance->CR |= 0x00000004U;
+    return HAL_OK;
+}
+
 int HAL_TIM_PWM_Start(TIM_HandleTypeDef *htim, uint32_t channel)
 {
     if (htim) htim->pwm_started_ch_mask |= (int)channel;

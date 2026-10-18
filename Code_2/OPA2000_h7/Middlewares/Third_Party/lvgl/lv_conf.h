@@ -48,7 +48,7 @@
 
 /* Default display refresh period.
  * Can be changed in the display driver (`lv_disp_drv_t`).*/
-#define LV_DISP_DEF_REFR_PERIOD      17      /*[ms]*/
+#define LV_DISP_DEF_REFR_PERIOD      33      /*[ms]*/
 
 /* Dot Per Inch: used to initialize default sizes.
  * E.g. a button with width = LV_DPI / 2 -> half inch wide
@@ -81,7 +81,7 @@ typedef int16_t lv_coord_t;
 #define LV_MEM_CUSTOM      0
 #if LV_MEM_CUSTOM == 0
 /* Size of the memory used by `lv_mem_alloc` in bytes (>= 2kB)*/
-#  define LV_MEM_SIZE    (32U * 1024U)
+#  define LV_MEM_SIZE    (48U * 1024U)
 
 /* Complier prefix for a big array declaration */
 // LVGL heap allocated at CCM RAM
@@ -267,11 +267,16 @@ typedef void * lv_img_decoder_user_data_t;
  *==================*/
 
 /* 1: use a custom tick source.
- * It removes the need to manually update the tick with `lv_tick_inc`) */
-#define LV_TICK_CUSTOM     0
+ * It removes the need to manually update the tick with `lv_tick_inc`)
+ *
+ * 本工程打开：LVGL 的时基直接读 FreeRTOS 的 tick 计数（1 kHz，数值即
+ * 毫秒），而不是在 GUI 任务里调 lv_tick_inc()。原因见 lv_tick_port.h
+ * 的注释——GUI 任务优先级低于 ADC/Monitor/Protect，被抢占时补不回
+ * 真实流逝的时间，动画和定时器会整体变慢。 */
+#define LV_TICK_CUSTOM     1
 #if LV_TICK_CUSTOM == 1
-#define LV_TICK_CUSTOM_INCLUDE  "something.h"       /*Header for the sys time function*/
-#define LV_TICK_CUSTOM_SYS_TIME_EXPR (millis())     /*Expression evaluating to current systime in ms*/
+#define LV_TICK_CUSTOM_INCLUDE  "lv_tick_port.h"   /*Header for the sys time function*/
+#define LV_TICK_CUSTOM_SYS_TIME_EXPR (lv_port_tick_ms()) /*Expression evaluating to current systime in ms*/
 #endif   /*LV_TICK_CUSTOM*/
 
 typedef void * lv_disp_drv_user_data_t;             /*Type of user data in the display driver*/
@@ -415,7 +420,10 @@ typedef void * lv_font_user_data_t;
 
 /* No theme, you can apply your styles as you need
  * No flags. Set LV_THEME_DEFAULT_FLAG 0 */
- #define LV_USE_THEME_EMPTY       1
+ /* OFF.  This is NOT the theme in use (see LV_THEME_DEFAULT_INIT below); it
+  * only compiles lv_theme_empty.c in.  With the material theme active
+  * nothing references it, so leaving it on would just add dead code. */
+ #define LV_USE_THEME_EMPTY       0
 
 /*Simple to the create your theme based on it
  * No flags. Set LV_THEME_DEFAULT_FLAG 0 */
@@ -425,7 +433,7 @@ typedef void * lv_font_user_data_t;
  * Flags:
  * LV_THEME_MATERIAL_FLAG_LIGHT: light theme
  * LV_THEME_MATERIAL_FLAG_DARK: dark theme*/
- #define LV_USE_THEME_MATERIAL    0
+ #define LV_USE_THEME_MATERIAL    1
 
 /* Mono-color theme for monochrome displays.
  * If LV_THEME_DEFAULT_COLOR_PRIMARY is LV_COLOR_BLACK the
@@ -435,10 +443,39 @@ typedef void * lv_font_user_data_t;
  #define LV_USE_THEME_MONO        0
 
 #define LV_THEME_DEFAULT_INCLUDE            <stdint.h>      /*Include a header for the init. function*/
-#define LV_THEME_DEFAULT_INIT               lv_theme_empty_init
+/* Why material and not empty:
+ *
+ * lv_theme_empty_init() installs a theme whose apply callback is an empty
+ * function, so NO widget receives any style from LVGL.  Every object then
+ * falls back to lv_obj_get_style_prop()'s hardcoded default for an unset
+ * LV_STYLE_BG_OPA, which is LV_OPA_TRANSP - fully transparent.  The visible
+ * consequence was that every popup (alert msgbox, band selector, coupler
+ * calibration, baud spinner, protection settings) and every button inside
+ * them drew nothing, because gui.c only ever set bg_color and relied on a
+ * theme to supply the opacity.
+ *
+ * OPA1000 does not hit this: it sets bg_color and bg_opa as a pair on every
+ * style (LVGL_GUI.c: lv_style_set_bg_color + lv_style_set_bg_opa).  With a
+ * real theme installed that pairing is unnecessary - the theme supplies
+ * LV_OPA_COVER and the explicit bg_color on top simply recolours it.
+ *
+ * Light (not dark) is deliberate: the material theme's own palette is a light
+ * grey, which sits closer to this project's existing light-on-dark widgets
+ * than the dark palette would, so any object gui.c does not recolour still
+ * ends up legible rather than black-on-black.  Every colour the application
+ * cares about is set later with lv_obj_set_style_local_*(), which is a
+ * *local* style and therefore takes priority over the theme's applied style
+ * - so nothing that currently looks right changes. */
+#define LV_THEME_DEFAULT_INIT               lv_theme_material_init
 #define LV_THEME_DEFAULT_COLOR_PRIMARY      LV_COLOR_RED
 #define LV_THEME_DEFAULT_COLOR_SECONDARY    LV_COLOR_BLUE
-#define LV_THEME_DEFAULT_FLAG               0
+/* Light palette.  Spelled as the literal rather than
+ * LV_THEME_MATERIAL_FLAG_LIGHT because this header is included from
+ * lv_conf_internal.h line 20 - long before lv_theme_material.h (which is
+ * where that enum lives) is reachable through lvgl.h.  Using the name here
+ * would not compile.
+ * Value from lv_theme_material.h: LV_THEME_MATERIAL_FLAG_LIGHT = 0x02. */
+#define LV_THEME_DEFAULT_FLAG               0x02
 #define LV_THEME_DEFAULT_FONT_SMALL         &MyCJK_12
 #define LV_THEME_DEFAULT_FONT_NORMAL        &MyCJK_16
 #define LV_THEME_DEFAULT_FONT_SUBTITLE      &MyCJK_16

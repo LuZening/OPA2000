@@ -32,6 +32,7 @@
 #include "user_adc.h"
 #include "boot.h"
 #include "stm32h7xx_hal.h"
+#include "comp.h"
 #include <string.h>
 #include <math.h>
 
@@ -176,6 +177,75 @@ bool adc_stabilisation_done(void)
  * only, so no volatile and no atomicity concerns. */
 static uint32_t s_peak_last_tick = 0U;
 
+/*============================================================================
+ *  ADC2 injected conversions - periodic restart
+ *
+ *  Why they stop after one pass
+ *  ---------------------------
+ *  MX_ADC2_Init() configures the injected sequence as:
+ *      ExternalTrigInjecConv          = ADC_INJECTED_SOFTWARE_START
+ *      InjectedDiscontinuousConvMode  = DISABLE
+ *      InjectedNbrOfConversion       = 3   (NTC core, NTC aux, die temp)
+ *
+ *  With no trigger source and discontinuous mode off, HAL_ADCEx_InjectedStart()
+ *  runs those three ranks exactly once and the injected state machine parks
+ *  itself.  Nothing re-arms it, so adc2_inj_*_raw freeze at whatever the
+ *  first pass measured - which on a cold part is the ambient temperature at
+ *  boot, forever.  The NTC readings on the status bar and the MCU die
+ *  temperature in the sensor-inspect page are then not measurements at all.
+ *
+ *  The fix
+ *  -------
+ *  Re-arm the sequence from task context on a timer.  Software start plus a
+ *  re-arm is enough: the three conversions take microseconds (1.5 cycles +
+ *  12-bit sample on three channels), so re-arming at 100 ms costs nothing
+ *  and no interrupt is involved beyond the existing end-of-sequence one that
+ *  publishes the JDRs.
+ *
+ *  100 ms, not faster: the slowest thing these feeds is the NTC number on the
+ *  status bar, which is meaningless to read faster than the eye can resolve.
+ *  A faster rate would just be interrupt traffic for the same information.
+ *
+ *  The NTC protection path is NOT affected by this rate - protection reacts
+ *  to the ADC1 analog watchdog, which runs continuously off the hardware
+ *  comparator front end and never touches the injected sequence at all.
+ *==========================================================================*/
+
+/*!< Re-arm interval, milliseconds.  Matches the requirement's floor of
+ *  "at least every 100 ms". */
+#define INJ_PERIOD_MS            100U
+
+/*!< Tick of the previous re-arm.  Unsigned subtraction makes the
+ *  HAL_GetTick() wrap (~49 days) a non-issue. */
+static uint32_t s_inj_last_tick  = 0U;
+
+/**
+ * @brief Re-arm the ADC2 injected sequence if the period has elapsed
+ *
+ * Task context only (the ADC task).  Call at the task tick rate; the call
+ * itself is a tick comparison plus an occasional three-conversion burst, so
+ * calling it every 50 ms is indistinguishable from calling it every 100 ms
+ * in cost, and calling it more often than that is pointless because the
+ * period check gates the actual start.
+ *
+ * Failure is ignored on purpose.  HAL_ADCEx_InjectedStart() only fails on a
+ * bad state or a disabled ADC, and if that is true then re-arming every
+ * 100 ms forever would spin in a task and bury the real cause.  One attempt
+ * per period is the smallest useful retry, and if the peripheral is truly
+ * broken the protection path reports that long before the NTC display does.
+ */
+void adc_injected_tick(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if ((now - s_inj_last_tick) < INJ_PERIOD_MS) {
+        return;
+    }
+    s_inj_last_tick = now;
+
+    (void)HAL_ADCEx_InjectedStart(&hadc2);
+}
+
 /* One peak-hold step for a single channel. */
 static float peak_hold_step(float prev, float sample, float dt_s)
 {
@@ -247,6 +317,11 @@ void adc_init(void)
     g_adc_data.fwd2_peak_mW = 0;
     g_adc_data.rev2_peak_mW = 0;
 
+    /* Same for the injected re-arm: 0 means "a full period has elapsed", so
+     * the first adc_injected_tick() fires immediately rather than waiting a
+     * pointless 100 ms before the very first measurement. */
+    s_inj_last_tick       = 0U;
+
     /* Power-on stabilisation restarts too.  adc_init() runs once per boot
      * from app_adc_task(), so without this a soft restart (or a unit test
      * calling adc_init() to reset the module) would leave the gate sitting
@@ -278,14 +353,21 @@ void adc_start(void)
      *   AWD2 -> CH5 main current IM  (threshold via adc_awd_set_im_mA)
      *   AWD3 -> CH6 coupler 1 reverse (threshold via adc_awd_set_rev1_mW)
      * So nothing extra is needed here beyond starting the conversions. */
-
-    if (HAL_ADC_Start_DMA(&hadc2,
-                          (uint32_t *)adc2_dma_buf,
-                          ADC_DMA_BUFFER_SIZE * 2U)
-        != HAL_OK) {
-        Error_Handler();
-    }
-    /* Trigger injected conversion once per started interrupt cycle. */
+    /* Note: hadc2 interrupts at very high frequency, which will storm the cpu in debug mode.
+     * That is why the regular-conversion DMA start below is commented out. */
+//    if (HAL_ADC_Start_DMA(&hadc2,
+//                          (uint32_t *)adc2_dma_buf,
+//                          ADC_DMA_BUFFER_SIZE * 2U)
+//        != HAL_OK) {
+//        Error_Handler();
+//    }
+    /* Trigger injected conversion once per started interrupt cycle.
+     *
+     * This only fires ONE pass: MX_ADC2_Init() asks for
+     * ADC_INJECTED_SOFTWARE_START with no trigger source and
+     * InjectedDiscontinuousConvMode = DISABLE, so the three ranks (NTC core,
+     * NTC aux, die temp) convert once and the injected state machine parks.
+     * adc_injected_tick() is what keeps it going from then on. */
     if (HAL_ADCEx_InjectedStart(&hadc2) != HAL_OK) {
         Error_Handler();
     }
@@ -308,23 +390,15 @@ static inline uint16_t adc1_latest(uint8_t rank)
     return adc1_dma_buf[(ADC_DMA_BUFFER_SIZE - 1U) * ADC1_RANK_COUNT + rank];
 }
 
-static uint16_t adc1_average_rank(uint8_t rank, uint16_t *out_avg)
-{
-    uint32_t sum = 0U;
-    for (uint16_t i = 0; i < ADC_DMA_BUFFER_SIZE; i++) {
-        sum += adc1_dma_buf[i * ADC1_RANK_COUNT + rank];
-    }
-    *out_avg = (uint16_t)(sum / ADC_DMA_BUFFER_SIZE);
-    return 0;
-}
 
 void adc_process(void)
 {
     /* ADC1 ranks: average across the rolling DMA buffer. */
     uint16_t raw_rank[ADC1_RANK_COUNT];
+
     for (uint8_t r = 0; r < ADC1_RANK_COUNT; r++) {
-        adc1_average_rank(r, &raw_rank[r]);
-        g_adc_data.adc1_raw[r] = raw_rank[r];
+        g_adc_data.adc1_raw[r] = adc1_dma_buf[r];
+        raw_rank[r] = adc1_dma_buf[r];
     }
 
     /* Convert to engineering units via adc_calibration.h. */
@@ -405,11 +479,25 @@ bool adc_stabilisation_tick(void)
             boot_arm_thresholds((int)g_current_band);
             CLEAR_FAULTX_OC_HIGH();
             s_stab_stage = STAB_ARMED;
+            /* --- Enable the two comparators ------------------------------------ */
+            /* MX_COMPx_Init() only configures the peripheral; without this the
+             * comparators stay disabled and HAL_COMP_TriggerCallback() would never
+             * fire, i.e. the COMP1 overdrive and COMP2 over-current protections
+             * would be dead code.  Started only after the references above are at the
+             * unreachable end of the DAC range, so the first comparison already runs
+             * against a threshold that cannot be crossed. */
+            if (HAL_COMP_Start_IT(&hcomp1) != HAL_OK) {
+              Error_Handler();
+            }
+            if (HAL_COMP_Start_IT(&hcomp2) != HAL_OK) {
+              Error_Handler();
+            }
             return true;
         }
         return false;
 
     case STAB_ARMED:
+
     default:
         return true;
     }
@@ -453,14 +541,26 @@ bool adc_im_zero_offset_tick(void){
             s_im_cal.phase = 0U;
             return true;
         }
-        /* Failure - retry up to 3 times then alarm */
-        if (++s_im_cal.retry >= 3U) {
-            g_alert_active = ALERT_HARDWARE_FAULT;
-            g_alert_flag   = true;
-            s_im_cal.phase = 0U;     /* stop sampling */
-            return false;
-        }
-        /* back to sampling */
+        /* Out of tolerance: keep sampling.
+         *
+         * This used to count three attempts and then raise
+         * ALERT_HARDWARE_FAULT, but that path was removed - a zero-offset
+         * that will not settle is far more often a cold-soak / warm-up
+         * artefact (the CC6920's offset drifts with temperature, and the
+         * PA is drawing nothing at this point so nothing warms it) than a
+         * real hardware failure.  alarming on it taught the operator to
+         * ignore the alert.
+         *
+         * Retrying forever is safe because g_allow_rf stays false until
+         * the fit succeeds, and nothing downstream arms the real AWD/COMP
+         * limits until STAB_ARMED - which, for the same reason, this
+         * failure keeps us from reaching.  The visible symptom of a
+         * never-settling offset is simply that the amp cannot be keyed.
+         *
+         * s_im_cal.retry keeps counting passes but is no longer read for
+         * any decision - it is there to be watched in a debugger to see how
+         * long the offset has been refusing to settle. */
+        s_im_cal.retry++;
         s_im_cal.phase = 1U;
         s_im_cal.sample_idx = 0U;
         return false;

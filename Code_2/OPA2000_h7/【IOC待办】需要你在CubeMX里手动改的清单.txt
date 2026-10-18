@@ -121,13 +121,14 @@
     TIM7.IPParameters=Prescaler
     TIM7.Prescaler=3        （Period 未列，约 1.3 ms/tick）
 
-  但 freq_detect_init() / fan_tach_init() 会在运行时重写
-  htim7->PSC / htim7->ARR，所以 ioc 里这个值实际上不影响运行。
+  但 freq_detect_init() 会在运行时重写 htim7->PSC / htim7->ARR，
+  所以 ioc 里这个值实际上不影响运行。
 
   [ ] 可以不改。若想 ioc 与代码一致，改成 Prescaler=19 / Period=999（100 µs）
-  ⚠ 注意代码内部目前对 TIM7 周期有冲突（freq_detect 要 100 µs、
-    fan_tach 要 500 µs），这是我接下来要修的代码问题，不是 ioc 问题，
-    见文末"代码侧顺手提醒"。
+  ✅ TIM7 周期冲突已解决：fan_tach 原来有个 fan_tach_start() 想按 500 µs
+    重写 PSC/ARR，但从来没被调用过。现已删除该函数，fan_tach 只挂在
+    TIM7_IRQHandler 里数边沿，不再碰定时器寄存器。TIM7 周期唯一由
+    freq_detect.c 决定 = 100 µs。
 
 
 ========================================================================
@@ -235,9 +236,9 @@
 ========================================================================
   附：不是 ioc 的事，但顺手提醒你（代码侧，我会处理）
 ========================================================================
-  · TIM7 周期冲突：freq_detect.c 按 100 µs（PSC=19/ARR=999）算频率，
-    fan_tach.c 按 500 µs（PSC/ARR=4999）测转速，两者都写 htim7 →
-    后者覆盖前者。需要一个统一的 TIM7 周期或各自分频，我会修。
+  · TIM7 周期冲突：✅ 已修。fan_tach_start()（会按 500 µs 覆盖
+    freq_detect 的 PSC/ARR）已删除，fan_tach 现在只挂在 TIM7_IRQHandler
+    里数边沿。详见上面【B3】。
   · comm.c 的 CMD_ALERT_OFF：现在只清 g_alert_active / g_alert_flag，
     没调 protection_clear() → 锁存还在、PB13 仍高、蜂鸣器仍响。
     应改成调 protection_clear()，我会修。

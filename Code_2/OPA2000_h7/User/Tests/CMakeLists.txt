@@ -78,6 +78,7 @@ add_executable(host_tests
     ${USER_SRC}/power_control.c
     ${USER_SRC}/protection.c
     ${USER_SRC}/buzzer.c
+    ${USER_SRC}/fan_tach.c
     ${USER_SRC}/radio_band.c
     ${USER_SRC}/freq_detect.c
     ${USER_SRC}/flash_eeprom.c
@@ -96,6 +97,7 @@ add_executable(host_tests
     ${CMAKE_CURRENT_SOURCE_DIR}/test_user_adc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_power_control.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_protection.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_fan_tach.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_radio_band.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_freq_detect.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_flash_eeprom.c

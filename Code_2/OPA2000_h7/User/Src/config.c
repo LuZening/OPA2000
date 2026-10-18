@@ -11,6 +11,8 @@
 #endif
 
 #include <string.h>
+/* offsetof, for the crc32-is-last guard below.  Not pulled in by stdint.h. */
+#include <stddef.h>
 /* strcasecmp is POSIX; MSVC exposes _stricmp.  Map once here so the
  * portable spelling works on every host toolchain we use for unit
  * tests.  (The CMSIS-RTOS2 path in the firmware does not need this
@@ -18,6 +20,54 @@
 #if defined(_MSC_VER)
 #define strcasecmp _stricmp
 #endif
+
+/*============================================================================
+ *  Layout guards
+ *
+ *  These fail the BUILD, not the field.  Growing ConfigType is a normal
+ *  thing to do and every path below degrades quietly if it is not paired
+ *  with the rest of the storage layer:
+ *
+ *  - Past EEPROM_MAX_PAYLOAD_BYTES the record no longer fits the staging
+ *    buffer, so config_save() returns false.  The config task ignores that
+ *    return value (app_tasks.c) and retries once a second forever, and the
+ *    operator sees their edits vanish on the next reboot with no message.
+ *    A silent failure that only shows up as "the settings reset themselves"
+ *    is far more expensive to diagnose than a build break.
+ *
+ *  - The CRC in config_init() rejects a record whose bytes do not match, but
+ *    it cannot tell "same layout, different values" from "same values,
+ *    different layout".  Bumping CONFIG_VERSION is what invalidates an old
+ *    blob after a field is inserted or reordered; nothing forces you to.
+ *    Renumber the versions rather than editing an old one, so a blob written
+ *    by any earlier build is still recognised as old.
+ *==========================================================================*/
+
+/* MSVC only learned _Static_assert in C11 mode; the host test build asks for
+ * C11 explicitly, but spell out the fallback so this file still compiles if
+ * that ever changes.  C11 6.7.10 / N1570 7.18. */
+#if defined(_MSC_VER) && (!defined(__STDC_VERSION__) \
+                         || __STDC_VERSION__ < 201112L)
+#define OPA2000_STATIC_ASSERT(cond, msg)                              \
+    typedef char opa2000_static_assert_##__LINE__[(cond) ? 1 : -1]
+#else
+#define OPA2000_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+
+OPA2000_STATIC_ASSERT(sizeof(ConfigType) <= EEPROM_MAX_PAYLOAD_BYTES,
+               "ConfigType exceeds the EEPROM payload cap - config_save() "
+               "would fail silently and every operator edit would be lost on "
+               "reboot. Raise EEPROM_MAX_PAYLOAD_BYTES if the record really "
+               "has to be this big.");
+
+OPA2000_STATIC_ASSERT(offsetof(ConfigType, crc32) + sizeof(uint32_t)
+                   == sizeof(ConfigType),
+               "crc32 must stay the LAST member of ConfigType - the CRC is "
+               "computed over everything ahead of it, so a field appended "
+               "after it would silently escape the checksum.");
+
+OPA2000_STATIC_ASSERT(CONFIG_VERSION != 0U,
+               "CONFIG_VERSION 0 is reserved for 'never written'.");
 
 /*============================================================================
  * Private Variables

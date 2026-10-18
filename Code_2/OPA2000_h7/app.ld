@@ -291,9 +291,22 @@ SECTIONS
     KEEP(*(.usb_dma_buffer))
     KEEP(*(.dma_no_cache))
     . = ALIGN(32);
+    . = ORIGIN(RAM) + 512K;
     _dma_no_cache_end = .;
   } >RAM
+  
+  .RAM (NOLOAD) :
+  {
+    . = ALIGN(32);
+  
+    KEEP(*(.ram))
+    KEEP(*(.RAM))
+    . = ALIGN(32);
 
+  } >RAM
+  
+
+  
   /* D3 域 SRAM4：BDMA2 在 D3 域，只能访问 SRAM4/Backup SRAM，够不到 AXI SRAM
    * 与 DTCM。LPUART1 挂 D3 域、其 DMA 是 BDMA2，所以 LPUART 的 DMA 缓冲必须
    * 放这里。NOLOAD（无需初值），由 MPU region6 标为不可缓存。 */

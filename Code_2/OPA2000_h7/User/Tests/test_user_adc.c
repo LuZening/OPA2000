@@ -140,33 +140,27 @@ TEST_CASE(im_calibration_short_circuits_once_calibrated)
  *  adc_im_zero_offset_tick() - retry / fault path
  *==========================================================================*/
 
-TEST_CASE(im_calibration_retries_three_times_then_alarms)
+TEST_CASE(im_calibration_retries_forever_and_never_alarms)
 {
     const uint16_t bad = (uint16_t)(IM_ZERO_EXPECTED + 3000);
 
     im_reset();
 
-    /* Pass 1 */
-    im_run_pass(bad);
-    ASSERT_FALSE(g_config.im_calibrated);
-    ASSERT_FALSE(g_allow_rf);
-    ASSERT_FALSE(g_alert_flag);
+    /* A zero-offset that will not settle is a warm-up artefact far more
+     * often than a hardware failure, so it no longer raises an alert after
+     * a fixed number of attempts - it keeps sampling. */
+    for (int pass = 0; pass < 20; pass++) {
+        im_run_pass(bad);
+        ASSERT_FALSE(g_config.im_calibrated);
+        ASSERT_FALSE(g_allow_rf);      /* RF stays blocked throughout */
+        ASSERT_FALSE(g_alert_flag);    /* and it never raises an alarm */
+    }
+    ASSERT_EQ(g_alert_active, ALERT_NONE);
 
-    /* Pass 2 */
-    im_run_pass(bad);
-    ASSERT_FALSE(g_config.im_calibrated);
-    ASSERT_FALSE(g_alert_flag);
-
-    /* Pass 3 -> give up */
-    im_run_pass(bad);
-    ASSERT_FALSE(g_config.im_calibrated);
-    ASSERT_FALSE(g_allow_rf);
-    ASSERT_TRUE(g_alert_flag);
-    ASSERT_EQ(g_alert_active, ALERT_HARDWARE_FAULT);
-
-    /* Once given up the machine stays idle and must not re-arm itself. */
+    /* Still trying: a later good pass must be able to succeed. */
     im_run_pass(IM_ZERO_EXPECTED);
-    ASSERT_FALSE(g_config.im_calibrated);
+    ASSERT_TRUE(g_config.im_calibrated);
+    ASSERT_TRUE(g_allow_rf);
 }
 
 TEST_CASE(im_calibration_recovers_on_second_pass)
@@ -281,7 +275,7 @@ TEST_CASE(stabilisation_releases_clear_fault_when_it_arms)
     ASSERT_EQ(clear_faultx_level(), 1);
 }
 
-TEST_CASE(stabilisation_holds_clear_fault_low_when_calibration_fails)
+TEST_CASE(stabilisation_never_arms_or_alarms_while_the_offset_will_not_settle)
 {
     const uint16_t bad = (uint16_t)(IM_ZERO_EXPECTED + 3000);
 
@@ -290,15 +284,17 @@ TEST_CASE(stabilisation_holds_clear_fault_low_when_calibration_fails)
 
     stab_tick_settling(STAB_SETTLE_TICKS);
 
-    /* Three failed passes -> ALERT_HARDWARE_FAULT, but still not armed and
-     * still holding the pin low, so a bad sensor cannot both alarm and then
-     * leave a latched fault behind for the next power cycle. */
-    for (int pass = 0; pass < 3; pass++) {
+    /* A zero-offset that never settles keeps the machine permanently idle
+     * and permanently quiet: not armed (so the real AWD/COMP limits are
+     * never pushed out) and no alarm (so the operator is not trained to
+     * ignore one).  CLEAR_FAULTX_OC stays low the whole time, which is the
+     * safe state: a genuinely bad sensor cannot key the amp either. */
+    for (int pass = 0; pass < 20; pass++) {
         (void)stab_tick_calibrating(bad, IM_TICKS_PER_PASS);
     }
 
-    ASSERT_TRUE(g_alert_flag);
-    ASSERT_EQ(g_alert_active, ALERT_HARDWARE_FAULT);
+    ASSERT_FALSE(g_alert_flag);
+    ASSERT_EQ(g_alert_active, ALERT_NONE);
     ASSERT_FALSE(adc_stabilisation_done());
     ASSERT_FALSE(g_allow_rf);
     ASSERT_EQ(clear_faultx_level(), 0);
@@ -776,13 +772,13 @@ const test_entry_t g_suite_user_adc[] = {
     TEST_ENTRY(im_calibration_succeeds_at_lower_tolerance_edge),
     TEST_ENTRY(im_calibration_averages_sampled_window),
     TEST_ENTRY(im_calibration_short_circuits_once_calibrated),
-    TEST_ENTRY(im_calibration_retries_three_times_then_alarms),
+    TEST_ENTRY(im_calibration_retries_forever_and_never_alarms),
     TEST_ENTRY(im_calibration_recovers_on_second_pass),
     TEST_ENTRY(stabilisation_blocks_the_first_second_entirely),
     TEST_ENTRY(stabilisation_holds_clear_fault_low_for_the_whole_window),
     TEST_ENTRY(stabilisation_arms_only_after_the_calibration_passes),
     TEST_ENTRY(stabilisation_releases_clear_fault_when_it_arms),
-    TEST_ENTRY(stabilisation_holds_clear_fault_low_when_calibration_fails),
+    TEST_ENTRY(stabilisation_never_arms_or_alarms_while_the_offset_will_not_settle),
     TEST_ENTRY(stabilisation_stays_armed_and_is_idempotent),
     TEST_ENTRY(stabilisation_restarts_when_adc_init_reruns),
     TEST_ENTRY(adc_process_averages_the_rolling_dma_window),

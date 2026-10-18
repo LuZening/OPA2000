@@ -104,6 +104,10 @@ static volatile bool     s_protection_active = false;
 static volatile AlertType s_last_fault        = ALERT_NONE;
 static volatile AlertSeverity s_last_severity = ALERT_SEV_NONE;
 
+/*!< Set by protection_clear() (GUI / comm task), consumed by the protection
+ *   task.  Volatile because the two live in different contexts. */
+static volatile bool     s_latch_clear_requested = false;
+
 /*============================================================================
  *  Initialisation
  *==========================================================================*/
@@ -121,6 +125,9 @@ void protection_init(void)
      * cannot leave PB13 in whatever state the pin came up in. */
     RF_IN_PROTECT_CLEAR();
     buzzer_stop();
+    /* No dismiss is pending at boot.  Without this a request that somehow
+     * survived a soft restart would fire a spurious 100 ms bias cut. */
+    s_latch_clear_requested = false;
 }
 
 /*============================================================================
@@ -413,6 +420,25 @@ void protection_clear(void)
      *     zero offset is the only reason it can be low at this point
      *     and that was set at boot.  Conservative: always re-arm. */
     g_allow_rf = true;
+
+    /* Ask the protection task to pulse the external latch reset.  NOT done
+     * inline on purpose: this function is called from the GUI task (popup
+     * dismiss) and from the comm task (CAT / SPI6 command), and the pulse
+     * has to hold two pins down for 100 ms.  Doing that here would freeze
+     * LVGL input handling, or stall the CAT parser, for that long. */
+    s_latch_clear_requested = true;
+}
+
+bool protection_take_latch_clear_request(void)
+{
+    bool requested = s_latch_clear_requested;
+
+    /* Clear before the caller acts on it, not after.  A dismiss that lands
+     * while the 100 ms pulse is still running then sets the flag again and
+     * the next tick pulses once more, instead of the request being silently
+     * swallowed by this one's cleanup. */
+    s_latch_clear_requested = false;
+    return requested;
 }
 
 bool protection_is_active(void) { return s_protection_active; }

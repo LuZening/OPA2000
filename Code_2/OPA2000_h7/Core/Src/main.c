@@ -212,19 +212,7 @@ int main(void)
    * false alarm can never be latched in the first place. */
   boot_hold_thresholds_open();
 
-  /* --- Enable the two comparators ------------------------------------ */
-  /* MX_COMPx_Init() only configures the peripheral; without this the
-   * comparators stay disabled and HAL_COMP_TriggerCallback() would never
-   * fire, i.e. the COMP1 overdrive and COMP2 over-current protections
-   * would be dead code.  Started only after the references above are at the
-   * unreachable end of the DAC range, so the first comparison already runs
-   * against a threshold that cannot be crossed. */
-  if (HAL_COMP_Start_IT(&hcomp1) != HAL_OK) {
-    Error_Handler();
-  }
-  if (HAL_COMP_Start_IT(&hcomp2) != HAL_OK) {
-    Error_Handler();
-  }
+
 
   /* --- Step 5: USB device bring-up (moved out of the deleted defaultTask) - */
   /* MX_USB_DEVICE_Init() is safe to call here: it does not depend on
@@ -376,7 +364,7 @@ void PeriphCommonClock_Config(void)
   PeriphClkInitStruct.PLL3.PLL3N = 58;
   PeriphClkInitStruct.PLL3.PLL3P = 10;
   PeriphClkInitStruct.PLL3.PLL3Q = 24;
-  PeriphClkInitStruct.PLL3.PLL3R = 10;
+  PeriphClkInitStruct.PLL3.PLL3R = 31;
   PeriphClkInitStruct.PLL3.PLL3RGE = RCC_PLL3VCIRANGE_2;
   PeriphClkInitStruct.PLL3.PLL3VCOSEL = RCC_PLL3VCOWIDE;
   PeriphClkInitStruct.PLL3.PLL3FRACN = 8048;
@@ -558,7 +546,7 @@ void MPU_Config(void)
   MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_ENABLE;
   MPU_InitStruct.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_CACHEABLE;
-  MPU_InitStruct.IsBufferable = MPU_ACCESS_BUFFERABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
 
@@ -568,6 +556,7 @@ void MPU_Config(void)
   MPU_InitStruct.BaseAddress = 0x90000000;
   MPU_InitStruct.Size = MPU_REGION_SIZE_128MB;
   MPU_InitStruct.SubRegionDisable = 0x0;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
 

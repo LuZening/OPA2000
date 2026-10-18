@@ -1344,6 +1344,25 @@ TEST_CASE(pump_pwm_duty_matches_speed_percent)
     ASSERT_EQ(htim4.Instance->CCR4, 1000);
 }
 
+TEST_CASE(the_pump_follows_the_fan_duty)
+{
+    /* The pump PWM is written from power_set_fan_speed(), not from a
+     * separate caller.  If that link is ever removed the pump parks at
+     * 0 %, its TACH line goes static, and the CAT "pump=" field reads a
+     * steady 0 - indistinguishable from a failed pump, which is exactly
+     * the failure this link exists to prevent. */
+    power_init_fan_pwm();
+
+    power_set_fan_speed(0);
+    ASSERT_EQ(htim4.Instance->CCR4, 0);
+
+    power_set_fan_speed(50);
+    ASSERT_EQ(htim4.Instance->CCR4, 500);
+
+    power_set_fan_speed(100);
+    ASSERT_EQ(htim4.Instance->CCR4, 1000);
+}
+
 /*============================================================================
  *  Suite table
  *==========================================================================*/
@@ -1422,5 +1441,6 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(fan_pwm_duty_matches_speed_percent),
     TEST_ENTRY(fan_speed_percent_is_clamped_to_100),
     TEST_ENTRY(pump_pwm_duty_matches_speed_percent),
+    TEST_ENTRY(the_pump_follows_the_fan_duty),
     TEST_SUITE_END
 };

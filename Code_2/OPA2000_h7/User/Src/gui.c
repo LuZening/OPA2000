@@ -20,6 +20,7 @@
 #include "power_control.h"
 #include "boot.h"
 #include "user_adc.h"
+#include "fan_tach.h"
 #endif
 #include "string.h"
 #include "stdio.h"
@@ -62,6 +63,112 @@ static void gui_fmt_fixed(char *buf, size_t len, int32_t scaled_int,
     } else {
         snprintf(buf, len, negative ? "-%lu.%03lu" : "%lu.%03lu",
                  (unsigned long)(mag / 1000U), (unsigned long)(mag % 1000U));
+    }
+}
+
+/*============================================================================
+ *  Change-guarded label writes
+ *
+ *  LVGL 7 的 lv_label_set_text() 第一行就是 lv_obj_invalidate()，无条件：
+ *
+ *      void lv_label_set_text(lv_obj_t * label, const char * text)
+ *      {
+ *          LV_ASSERT_OBJ(label, LV_OBJX_NAME);
+ *          lv_obj_invalidate(label);        <-- 文字没变也照样标脏
+ *
+ *  而 gui_update_main_values() 每轮要写 20 多个 label（功率、温度、电压、
+ *  频段……）。无条件标脏的后果是每 30 ms 把整个主界面重画一次，而
+ *  LV_USE_GPU_STM32_DMA2D = 0 —— 全部走 CPU 软件光栅化，中文字形还要逐
+ *  像素混合。LVGL 的 perf monitor 实测就是 91% CPU。
+ *
+ *  真正的浪费在于：这些值绝大多数时候根本没变。功率还是那个功率，温度还是
+ *  那个温度，但 LVGL 无从知道。所以这里在写入前先比一次，相同就整条跳过，
+ *  连 invalidate 都不产生。
+ *
+ *  用法：每个 label 配一个缓存槽，写入时把 label 指针一并传进来（指针
+ *  同时充当"这个槽属于哪个 label"的标识，也让重复注册不可能出错）。
+ *==========================================================================*/
+
+/*!< 缓存槽里保存的上次写入文本。32 B 够装下本文件所有格式化结果
+ *  （最长的是协议行 "Protocol: KENWOOD"，约 18 字节）。 */
+typedef struct {
+    lv_obj_t *label;              /*!< 归属的 label；NULL = 空槽 */
+    char      text[32];
+} GuiLabelCache;
+
+#define GUI_LABEL_CACHE_SLOTS \
+    (sizeof(s_lblcache) / sizeof(s_lblcache[0]))
+
+static GuiLabelCache s_lblcache[24];
+
+/**
+ * @brief Only call lv_label_set_text() when the text actually changed
+ *
+ * @param label  Target label
+ * @param text   New text (must stay valid for the call, LVGL copies it)
+ */
+static void gui_label_set_cached(lv_obj_t *label, const char *text)
+{
+    /* 首个空槽；等于槽数表示没有空槽。 */
+    size_t free_slot = GUI_LABEL_CACHE_SLOTS;
+
+    if (label == NULL || text == NULL) {
+        return;
+    }
+
+    for (size_t i = 0U; i < GUI_LABEL_CACHE_SLOTS; i++) {
+        if (s_lblcache[i].label == label) {
+            if (strcmp(s_lblcache[i].text, text) == 0) {
+                return;             /* 无变化：连 invalidate 都不产生 */
+            }
+            lv_label_set_text(label, text);
+            strncpy(s_lblcache[i].text, text, sizeof(s_lblcache[i].text) - 1U);
+            s_lblcache[i].text[sizeof(s_lblcache[i].text) - 1U] = '\0';
+            return;
+        }
+        if (s_lblcache[i].label == NULL && free_slot == GUI_LABEL_CACHE_SLOTS) {
+            free_slot = i;
+        }
+    }
+
+    lv_label_set_text(label, text);
+
+    if (free_slot < GUI_LABEL_CACHE_SLOTS) {
+        s_lblcache[free_slot].label = label;
+        strncpy(s_lblcache[free_slot].text, text,
+                sizeof(s_lblcache[free_slot].text) - 1U);
+        s_lblcache[free_slot].text[sizeof(s_lblcache[free_slot].text) - 1U] = '\0';
+    }
+    /* else: 槽位耗尽。写入照常发生（正确性优先），只是不再缓存，
+     * 下一轮起会重新走上面的查找分支。 */
+}
+
+/**
+ * @brief Same as gui_label_set_cached(), for bar values
+ *
+ * lv_bar_set_value() already early-returns when the value is unchanged
+ * (lv_bar.c: `if(ext->cur_value == value) return;`), so bars need no cache
+ * of their own.  This wrapper exists only so the intent is obvious at the
+ * call sites: the write is already change-guarded by LVGL itself.
+ */
+static void gui_bar_set_cached(lv_obj_t *bar, int16_t value)
+{
+    lv_bar_set_value(bar, value, LV_ANIM_OFF);
+}
+
+/**
+ * @brief Drop all cached label text, so the next write goes through
+ *
+ * Needed whenever a label's text is changed by something other than
+ * gui_label_set_cached() — a language switch rewrites every string, and
+ * without this the cache would report "unchanged" and the new language
+ * would never appear.
+ */
+static void gui_label_cache_invalidate(void)
+{
+    for (size_t i = 0U; i < GUI_LABEL_CACHE_SLOTS; i++) {
+        s_lblcache[i].label = NULL;
+        s_lblcache[i].text[0] = '\0';
     }
 }
 
@@ -261,6 +368,12 @@ enum {
     STR_CAL_RESIDUAL,
     STR_CAL_ACCEPT,
     STR_CAL_RETRY,
+    /*!< Shown after a failed touch calibration pass.  The screen restarts
+     *  from the first target on its own, so this line exists purely to stop
+     *  the operator reading the transition as a hang.  Touch calibration no
+     *  longer has Accept/Retry buttons - those two IDs are still used by the
+     *  coupler calibration result page. */
+    STR_CAL_RESTART,
     STR_SCREEN,
     STR_TOUCH_CAL,
     STR_CAL_SENSORS,
@@ -307,7 +420,7 @@ static const char* gui_strings[2][STR_COUNT] = {
         "警报", "驻波比过高", "反射功率过高", "电流过高", "硬件故障", "过驱动", "频率不匹配",
         "解除", "取消", "校准", "校准点", "校准成功", "校准失败", "设置", "语言", "电源",
         "风扇",
-        "原始坐标", "残差", "确认", "重试",
+        "原始坐标", "残差", "确认", "重试", "重新开始标定",
         "屏幕", "触屏校准",
         "校准传感器", "耦合器1", "耦合器2", "开始测量",
         "传感器检查", "自动", "保存",
@@ -323,7 +436,7 @@ static const char* gui_strings[2][STR_COUNT] = {
         "Alert", "SWR High", "Reflected High", "Current High", "Hardware Fault", "Overdrive", "Freq Mismatch",
         "Dismiss", "Cancel", "Calibration", "Calibrate Point", "Calibrate Success", "Calibrate Failed", "Settings", "Language", "Power",
         "Fan",
-        "Raw Coordinate", "Residual", "Accept", "Retry",
+        "Raw Coordinate", "Residual", "Accept", "Retry", "Restarting calibration",
         "Screen", "Touch Calibrate",
         "Calibrate Sensors", "Coupler 1", "Coupler 2", "Start",
         "Sensor Inspect", "Auto", "Save",
@@ -397,12 +510,19 @@ static lv_obj_t *lbl_protocol;
 
 /*!< 防连点：记下标定点后锁这么久（毫秒）。按住不放时采样每 10 ms 就来一个
  *  新样本，不锁的话 5 个点会在 50 ms 内记满。减法写法对 tick 回绕安全。 */
-#define CAL_LOCKOUT_MS 200U
+#define CAL_LOCKOUT_MS 500U
+
+/*!< 一轮 5 点标定失败后，在"残差/系数"画面上停留多久再自动回到第 1 点。
+ *  留这一段是因为那几个数字是唯一能看出"为什么失败"的线索（通常是某个点
+ *  敲偏了），一闪而过等于没显示。3 s 够读完五个数，又不至于让"想重试"
+ *  的人觉得程序卡住。 */
+#define CAL_RESTART_DELAY_MS 1000U
 
 static uint8_t cal_state = 0;        /* 0=idle, 1=showing point, 2=results */
 static uint8_t cal_point_idx = 0;
 static lv_obj_t *cal_container = NULL;
 static uint32_t s_cal_lockout_tick = 0U;   /*!< 上次记点的时刻 */
+static uint32_t s_cal_restart_tick = 0U;  /*!< 失败画面开始展示的时刻 */
 
 /* Top-of-screen debug line.  On firmware build this shows the detected
  * touch driver + key boot-time flags; on the PC simulator it shows the
@@ -411,6 +531,53 @@ static uint32_t s_cal_lockout_tick = 0U;   /*!< 上次记点的时刻 */
  * screen real estate.  Controlled by gui.c internal -DDEBUG_OVERLAY
  * in CMake, default ON. */
 static lv_obj_t *debug_label;
+
+/*============================================================================
+ *  Touch raw readout - bottom-left corner, red
+ *
+ *  Shows the last sample exactly as the driver published it: panel X, panel
+ *  Y, and the NS2009 contact pressure.  No calibration, no transform - this
+ *  is the number you want when the calibrated position is wrong and you
+ *  need to know what the panel itself said.
+ *
+ *  Compile-time switch: -DDEBUG_TOUCH_RAW=0 (the default) compiles the
+ *  whole feature out, including the label and the per-click formatting, so
+ *  a release build carries none of it.  The #if is written as
+ *  `#if DEBUG_TOUCH_RAW` so an -DNDEBUG-only build (which does NOT define
+ *  this macro) also compiles it out - that is deliberate, this is a
+ *  bring-up aid, not a diagnostic that should survive into the field.
+ *
+ *  Placement: bottom-left, aligned inside the screen by 4 px so it never
+ *  overlaps the Settings button on the right or the status banner on top.
+ *==========================================================================*/
+#ifndef DEBUG_TOUCH_RAW
+#define DEBUG_TOUCH_RAW 0
+#endif
+
+#if DEBUG_TOUCH_RAW
+
+/*!< The readout label.  Created in gui_create_main_screen() as a child of
+ *  main_screen (not of a sub-panel) so it floats over whatever is on
+ *  screen - useful when the thing being debugged *is* a popup. */
+static lv_obj_t *lbl_touch_raw;
+
+/*!< New sample published by the driver, waiting for the GUI task pump to
+ *  pick it up.  Set from gui_indev_read_cb(), which runs INSIDE
+ *  lv_task_handler() - LVGL is mid-refresh there and touching a widget
+ *  from that context is unsafe.  The pump in gui_update_display() does the
+ *  actual label write, in task context, exactly like every other widget
+ *  update in this file.
+ *
+ *  Written by the GUI task and read by the GUI task (read_cb is called by
+ *  lv_task_handler, which the same task runs), so no volatile and no lock
+ *  are needed here either. */
+static bool     s_touch_raw_dirty;
+static uint16_t s_touch_raw_x;
+static uint16_t s_touch_raw_y;
+static uint32_t s_touch_raw_z;
+
+#endif /* DEBUG_TOUCH_RAW */
+
 
 /* Throttle: update debug overlay at most once per 500 ms so the
  * label does not flicker.  10 ms LVGL ticks call it constantly. */
@@ -515,6 +682,13 @@ static lv_obj_t* make_cont(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
     lv_obj_set_pos(c, x, y);
     lv_obj_set_size(c, w, h);
     lv_obj_set_style_local_bg_color(c, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, bg);
+    /* bg_opa must be COVER or the block is invisible.  This project installs
+     * no theme (no lv_theme_*_init() call, and this LVGL 7.0's
+     * lv_disp_drv_t has no theme field at all), so every object falls back to
+     * lv_obj_get_style_prop()'s hardcoded default for an unset
+     * LV_STYLE_BG_OPA, which is LV_OPA_TRANSP.  Setting bg_color alone then
+     * paints a fully transparent rectangle. */
+    lv_obj_set_style_local_bg_opa(c, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_obj_set_style_local_border_width(c, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
     lv_obj_set_style_local_pad_top(c, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
     lv_obj_set_style_local_pad_bottom(c, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
@@ -698,6 +872,11 @@ static void gui_create_main_screen(void)
     main_screen = lv_obj_create(NULL, NULL);
     lv_obj_set_size(main_screen, HOR_RES, VER_RES);
     lv_obj_set_style_local_bg_color(main_screen, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, COLOR_BG);
+    /* No theme in this project, so an unset bg_opa falls back to LV_OPA_TRANSP
+     * (see make_cont).  Without this the whole screen is see-through and the
+     * framebuffer's initial contents show instead. */
+    lv_obj_set_style_local_bg_opa(main_screen, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
 
     /*=============================================
      * 1 — Top Banner — centered status button
@@ -863,6 +1042,23 @@ static void gui_create_main_screen(void)
         lv_obj_set_event_cb(btn, settings_btn_cb);
     }
 #undef MAKE_STATUS_VAL
+
+#if DEBUG_TOUCH_RAW
+    /* Touch raw readout: bottom-left, red, one line.
+     *
+     * Child of main_screen rather than of any section, so it stays put and
+     * on top no matter which screen is loaded - including the popups, which
+     * is exactly when you want to see what the panel actually reported.
+     * Created hidden: nothing shows until the first sample arrives, so an
+     * idle panel is not carrying a "0 0 0" that reads like a fault. */
+    lbl_touch_raw = lv_label_create(main_screen, NULL);
+    lv_obj_set_style_local_text_color(lbl_touch_raw, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_RED);
+    lv_obj_set_style_local_text_font(lbl_touch_raw, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &lv_font_montserrat_12);
+    lv_obj_align(lbl_touch_raw, main_screen, LV_ALIGN_IN_BOTTOM_LEFT, 4, -2);
+    lv_obj_set_hidden(lbl_touch_raw, true);
+#endif
 }
 
 /* Radio link caption: protocol name plus connect state.  The protocol comes
@@ -885,6 +1081,10 @@ static void gui_update_protocol_label(void)
         default:                  proto = NULL;     break;
     }
 
+    /* The colour is set before the text so it is already correct on the
+     * very first paint.  set_style_local_text_color() invalidates too, but
+     * the protocol rarely changes, so the write itself is cheap; the text
+     * write is the one that must be guarded. */
     if (proto) {
         snprintf(buf, sizeof(buf), "%s: %s", gui_get_string(STR_PROTOCOL), proto);
         lv_obj_set_style_local_text_color(lbl_protocol, LV_LABEL_PART_MAIN,
@@ -895,7 +1095,7 @@ static void gui_update_protocol_label(void)
         lv_obj_set_style_local_text_color(lbl_protocol, LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_GRAY);
     }
-    lv_label_set_text(lbl_protocol, buf);
+    gui_label_set_cached(lbl_protocol, buf);
 }
 
 /**
@@ -906,16 +1106,21 @@ static void gui_update_main_values(void)
     char buf[32];
 
 #ifndef LVGL_SIM
-    /* Status */
+    /* Status.  Every write below goes through gui_label_set_cached() /
+     * gui_bar_set_cached(), both of which skip the LVGL call when the value
+     * is unchanged.  That matters because lv_label_set_text() invalidates
+     * unconditionally (lv_label.c, first statement), and with 20+ labels on
+     * this screen an unguarded refresh marks the whole screen dirty on every
+     * single loop - measured at 91% CPU with software rasterisation. */
     lv_color_t banner_color;
     if (g_power_state == POWER_STATE_TX) {
-        lv_label_set_text(status_label, gui_get_string(STR_TRANSMIT));
+        gui_label_set_cached(status_label, gui_get_string(STR_TRANSMIT));
         banner_color = LV_COLOR_MAKE(0xdf, 0x01, 0x01);  /* OPA1000 dark red */
     } else if (g_power_state == POWER_STATE_STANDBY) {
-        lv_label_set_text(status_label, gui_get_string(STR_STANDBY));
+        gui_label_set_cached(status_label, gui_get_string(STR_STANDBY));
         banner_color = LV_COLOR_MAKE(0xea, 0xb9, 0x06);  /* OPA1000 dark yellow */
     } else {
-        lv_label_set_text(status_label, gui_get_string(STR_IDLE));
+        gui_label_set_cached(status_label, gui_get_string(STR_IDLE));
         banner_color = COLOR_BANNER;  /* blue */
     }
     lv_obj_set_style_local_bg_color(banner, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, banner_color);
@@ -931,28 +1136,33 @@ static void gui_update_main_values(void)
      * 这里只替换测量值，状态条/频段/协议等照旧刷新，操作员看得出
      * 机器活着、只是还没进入可发射状态。 */
     if (!adc_stabilisation_done()) {
-        lv_label_set_text(val_fwd, "--W");
-        lv_label_set_text(val_ref, "--W");
-        lv_label_set_text(val_swr, "--");
-        lv_bar_set_value(bar_fwd, 0, LV_ANIM_OFF);
-        lv_bar_set_value(bar_ref, 0, LV_ANIM_OFF);
-        lv_bar_set_value(bar_swr, 0, LV_ANIM_OFF);
+        gui_label_set_cached(val_fwd, "--W");
+        gui_label_set_cached(val_ref, "--W");
+        gui_label_set_cached(val_swr, "--");
+        gui_bar_set_cached(bar_fwd, 0);
+        gui_bar_set_cached(bar_ref, 0);
+        gui_bar_set_cached(bar_swr, 0);
         lv_obj_set_style_local_text_color(val_swr, LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_WHITE);
-        lv_label_set_text(lbl_voltage, "--V");
-        lv_label_set_text(lbl_current, "--A");
-        lv_label_set_text(lbl_temp, "--\xC2\xB0" "C");
+        gui_label_set_cached(lbl_voltage, "--V");
+        gui_label_set_cached(lbl_current, "--A");
+        gui_label_set_cached(lbl_temp, "--\xC2\xB0" "C");
 
-        lv_label_set_text(lbl_fan, "-");
-        lv_label_set_text(lbl_temp_cap, "--");
+        /* The fan is already spinning here (power_init() commands 50 %),
+         * so its TACH reading is meaningful even while the ADC readings
+         * are not - leave it running rather than blanking it. */
+        gui_fmt_fixed(buf, sizeof(buf), (int32_t)fan_tach_get_fan_rpm(), 0U);
+        strncat(buf, "RPM", sizeof(buf) - strlen(buf) - 1U);
+        gui_label_set_cached(lbl_fan, buf);
+        gui_label_set_cached(lbl_temp_cap, "--");
 
         /* Band / Frequency range — indexed from BandType (BAND_160M=1, etc.) */
         if (g_current_band > BAND_NONE && g_current_band <= BAND_15M_10M) {
-            lv_label_set_text(band_label, strFreqRanges[g_current_band - 1]);
-            lv_label_set_text(lbl_radio_mode, strBands[g_current_band - 1]);
+            gui_label_set_cached(band_label, strFreqRanges[g_current_band - 1]);
+            gui_label_set_cached(lbl_radio_mode, strBands[g_current_band - 1]);
         } else {
-            lv_label_set_text(band_label, "---");
-            lv_label_set_text(lbl_radio_mode, "");
+            gui_label_set_cached(band_label, "---");
+            gui_label_set_cached(lbl_radio_mode, "");
         }
         gui_update_protocol_label();
         return;
@@ -968,22 +1178,22 @@ static void gui_update_main_values(void)
     int32_t fwd_w = (fwd_peak_mW + 500) / 1000;
     gui_fmt_fixed(buf, sizeof(buf), fwd_w, 0U);
     strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
-    lv_label_set_text(val_fwd, buf);
-    lv_bar_set_value(bar_fwd, (int16_t)((fwd_peak_mW * BAR_MAX_FWD) / (1000 * 1000)), LV_ANIM_OFF);
+    gui_label_set_cached(val_fwd, buf);
+    gui_bar_set_cached(bar_fwd, (int16_t)((fwd_peak_mW * BAR_MAX_FWD) / (1000 * 1000)));
 
     /* Reflected power, in Watts */
     int32_t ref_w = (rev_peak_mW + 500) / 1000;
     gui_fmt_fixed(buf, sizeof(buf), ref_w, 0U);
     strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
-    lv_label_set_text(val_ref, buf);
-    lv_bar_set_value(bar_ref, (int16_t)((rev_peak_mW * BAR_MAX_REF) / (300 * 1000)), LV_ANIM_OFF);
+    gui_label_set_cached(val_ref, buf);
+    gui_bar_set_cached(bar_ref, (int16_t)((rev_peak_mW * BAR_MAX_REF) / (300 * 1000)));
 
     /* SWR derived from the same peak values so the three bars agree.
      * calculate_swr_x100 returns hundredths; one decimal means /10. */
     int32_t swr_x100 = calculate_swr_x100(fwd_peak_mW, rev_peak_mW);
     gui_fmt_fixed(buf, sizeof(buf), swr_x100 / 10, 1U);
-    lv_label_set_text(val_swr, buf);
-    lv_bar_set_value(bar_swr, (int16_t)(((swr_x100 - 100) * BAR_MAX_SWR) / 300), LV_ANIM_OFF);
+    gui_label_set_cached(val_swr, buf);
+    gui_bar_set_cached(bar_swr, (int16_t)(((swr_x100 - 100) * BAR_MAX_SWR) / 300));
     if (swr_x100 > 200) {
         lv_obj_set_style_local_text_color(val_swr, LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_RED);
@@ -995,12 +1205,12 @@ static void gui_update_main_values(void)
     /* Voltage - vm_mV is millivolts, whole volts means /1000 */
     gui_fmt_fixed(buf, sizeof(buf), ((int32_t)g_adc_data.vm_mV + 500) / 1000, 0U);
     strncat(buf, "V", sizeof(buf) - strlen(buf) - 1U);
-    lv_label_set_text(lbl_voltage, buf);
+    gui_label_set_cached(lbl_voltage, buf);
 
     /* Current - one decimal amp means /100 of the milliamp reading */
     gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.im_mA, 2U);
     strncat(buf, "A", sizeof(buf) - strlen(buf) - 1U);
-    lv_label_set_text(lbl_current, buf);
+    gui_label_set_cached(lbl_current, buf);
 
     /* Temperature — unit follows the setting chosen in the language menu.
      * ntc_core_tenth_c is tenths of a degree Celsius; whole degrees. */
@@ -1014,26 +1224,26 @@ static void gui_update_main_values(void)
         gui_fmt_fixed(buf, sizeof(buf), (tc_tenth + 5) / 10, 0U);
         strncat(buf, "\xC2\xB0" "C", sizeof(buf) - strlen(buf) - 1U);
     }
-    lv_label_set_text(lbl_temp, buf);
+    gui_label_set_cached(lbl_temp, buf);
 
-    /* Fan speed */
-    const char *fan_str;
-    switch (g_fan_speed) {
-        case FAN_SPEED_LOW:  fan_str = "Low";  break;
-        case FAN_SPEED_MED:  fan_str = "Med";  break;
-        case FAN_SPEED_HIGH: fan_str = "High"; break;
-        default:             fan_str = "-";    break;
-    }
-    lv_label_set_text(lbl_fan, fan_str);
+    /* Fan speed - measured RPM from the TACH pin, not the commanded
+     * duty.  The two are not the same thing (a stalled or unplugged
+     * fan still reports whatever duty we asked for), and the whole
+     * point of counting pulses is to catch that difference.  Spelling out
+     * "RPM" rather than a bare "R": the segment is 96 px wide, so there
+     * is room, and an unexplained "R" next to "13.8V" reads as a typo. */
+    gui_fmt_fixed(buf, sizeof(buf), (int32_t)fan_tach_get_fan_rpm(), 0U);
+    strncat(buf, "RPM", sizeof(buf) - strlen(buf) - 1U);
+    gui_label_set_cached(lbl_fan, buf);
 
     /* Band / Frequency range — indexed from BandType (BAND_160M=1, etc.) */
     if (g_current_band > BAND_NONE && g_current_band <= BAND_15M_10M) {
-        lv_label_set_text(band_label, strFreqRanges[g_current_band - 1]);
+        gui_label_set_cached(band_label, strFreqRanges[g_current_band - 1]);
         /* Band name under the range, e.g. "20-17m" */
-        lv_label_set_text(lbl_radio_mode, strBands[g_current_band - 1]);
+        gui_label_set_cached(lbl_radio_mode, strBands[g_current_band - 1]);
     } else {
-        lv_label_set_text(band_label, "---");
-        lv_label_set_text(lbl_radio_mode, "");
+        gui_label_set_cached(band_label, "---");
+        gui_label_set_cached(lbl_radio_mode, "");
     }
 
     /* Radio protocol link status (from the comm protocol detector) */
@@ -1078,34 +1288,34 @@ static void gui_update_main_values(void)
     float rev_peak_mW = (float)g_adc_data.rev2_peak_mW;
 
     snprintf(buf, sizeof(buf), "%.0fW", fwd_peak_mW / 1000.0f);
-    lv_label_set_text(val_fwd, buf);
-    lv_bar_set_value(bar_fwd, (int16_t)(fwd_peak_mW / 1000.0f), LV_ANIM_OFF);
+    gui_label_set_cached(val_fwd, buf);
+    gui_bar_set_cached(bar_fwd, (int16_t)(fwd_peak_mW / 1000.0f));
 
     snprintf(buf, sizeof(buf), "%.0fW", rev_peak_mW / 1000.0f);
-    lv_label_set_text(val_ref, buf);
-    lv_bar_set_value(bar_ref, (int16_t)(rev_peak_mW / 3000.0f), LV_ANIM_OFF);
+    gui_label_set_cached(val_ref, buf);
+    gui_bar_set_cached(bar_ref, (int16_t)(rev_peak_mW / 3000.0f));
 
     float sim_swr = calculate_swr_x100((int32_t)fwd_peak_mW,
                                        (int32_t)rev_peak_mW) / 100.0f;
     snprintf(buf, sizeof(buf), "%.1f", sim_swr);
-    lv_label_set_text(val_swr, buf);
-    lv_bar_set_value(bar_swr, (int16_t)((sim_swr - 1.0f) * BAR_MAX_SWR / 3.0f), LV_ANIM_OFF);
+    gui_label_set_cached(val_swr, buf);
+    gui_bar_set_cached(bar_swr, (int16_t)((sim_swr - 1.0f) * BAR_MAX_SWR / 3.0f));
 
     snprintf(buf, sizeof(buf), "13.8V");
-    lv_label_set_text(lbl_voltage, buf);
+    gui_label_set_cached(lbl_voltage, buf);
     snprintf(buf, sizeof(buf), "%.1fA", 2.0f + sim_fwd_w / 400.0f);
-    lv_label_set_text(lbl_current, buf);
+    gui_label_set_cached(lbl_current, buf);
 
     if (temp_fahrenheit) {
         snprintf(buf, sizeof(buf), "%.0f°F", 45.0f * 9.0f / 5.0f + 32.0f);
     } else {
         snprintf(buf, sizeof(buf), "%.0f°C", 45.0f);
     }
-    lv_label_set_text(lbl_temp, buf);
+    gui_label_set_cached(lbl_temp, buf);
 
-    lv_label_set_text(lbl_fan, "Med");
-    lv_label_set_text(band_label, strFreqRanges[3]);
-    lv_label_set_text(lbl_radio_mode, strBands[3]);
+    gui_label_set_cached(lbl_fan, "2450RPM");
+    gui_label_set_cached(band_label, strFreqRanges[3]);
+    gui_label_set_cached(lbl_radio_mode, strBands[3]);
     gui_update_protocol_label();
 #endif
 }
@@ -1116,9 +1326,9 @@ static void gui_update_main_values(void)
 
 /* Forward declarations */
 static void cal_cancel_cb(lv_obj_t *obj, lv_event_t e);
-static void cal_accept_cb(lv_obj_t *obj, lv_event_t e);
-static void cal_retry_cb(lv_obj_t *obj, lv_event_t e);
 static void cal_del_container(void);
+static void cal_finish(void);
+static void cal_restart_from_first_point(void);
 #ifdef LVGL_SIM
 static void cal_sim_touch_cb(lv_obj_t *obj, lv_event_t e);
 #endif
@@ -1150,45 +1360,33 @@ static void cal_cancel_cb(lv_obj_t *obj, lv_event_t e)
     }
 }
 
-/* Accept button callback
+/* Leave the calibration screen for good, with the panel calibrated.
  *
- * The linear regression in cal_build_results_ui() has already written
- * the new gain/offset/calibrated fields into g_config (see the
- * `#ifndef LVGL_SIM` block in cal_build_results_ui).  We just need
- * to (1) flag g_config as dirty so app_config_task() persists the
- * changes to flash within its 1 s window, (2) clear the boot-time
- * "calibration required" flag so the next boot goes to the main
- * screen, and (3) load main_screen.
- */
-static void cal_accept_cb(lv_obj_t *obj, lv_event_t e)
+ * Split out of what used to be cal_accept_cb() so cal_build_results_ui()
+ * can call it the moment the fit passes, without the round trip through a
+ * button the operator no longer has to press. */
+static void cal_finish(void)
 {
-    if (e == LV_EVENT_CLICKED) {
-        calibrating = false;
-        cal_state = 0;
-        g_calibration_required = false;
-        g_touch_calibrated     = true;
+    calibrating = false;
+    cal_state = 0;
+    g_calibration_required = false;
+    g_touch_calibrated     = true;
 #ifndef LVGL_SIM
-        config_lock();
-        config_mark_dirty();
-        config_unlock();
+    config_lock();
+    config_mark_dirty();
+    config_unlock();
 #endif
-        lv_scr_load(main_screen);
-    }
+    lv_scr_load(main_screen);
 }
 
-/* Retry button callback */
-static void cal_retry_cb(lv_obj_t *obj, lv_event_t e)
-{
-    if (e == LV_EVENT_CLICKED) {
-        calibrating = true;
-        cal_state = 1;
-        cal_point_idx = 0;
-        memset(cal_data, 0, sizeof(cal_data));
-        lv_obj_clean(cal_screen);
-        cal_container = NULL;
-        gui_update_calibration(0);
-    }
-}
+/* cal_accept_cb() and cal_retry_cb() used to live here, backing the
+ * Accept / Retry buttons on the result screen.  Both buttons are gone: a
+ * passing fit now commits and leaves on the spot (cal_finish, called from
+ * cal_build_results_ui), and a failing one restarts from point 0 by itself
+ * (cal_restart_from_first_point, driven by gui_process_cal_restart).  There
+ * is deliberately no remaining tap target that can leave the calibration
+ * half-finished - g_config.touch.calibrated would stay 0 and the next boot
+ * would ask the same five questions again. */
 
 /* Remove the dynamic container */
 static void cal_del_container(void)
@@ -1280,35 +1478,55 @@ static void cal_build_point_ui(uint8_t idx)
     lv_label_set_text(cancel_lbl, gui_get_string(STR_CANCEL));
     lv_obj_set_event_cb(cancel_btn, cal_cancel_cb);
 
-    /* Red dot at target position */
+    /* Target marker: a blue cross.
+     *
+     * bg_opa has to be set explicitly on every one of these.  LVGL 7's
+     * fallback for an unset LV_STYLE_BG_OPA is LV_OPA_TRANSP (lv_obj.c
+     * lv_obj_get_style_prop()), and no theme is installed in this project
+     * (lv_theme_*_init() is never called and disp_drv.theme stays NULL),
+     * so there is nothing to raise that opacity.  Setting only bg_color on a
+     * plain lv_obj_create() therefore draws a fully transparent rectangle -
+     * the marker is invisible, and the colour choice is irrelevant.
+     *
+     * Three overlapping bars rather than one graphic: the two 48 px arms
+     * plus the 14 px centre block read as a single cross, and each bar is a
+     * plain lv_obj so nothing depends on line-draw support.
+     */
     lv_coord_t tx = cal_targets[idx].x;
     lv_coord_t ty = cal_targets[idx].y;
-    lv_obj_t *dot = lv_obj_create(cal_container, NULL);
-    lv_obj_set_size(dot, 34, 34);
-    lv_obj_set_pos(dot, tx - 17, ty - 17);
-    lv_obj_set_style_local_bg_color(dot, LV_OBJ_PART_MAIN,
-                                    LV_STATE_DEFAULT, LV_COLOR_RED);
-    lv_obj_set_style_local_border_width(dot, LV_OBJ_PART_MAIN,
-                                        LV_STATE_DEFAULT, 2);
-    lv_obj_set_style_local_border_color(dot, LV_OBJ_PART_MAIN,
-                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
-    lv_obj_set_style_local_radius(dot, LV_OBJ_PART_MAIN,
-                                  LV_STATE_DEFAULT, LV_RADIUS_CIRCLE);
 
-    /* Crosshair lines */
+    /* Horizontal arm */
     lv_obj_t *hl = lv_obj_create(cal_container, NULL);
-    lv_obj_set_size(hl, 48, 2);
-    lv_obj_set_pos(hl, tx - 24, ty - 1);
+    lv_obj_set_size(hl, 48, 4);
+    lv_obj_set_pos(hl, tx - 24, ty - 2);
     lv_obj_set_style_local_bg_color(hl, LV_OBJ_PART_MAIN,
-                                    LV_STATE_DEFAULT, LV_COLOR_RED);
+                                    LV_STATE_DEFAULT, LV_COLOR_BLUE);
+    lv_obj_set_style_local_bg_opa(hl, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_obj_set_style_local_border_width(hl, LV_OBJ_PART_MAIN,
                                         LV_STATE_DEFAULT, 0);
+
+    /* Vertical arm */
     lv_obj_t *vl = lv_obj_create(cal_container, NULL);
-    lv_obj_set_size(vl, 2, 48);
-    lv_obj_set_pos(vl, tx - 1, ty - 24);
+    lv_obj_set_size(vl, 4, 48);
+    lv_obj_set_pos(vl, tx - 2, ty - 24);
     lv_obj_set_style_local_bg_color(vl, LV_OBJ_PART_MAIN,
-                                    LV_STATE_DEFAULT, LV_COLOR_RED);
+                                    LV_STATE_DEFAULT, LV_COLOR_BLUE);
+    lv_obj_set_style_local_bg_opa(vl, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_obj_set_style_local_border_width(vl, LV_OBJ_PART_MAIN,
+                                        LV_STATE_DEFAULT, 0);
+
+    /* Centre block, so the exact pixel the operator has to hit is
+     * unambiguous even at a glancing angle. */
+    lv_obj_t *dot = lv_obj_create(cal_container, NULL);
+    lv_obj_set_size(dot, 14, 14);
+    lv_obj_set_pos(dot, tx - 7, ty - 7);
+    lv_obj_set_style_local_bg_color(dot, LV_OBJ_PART_MAIN,
+                                    LV_STATE_DEFAULT, LV_COLOR_BLUE);
+    lv_obj_set_style_local_bg_opa(dot, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
+    lv_obj_set_style_local_border_width(dot, LV_OBJ_PART_MAIN,
                                         LV_STATE_DEFAULT, 0);
 
 #ifdef LVGL_SIM
@@ -1356,10 +1574,55 @@ static bool cal_calculate(float *x_slope, float *x_off,
     return (*residual <= 5.0f);
 }
 
-/* Build the results screen */
+/* Build the results screen
+ *
+ * No buttons, and that is the whole point of the change: the operator never
+ * confirms anything.  Either the fit passes the residual check, in which
+ * case it is committed to g_config, flagged for the flash write, and
+ * cal_finish() drops straight back to the main screen - or it fails, in
+ * which case cal_restart_from_first_point() wipes the samples and asks for
+ * point 0 again.
+ *
+ * A screen the operator can leave half-done is worse than one that insists
+ * on finishing: g_config.touch.calibrated would stay 0 and the next power
+ * cycle would ask the same five questions all over again.
+ *
+ * The coefficients stay on screen for a moment on failure because they are
+ * the only clue to WHY it failed.  A residual just over the limit almost
+ * always means one target got tapped slightly off, and seeing the fitted
+ * line lets the person aim differently on the next pass.
+ */
 static void cal_build_results_ui(void)
 {
     cal_del_container();
+
+    /* cal_calculate() has two early "return false" paths (degenerate input,
+     * residual > 5%) that leave the outputs untouched, and the display below
+     * prints them unconditionally.  Seed everything to a defined value so a
+     * failed calibration shows "0.000" instead of whatever was on the stack. */
+    float x_slope = 0.0f, x_off = 0.0f, y_slope = 0.0f, y_off = 0.0f,
+          residual = 0.0f;
+    bool passed = cal_calculate(&x_slope, &x_off, &y_slope, &y_off, &residual);
+
+    if (passed) {
+#ifndef LVGL_SIM
+        /* Straight float fit: screen = raw * gain + offset */
+        g_config.touch.x_gain     = x_slope;
+        g_config.touch.x_offset   = x_off;
+        g_config.touch.y_gain     = y_slope;
+        g_config.touch.y_offset   = y_off;
+        g_config.touch.calibrated = 1;
+#endif
+        /* cal_finish() flags g_config dirty so app_config_task() persists the
+         * new coefficients, clears the boot-time "calibration required"
+         * flag, and loads the main screen.  No green screen, no OK button:
+         * if the numbers are good, the calibration is simply done. */
+        cal_finish();
+        return;
+    }
+
+    /* Failure: show why, then restart.  Build the container only now - on
+     * the success path there is nothing to look at. */
     cal_container = lv_obj_create(cal_screen, NULL);
     lv_obj_set_size(cal_container, HOR_RES, VER_RES);
     lv_obj_set_pos(cal_container, 0, 0);
@@ -1368,27 +1631,11 @@ static void cal_build_results_ui(void)
     lv_obj_set_style_local_border_width(cal_container, LV_OBJ_PART_MAIN,
                                         LV_STATE_DEFAULT, 0);
 
-    float x_slope, x_off, y_slope, y_off, residual;
-    bool passed = cal_calculate(&x_slope, &x_off, &y_slope, &y_off, &residual);
-
-#ifndef LVGL_SIM
-    if (passed) {
-        /* Straight float fit: screen = raw * gain + offset */
-        g_config.touch.x_gain     = x_slope;
-        g_config.touch.x_offset   = x_off;
-        g_config.touch.y_gain     = y_slope;
-        g_config.touch.y_offset   = y_off;
-        g_config.touch.calibrated = 1;
-    }
-#endif
-
-    lv_color_t result_c = passed ? LV_COLOR_GREEN : LV_COLOR_RED;
     lv_obj_t *result_lbl = lv_label_create(cal_container, NULL);
-    lv_label_set_text(result_lbl, passed ? gui_get_string(STR_CAL_SUCCESS)
-                                         : gui_get_string(STR_CAL_FAILED));
+    lv_label_set_text(result_lbl, gui_get_string(STR_CAL_FAILED));
     lv_obj_align(result_lbl, cal_container, LV_ALIGN_IN_TOP_MID, 0, 20);
     lv_obj_set_style_local_text_color(result_lbl, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, result_c);
+                                      LV_STATE_DEFAULT, LV_COLOR_RED);
     lv_obj_set_style_local_text_font(result_lbl, LV_LABEL_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
 
@@ -1415,38 +1662,74 @@ static void cal_build_results_ui(void)
     lv_obj_set_style_local_text_font(params_lbl, LV_LABEL_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
 
-    if (passed) {
-        lv_obj_t *accept_btn = lv_btn_create(cal_container, NULL);
-        lv_obj_set_pos(accept_btn, HOR_RES / 2 - 105, VER_RES - 44);
-        lv_obj_set_size(accept_btn, 100, 32);
-        lv_obj_set_style_local_text_font(accept_btn, LV_BTN_PART_MAIN,
-                                         LV_STATE_DEFAULT, &MyCJK_16);
-        lv_obj_t *accept_lbl = lv_label_create(accept_btn, NULL);
-        lv_label_set_text(accept_lbl, gui_get_string(STR_CAL_ACCEPT));
-        lv_obj_set_event_cb(accept_btn, cal_accept_cb);
-    }
-
-    lv_obj_t *retry_btn = lv_btn_create(cal_container, NULL);
-    lv_obj_set_pos(retry_btn, HOR_RES / 2 + 5, VER_RES - 44);
-    lv_obj_set_size(retry_btn, 100, 32);
-    lv_obj_set_style_local_text_font(retry_btn, LV_BTN_PART_MAIN,
+    /* Say what happens next, so a restart is not mistaken for a hang. */
+    lv_obj_t *hint_lbl = lv_label_create(cal_container, NULL);
+    lv_label_set_text(hint_lbl, gui_get_string(STR_CAL_RESTART));
+    lv_obj_align(hint_lbl, cal_container, LV_ALIGN_IN_BOTTOM_MID, 0, -50);
+    lv_obj_set_style_local_text_color(hint_lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_RED);
+    lv_obj_set_style_local_text_font(hint_lbl, LV_LABEL_PART_MAIN,
                                      LV_STATE_DEFAULT, &MyCJK_16);
-    lv_obj_t *retry_lbl = lv_label_create(retry_btn, NULL);
-    lv_label_set_text(retry_lbl, gui_get_string(STR_CAL_RETRY));
-    lv_obj_set_event_cb(retry_btn, cal_retry_cb);
 }
 
-/* Advance to next point or show results */
+/* Wipe the samples and ask for point 0 again.  Exactly what the Retry
+ * button used to do, minus the button. */
+static void cal_restart_from_first_point(void)
+{
+    calibrating   = true;
+    cal_state     = 1;
+    cal_point_idx = 0;
+    memset(cal_data, 0, sizeof(cal_data));
+    lv_obj_clean(cal_screen);
+    cal_container = NULL;
+    gui_update_calibration(0);
+}
+
+/* Advance to next point, or finish the pass.
+ *
+ * All five points collected: run the fit.  cal_build_results_ui() either
+ * commits and leaves (cal_finish) or shows the failed fit - and in the
+ * latter case arms the auto-restart below, so the operator gets to read the
+ * coefficients before being asked to tap point 0 again.
+ */
 static void gui_calibration_advance(void)
 {
     cal_point_idx++;
     if (cal_point_idx >= CAL_POINT_COUNT) {
         cal_state = 2;
         cal_build_results_ui();
+
+        /* Only arm the countdown when the fit actually failed.  On success
+         * cal_build_results_ui() has already called cal_finish(), which
+         * clears `calibrating` and loads the main screen - arming here would
+         * leave a stray timer about to yank the operator off the main
+         * screen. */
+        if (calibrating) {
+            s_cal_restart_tick = lv_tick_get();
+        }
     } else {
         cal_state = 1;
         cal_build_point_ui(cal_point_idx);
     }
+}
+
+/* Service the failed-pass countdown.  Called from gui_process_calibration()
+ * on every GUI tick.
+ *
+ * Why a delay at all: the fitted coefficients are the only clue to why the
+ * pass failed, and restarting instantly would flash them past before anyone
+ * could read them.  3 s is long enough to read five numbers and short enough
+ * that a deliberate retry does not feel like a hang. */
+static void gui_process_cal_restart(void)
+{
+    if (!calibrating || cal_state != 2) {
+        return;
+    }
+    /* Unsigned subtraction, so the lv_tick_get() wrap is a non-issue. */
+    if ((lv_tick_get() - s_cal_restart_tick) < CAL_RESTART_DELAY_MS) {
+        return;
+    }
+    cal_restart_from_first_point();
 }
 
 static void gui_create_cal_screen(void)
@@ -1455,6 +1738,10 @@ static void gui_create_cal_screen(void)
     lv_obj_set_size(cal_screen, HOR_RES, VER_RES);
     lv_obj_set_style_local_bg_color(cal_screen, LV_OBJ_PART_MAIN,
                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    /* Without this the screen is transparent (no theme -> bg_opa defaults to
+     * LV_OPA_TRANSP) and the black calibration text has nothing to read on. */
+    lv_obj_set_style_local_bg_opa(cal_screen, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
 }
 
 /*============================================================================
@@ -1512,6 +1799,8 @@ static bool gui_indev_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (data == NULL) {
         return false;
     }
+    if(calibrating)
+        return false; // do not race with calibrating
 
     /* LVGL 每 tick 调一次这里，而采样是 10 ms 一次——两个周期不同频，
      * 绝大多数 tick 拿到的都是同一份样本。所以用 touch_take_sample()：
@@ -1527,6 +1816,28 @@ static bool gui_indev_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
         s_indev_x = tp.x;
         s_indev_y = tp.y;
         s_indev_pr = tp.pressed;
+
+#if DEBUG_TOUCH_RAW
+        /* Latch the panel's own numbers, not tp.*.  tp has already been
+         * through touch_apply_calibration(), so it is exactly the value
+         * that is suspected of being wrong - useless for telling you how
+         * wrong.  g_touch_raw_* is what the ISR decoded straight off the
+         * I2C bus (NS2009: 0..4095; GT911: panel pixels).
+         *
+         * g_touch_raw_z is the NS2009 contact pressure NS2009_PRESSURE()
+         * derives from the panel's Z1/Z2 pair, i.e. the single number the
+         * press threshold NS2009_Z_PRESS_THRESHOLD is compared against.
+         * For a capacitive panel it stays 0 - there is no resistive Z.
+         *
+         * Only latched here; the label write happens in the GUI task pump.
+         * Updating a widget from inside read_cb means updating it from
+         * inside lv_task_handler() while LVGL is iterating its object
+         * tree. */
+        s_touch_raw_x = g_touch_raw_x;
+        s_touch_raw_y = g_touch_raw_y;
+        s_touch_raw_z = g_touch_raw_z;
+        s_touch_raw_dirty = true;
+#endif
     }
 
     /* 按下与抬起都要填坐标：LVGL 靠 state 判断这一帧算不算"按下"，而拖动
@@ -1591,6 +1902,7 @@ void gui_init(void)
      * LVGL's indev list, which lv_task_handler() walks from its first call
      * in gui_tick(). */
     gui_indev_register();
+    boot_backlight_on();
 #endif
 }
 
@@ -1602,24 +1914,51 @@ void gui_start(void)
 
 void gui_tick(void)
 {
-    gui_lock();
-    lv_tick_inc(5);
-    lv_task_handler();
-    gui_unlock();
+
+    /* No lv_tick_inc() here on purpose.  lv_conf.h sets LV_TICK_CUSTOM = 1,
+     * so LVGL reads its millisecond base straight from the FreeRTOS tick
+     * counter (1 kHz, so the count IS milliseconds - see lv_tick_port.h).
+     *
+     * Adding lv_tick_inc() on top would create a second time base that only
+     * advances when this task gets scheduled, and this task is priority 3 -
+     * below ADC (4), Monitor (5) and Protect (6).  Any preemption would make
+     * LVGL's clock fall permanently behind real time, slowing every animation
+     * and timer by an amount that varies with scheduler load. */
+
+
 }
 
 void gui_update_display(void)
 {
-    gui_lock();
+
+#if DEBUG_TOUCH_RAW
+    /* Touch raw readout.  gui_indev_read_cb() only latched the numbers (it
+     * runs inside lv_task_handler(), where touching a widget is unsafe);
+     * the label write happens here, in the task pump, with every other
+     * widget update. */
+    if (s_touch_raw_dirty && lbl_touch_raw != NULL) {
+        s_touch_raw_dirty = false;
+        char raw[48];
+        snprintf(raw, sizeof(raw), "X:%u Y:%u Z:%lu",
+                 (unsigned)s_touch_raw_x, (unsigned)s_touch_raw_y,
+                 (unsigned long)s_touch_raw_z);
+        /* Not gui_label_set_cached(): that cache exists to suppress
+         * redraws of the main screen's live values, and this label is
+         * already only written when the sample actually changed. */
+        lv_label_set_text(lbl_touch_raw, raw);
+        /* Reveal on first sample.  Creating it hidden keeps an untouched
+         * panel from showing "X:0 Y:0 Z:0", which reads like a fault. */
+        lv_obj_set_hidden(lbl_touch_raw, false);
+        lv_obj_move_foreground(lbl_touch_raw);
+    }
+#endif
+
     if (!alert_active && !calibrating) {
         gui_update_main_values();
     }
-    /* Refresh the top-of-screen debug overlay at most once per 500 ms.
-     * lv_tick_inc(5) runs every 10 ms so without throttling the label
-     * text would be rewritten too often.  The throttling also makes
-     * the overlay read as a stable status line on a moving display. */
+    /* Refresh the top-of-screen debug overlay only once . */
     uint32_t now = lv_tick_get();
-    if ((now - s_debug_last_tick_ms) >= 500U) {
+    if (s_debug_last_tick_ms == 0) {
         s_debug_last_tick_ms = now;
         gui_update_debug_overlay();
     }
@@ -1640,15 +1979,10 @@ void gui_update_display(void)
     if (!g_gui_ready) {
         if (++s_first_paint_ticks >= 3U) {
             g_gui_ready = true;
-#ifndef LVGL_SIM
-            /* No backlight PWM on the PC simulator, but keep g_gui_ready
-             * above unguarded so the sim exercises the same handshake. */
-            boot_backlight_on();
-#endif
         }
     }
 
-    gui_unlock();
+
 }
 
 /*============================================================================
@@ -1686,13 +2020,13 @@ void gui_show_alert(AlertType alert_type)
     /* Called from the GUI task pump, NOT from an ISR: the fault path only
      * sets g_alert_flag (see protection_trigger_locked() and the "no gui_*
      * from ISR" rule in gui.h).  Must take the lock. */
-    gui_lock();
+
 
     /* Re-entrancy guard: one popup per fault.  protection_trigger_locked()
      * already suppresses repeat triggers until cleared, but a stray second
      * call here would otherwise leak the previous msgbox. */
     if (alert_msgbox != NULL) {
-        gui_unlock();
+
         return;
     }
 
@@ -1754,18 +2088,18 @@ void gui_show_alert(AlertType alert_type)
     lv_obj_set_event_cb(alert_msgbox, alert_dismiss_cb);
 
     alert_active = true;
-    gui_unlock();
+
 }
 
 void gui_dismiss_alert(void)
 {
-    gui_lock();
+
     if (alert_msgbox) {
         lv_obj_del(alert_msgbox);
         alert_msgbox = NULL;
     }
     alert_active = false;
-    gui_unlock();
+
 }
 
 bool gui_is_alert_active(void)
@@ -1809,7 +2143,7 @@ static LangRefreshEntry lang_refresh[] = {
 
 void gui_set_language(LanguageType lang)
 {
-    gui_lock();
+
     current_language = lang;
 #ifndef LVGL_SIM
     g_config.language = lang;
@@ -1822,12 +2156,19 @@ void gui_set_language(LanguageType lang)
                               gui_get_string(lang_refresh[i].str_id));
         }
     }
-    gui_unlock();
+
+    /* The loop above writes labels directly, bypassing the change-guard
+     * cache.  Without dropping the cache, the next gui_update_main_values()
+     * pass would compare each label against its *pre-switch* text, find a
+     * match whenever the string happens to be language-neutral ("12W",
+     * "ICOM"), and skip the write - so parts of the screen would keep the
+     * old language indefinitely. */
+    gui_label_cache_invalidate();
 }
 
 void gui_show_calibration(void)
 {
-    gui_lock();
+
     if (cal_screen == NULL) gui_create_cal_screen();
     calibrating = true;
     cal_state = 1;
@@ -1845,29 +2186,31 @@ void gui_show_calibration(void)
      * that path alone the panel would stay black while asking the user
      * to press targets - the one screen that must never be unreadable.
      * Idempotent: re-entering just re-writes the same duty cycle. */
-    boot_backlight_on();
+
 #endif
     lv_scr_load(cal_screen);
     gui_update_calibration(0);
-    gui_unlock();
+
 }
 
 void gui_update_calibration(uint8_t current_point)
 {
-    gui_lock();
     (void)current_point;
     if (cal_state == 1) {
         cal_build_point_ui(cal_point_idx);
     }
-    gui_unlock();
 }
 
 void gui_process_calibration(void)
 {
-    gui_lock();
+
 #ifndef LVGL_SIM
+    /* Auto-restart after a failed pass runs before the tap handling below:
+     * it must fire even though cal_state is 2, not 1. */
+    gui_process_cal_restart();
+
     if (!calibrating || cal_state != 1) {
-        gui_unlock();
+
         return;
     }
 
@@ -1877,7 +2220,7 @@ void gui_process_calibration(void)
         uint32_t now = lv_tick_get();
 
         if ((now - s_cal_lockout_tick) < CAL_LOCKOUT_MS) {
-            gui_unlock();
+
             return;
         }
 
@@ -1887,7 +2230,7 @@ void gui_process_calibration(void)
         if (touch_take_sample(&tp) && tp.pressed) {
             uint8_t idx = cal_point_idx;
             if (idx >= CAL_POINT_COUNT) {
-                gui_unlock();
+
                 return;
             }
 
@@ -1901,12 +2244,12 @@ void gui_process_calibration(void)
         }
     }
 #endif
-    gui_unlock();
+
 }
 
 void gui_power_button_pressed(void)
 {
-    gui_lock();
+
 #ifndef LVGL_SIM
     /* The front-panel button is the HV switch: it engages / releases the
      * PWR_ON + RF_BIAS rail only.  The main supply latch (PG5) and the
@@ -1918,13 +2261,13 @@ void gui_power_button_pressed(void)
     static bool sim_active = false;
     sim_active = !sim_active;
     if (sim_active) {
-        lv_label_set_text(status_label, gui_get_string(STR_STANDBY));
+        gui_label_set_cached(status_label, gui_get_string(STR_STANDBY));
         lv_obj_set_style_local_bg_color(banner, LV_OBJ_PART_MAIN,
                                          LV_STATE_DEFAULT, LV_COLOR_MAKE(0xea, 0xb9, 0x06));
         lv_obj_set_style_local_bg_color(bottom_bar, LV_OBJ_PART_MAIN,
                                          LV_STATE_DEFAULT, LV_COLOR_MAKE(0xea, 0xb9, 0x06));
     } else {
-        lv_label_set_text(status_label, gui_get_string(STR_IDLE));
+        gui_label_set_cached(status_label, gui_get_string(STR_IDLE));
         lv_obj_set_style_local_bg_color(banner, LV_OBJ_PART_MAIN,
                                          LV_STATE_DEFAULT, COLOR_BANNER);
         lv_obj_set_style_local_bg_color(bottom_bar, LV_OBJ_PART_MAIN,
@@ -1934,7 +2277,7 @@ void gui_power_button_pressed(void)
     lv_obj_set_style_local_text_color(status_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
 #endif
-    gui_unlock();
+
 }
 
 uint8_t gui_get_current_screen(void)
@@ -2426,6 +2769,8 @@ static void show_baud_spinbox(const char *title_zh,
     lv_obj_align(baud_spinner_popup, scr, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_local_bg_color(baud_spinner_popup, LV_OBJ_PART_MAIN,
                                     LV_STATE_DEFAULT, COLOR_BG);
+    lv_obj_set_style_local_bg_opa(baud_spinner_popup, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_obj_set_style_local_border_width(baud_spinner_popup, LV_OBJ_PART_MAIN,
                                          LV_STATE_DEFAULT, 2);
     lv_obj_set_style_local_border_color(baud_spinner_popup, LV_OBJ_PART_MAIN,
@@ -2752,6 +3097,8 @@ static void cc_build_ui(uint8_t step)
     lv_obj_set_pos(adc_box, HOR_RES / 20, VER_RES / 4 + 10);
     lv_obj_set_style_local_bg_color(adc_box, LV_OBJ_PART_MAIN,
                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_bg_opa(adc_box, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_obj_set_style_local_border_color(adc_box, LV_OBJ_PART_MAIN,
                                          LV_STATE_DEFAULT, COLOR_BORDER);
     lv_obj_set_style_local_radius(adc_box, LV_OBJ_PART_MAIN,
@@ -2935,8 +3282,7 @@ static void cc_build_results(void)
 /* Update real-time ADC display — called from main loop */
 void gui_process_coupler_cal(void)
 {
-    gui_lock();
-    if (!cc_active) { gui_unlock(); return; }
+    if (!cc_active) {  return; }
 
     if (cc_rebuild_pending) {
         cc_rebuild_pending = false;
@@ -2947,11 +3293,11 @@ void gui_process_coupler_cal(void)
             cc_state = 1;
             cc_build_ui(cc_step);
         }
-        gui_unlock();
+
         return;
     }
 
-    if (cc_state != 1 || cc_adc_val_label == NULL) { gui_unlock(); return; }
+    if (cc_state != 1 || cc_adc_val_label == NULL) {  return; }
 
     uint16_t adc = cc_read_adc();
 
@@ -2977,18 +3323,18 @@ void gui_process_coupler_cal(void)
              (cc_step == 0 || cc_step == 2) ? "5" : "20");
 #endif
     lv_label_set_text(cc_adc_val_label, cc_buf);
-    gui_unlock();
 }
 
 /* Public: show coupler calibration screen */
 void gui_show_coupler_cal(uint8_t coupler_id)
 {
-    gui_lock();
     if (cc_screen == NULL) {
         cc_screen = lv_obj_create(NULL, NULL);
         lv_obj_set_size(cc_screen, HOR_RES, VER_RES);
         lv_obj_set_style_local_bg_color(cc_screen, LV_OBJ_PART_MAIN,
                                          LV_STATE_DEFAULT, LV_COLOR_WHITE);
+        lv_obj_set_style_local_bg_opa(cc_screen, LV_OBJ_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_OPA_COVER);
     }
 
     if (cc_result_container) {
@@ -3005,7 +3351,6 @@ void gui_show_coupler_cal(uint8_t coupler_id)
     memset(cc_meas, 0, sizeof(cc_meas));
     lv_scr_load(cc_screen);
     cc_build_ui(0);
-    gui_unlock();
 }
 
 /*============================================================================
@@ -3231,6 +3576,8 @@ static void show_sensor_inspect(void)
     lv_obj_align(si_overlay, NULL, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_local_bg_color(si_overlay, LV_OBJ_PART_MAIN,
                                      LV_STATE_DEFAULT, COLOR_BG);
+    lv_obj_set_style_local_bg_opa(si_overlay, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_obj_set_style_local_radius(si_overlay, LV_OBJ_PART_MAIN,
                                    LV_STATE_DEFAULT, 0);
 
@@ -3282,8 +3629,8 @@ static void show_sensor_inspect(void)
  * per opa2000.h; scale them down here for display only. */
 void gui_update_sensor_inspect(void)
 {
-    gui_lock();
-    if (!si_overlay) { gui_unlock(); return; }
+
+    if (!si_overlay) {  return; }
     char buf[48];
 
     /* ADC1 rows. */
@@ -3409,7 +3756,7 @@ void gui_update_sensor_inspect(void)
 #endif
         if (si_adc2_val_labels[i]) lv_label_set_text(si_adc2_val_labels[i], buf);
     }
-    gui_unlock();
+
 }
 
 /*============================================================================
@@ -3423,12 +3770,25 @@ static void fan_sel_cb(lv_obj_t *obj, lv_event_t e)
     if (e == LV_EVENT_CLICKED) {
         uint16_t btn_id = lv_msgbox_get_active_btn(obj);
         lv_obj_del_async(obj);
-        if (btn_id <= 5) {
-            static const uint8_t speeds[] = {0, 20, 40, 60, 80, 100};
 #ifndef LVGL_SIM
-            power_set_fan_speed(speeds[btn_id]);
-#endif
+        if (btn_id == 0U) {
+            /* "Auto": hand the duty back to the temperature loop.
+             * power_set_fan_speed() alone would only write the PWM and
+             * leave s_fan_mode alone, so the very next power_update_fan()
+             * tick would overwrite it - and passing 0 would stop the fan
+             * instead of handing it back. */
+            power_set_fan_mode(FAN_MODE_AUTO);
+        } else if (btn_id <= 5U) {
+            static const uint8_t speeds[] = {0, 20, 40, 60, 80, 100};
+            /* Must go through power_set_fan_manual(), not
+             * power_set_fan_speed(): only the former latches MANUAL, and
+             * without that latch the operator's choice is overwritten by
+             * the NTC curve on the next tick. */
+            power_set_fan_manual(speeds[btn_id]);
         }
+#else
+        (void)btn_id;
+#endif
     }
 }
 
@@ -3833,6 +4193,8 @@ static void show_protection_settings(void)
     lv_obj_set_size(prot_screen, HOR_RES, VER_RES);
     lv_obj_set_style_local_bg_color(prot_screen, LV_OBJ_PART_MAIN,
                                      LV_STATE_DEFAULT, COLOR_BG);
+    lv_obj_set_style_local_bg_opa(prot_screen, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_scr_load(prot_screen);
 
     prot_container = lv_obj_create(prot_screen, NULL);
@@ -3913,14 +4275,14 @@ static const char *settings_en[] = {
 
 void gui_toggle_menu(void)
 {
-    gui_lock();
+
     /* Toggle semantics: if the menu is already open, close it instead of
      * stacking another overlay (which would trap the user with multiple
      * stacked layers and is the bug the GUI agent just fixed). */
     if (settings_menu_overlay != NULL) {
         lv_obj_del(settings_menu_overlay);
         settings_menu_overlay = NULL;
-        gui_unlock();
+
         return;
     }
 
@@ -3931,6 +4293,8 @@ void gui_toggle_menu(void)
     lv_obj_align(overlay, NULL, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_local_bg_color(overlay, LV_OBJ_PART_MAIN,
                                      LV_STATE_DEFAULT, COLOR_BG);
+    lv_obj_set_style_local_bg_opa(overlay, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
     lv_obj_set_style_local_radius(overlay, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
 
     lv_obj_t *btnm = lv_btnmatrix_create(overlay, NULL);
@@ -3958,7 +4322,7 @@ void gui_toggle_menu(void)
 
     lv_obj_set_event_cb(btnm, settings_menu_cb);
     settings_menu_overlay = overlay;
-    gui_unlock();
+
 }
 
 void gui_toggle_band_popup(void) { /* TODO: not implemented; lock when used */ }

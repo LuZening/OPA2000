@@ -114,8 +114,17 @@ void protection_check_ntc(void);
 void protection_check(void);
 
 /* Clear latched fault after the user acknowledges the alert and the
- * underlying condition has been resolved. */
+ * underlying condition has been resolved.
+ *
+ * Non-blocking: it only raises a request.  The 100 ms external-latch reset
+ * pulse is executed by the protection task - see the latch-clear section in
+ * protection.c for why it cannot run here. */
 void protection_clear(void);
+
+/* True when a dismiss has asked for the external latch reset pulse, and
+ * clears the request.  Test-and-clear rather than a plain query so a request
+ * arriving during the 100 ms pulse is not lost. */
+bool protection_take_latch_clear_request(void);
 
 /* Has any fault been latched?  Read-only accessor for GUI. */
 bool protection_is_active(void);

@@ -32,53 +32,108 @@
 static EepromStatsType s_stats;
 
 /*============================================================================
+ *  Unit conversion - the one place flash words become uint32 indices
+ *==========================================================================
+ *
+ *  Two units meet in this file and confusing them is what caused the payload
+ *  overflow: the record geometry is counted in 16-byte FLASH words (that is
+ *  what the sector arithmetic and the ECC granularity both use), while every
+ *  buffer in the program is a uint32_t array, where one index step is 4
+ *  bytes.  Indexing a uint32_t buffer with a flash-word count silently
+ *  quarters every offset.
+ *
+ *  So the conversion lives here, in one named function, and nowhere else is
+ *  a flash-word count used as an index.  If you find yourself wanting to
+ *  write words[n] with an n that came from eeprom_record_words(), what you
+ *  actually want is eeprom_word_to_u32(n).
+ *==========================================================================*/
+
+/** @brief Flash-word index -> uint32_t element index.
+ *  @param word_index  position in 16-byte flash words
+ *  @return            the same position as a uint32_t array index
+ */
+static inline uint32_t eeprom_word_to_u32(uint32_t word_index)
+{
+    return word_index * EEPROM_WORD_U32;
+}
+
+/*============================================================================
  *  Host-testable helpers
  *==========================================================================*/
 
-/* How many 16-byte words a record of \p len payload bytes needs, including
- * the header and the commit word. */
+/* How many 16-byte flash words a record of \p len payload bytes needs,
+ * including the header and the commit word.
+ *
+ * Saturates rather than wrapping.  The rounding term (len + 15) would
+ * overflow for len > 0xFFFFFFF0 and hand back a need of 2, which then
+ * passes every "does it fit" check downstream and lets a huge memcpy run off
+ * the staging buffer.  The cap here is one sector: a record can never be
+ * larger than that, so clamping to it is both safe and the honest answer. */
 uint32_t eeprom_record_words(uint32_t len)
 {
     /* header + payload rounded up + commit */
+    uint32_t max_payload = EEPROM_SECTOR_BYTES - EEPROM_MAX_RECORD_OVERHEAD_BYTES;
+
+    if (len > max_payload) {
+        len = max_payload;
+    }
     uint32_t payload_words = (len + EEPROM_WORD_BYTES - 1U) / EEPROM_WORD_BYTES;
-    return 1U + payload_words + 1U;
+    return EEPROM_HEADER_WORDS + payload_words + EEPROM_COMMIT_WORDS;
 }
 
 /* Serialise \p src into \p words, ready to be programmed.  Returns the
- * word count, or 0 if the record would not fit in a sector. */
+ * word count, or 0 if the record would not fit in a sector.
+ *
+ * The payload is copied verbatim - memcpy of the caller's raw bytes, no
+ * byte-at-a-time loop and no per-field interpretation.  The caller hands us
+ * a plain struct (ConfigType), which contains only fixed-width integers and
+ * floats and no pointers, so its in-memory image IS its stored image. */
 uint32_t eeprom_encode(uint32_t id,
                        const void *src, uint32_t len,
                        uint32_t crc,
                        uint32_t *words, uint32_t max_words)
 {
     uint32_t need = eeprom_record_words(len);
-    const uint8_t *p = (const uint8_t *)src;
-    uint32_t payload_words = need - 2U;
-    uint32_t i;
+    uint32_t payload_words = need - EEPROM_HEADER_WORDS - EEPROM_COMMIT_WORDS;
+    /* Payload start and commit start, both as uint32_t indices into words[].
+     * Every geometry count goes through eeprom_word_to_u32() so the
+     * flash-word -> element conversion is done in exactly one place. */
+    uint32_t pay = eeprom_word_to_u32(EEPROM_HEADER_WORDS);
+    uint8_t *payload = (uint8_t *)&words[pay];
+    uint32_t pad;
 
-    if (words == NULL || src == NULL || need > max_words) {
+    if (words == NULL || src == NULL ||
+        eeprom_word_to_u32(need) > max_words) {
         return 0U;
     }
 
-    /* Header word: magic | id | len | flags */
+    /* Header: magic | id | len | flags, then a spare word.  All four live in
+     * the first flash word, i.e. the first EEPROM_WORD_U32 elements. */
     words[0] = EEPROM_RECORD_MAGIC;
     words[1] = ((uint32_t)id << 16) | (uint32_t)len;
     words[2] = EEPROM_FLAG_COMMITTED;
-    words[3] = 0xFFFFFFFFU;   /* spare, kept erased-looking for readability */
+    words[3] = 0xFFFFFFFFU;   /* spare, kept erased-looking */
 
-    /* Payload words, zero padded.  Padding must be deterministic: the same
+    /* Payload: one memcpy of the caller's raw bytes, then fill the tail of
+     * the last word with 0xFF.  The fill must be deterministic - the same
      * config saved twice has to produce identical bytes, otherwise the
-     * sector fills up with records that differ only in slack. */
-    for (i = 0U; i < payload_words * EEPROM_WORD_BYTES; i++) {
-        uint8_t b = (i < len) ? p[i] : 0xFFU;
-        ((uint8_t *)&words[4U + i])[0] = b;
+     * sector fills with records differing only in their slack. */
+    memcpy(payload, src, len);
+    pad = payload_words * EEPROM_WORD_BYTES - len;
+    if (pad > 0U) {
+        memset(&payload[len], 0xFF, pad);
     }
 
-    /* Commit word: magic again | id again | crc | payload length */
-    words[need - 1U] = EEPROM_RECORD_MAGIC;
-    words[need]     = ((uint32_t)id << 16) | (uint32_t)len;
-    words[need + 1U] = crc;
-    words[need + 2U] = 0xFFFFFFFFU;
+    /* Commit, programmed last so an interrupted save leaves it erased and
+     * the record is skipped rather than half-believed. */
+    {
+        uint32_t cmt = eeprom_word_to_u32(EEPROM_HEADER_WORDS + payload_words);
+
+        words[cmt + 0U] = EEPROM_RECORD_MAGIC;
+        words[cmt + 1U] = ((uint32_t)id << 16) | (uint32_t)len;
+        words[cmt + 2U] = crc;
+        words[cmt + 3U] = 0xFFFFFFFFU;
+    }
 
     return need;
 }
@@ -121,17 +176,22 @@ uint32_t eeprom_decode(const uint32_t *words, uint32_t n_words,
     /* Commit word must agree with the header.  This is the torn-write
      * check: the commit is programmed last, so a record whose payload was
      * interrupted still has an erased (0xFFFFFFFF) commit word. */
-    if (words[need - 1U] != EEPROM_RECORD_MAGIC) {
-        return 0U;
-    }
-    if ((words[need - 1U] >> 16) != id) {
-        return 0U;
-    }
-    if ((words[need - 1U] & 0xFFFFU) != len) {
-        return 0U;
+    {
+        uint32_t cmt = eeprom_word_to_u32(need - EEPROM_COMMIT_WORDS);
+
+        if (words[cmt + 0U] != EEPROM_RECORD_MAGIC) {
+            return 0U;
+        }
+        if ((words[cmt + 1U] >> 16) != id) {
+            return 0U;
+        }
+        if ((words[cmt + 1U] & 0xFFFFU) != len) {
+            return 0U;
+        }
     }
 
-    memcpy(out, (const uint8_t *)&words[4], len);
+    memcpy(out, (const uint8_t *)&words[eeprom_word_to_u32(EEPROM_HEADER_WORDS)],
+           len);
     return len;
 }
 
@@ -190,7 +250,10 @@ static bool eeprom_hal_erase_sector(uint32_t sector_index)
     er.VoltageRange = FLASH_VOLTAGE_RANGE_3;
 
     uint32_t sector_error = 0U;
-    return HAL_FLASHEx_Erase(&er, &sector_error) == HAL_OK;
+    __disable_irq();
+    bool r = HAL_FLASHEx_Erase(&er, &sector_error) == HAL_OK;
+    __enable_irq();
+    return r;
 }
 
 static bool eeprom_hal_program(uint32_t address, const uint32_t *words, uint32_t n)
@@ -198,22 +261,49 @@ static bool eeprom_hal_program(uint32_t address, const uint32_t *words, uint32_t
     /* One HAL_FLASH_Program() call per 16-byte flash word, and the caller
      * guarantees each word is programmed exactly once.
      *
-     * This matters more than it looks.  Each flash word carries ECC bits
-     * that are computed over the full 128 data bits, so a word must go
-     * from erased to its final value in a single operation.  Programming
-     * part of a word and later programming the rest corrupts the ECC, and
-     * the next read of that address raises a bus fault that hardfaults the
-     * core.  Never retry a failed program on the same address - erase the
-     * sector instead. */
+     * Why one call per word and not one call for the whole record: on this
+     * part a flash word is 128 bits wide - FLASH_NB_32BITWORD_IN_FLASHWORD
+     * is 4, so 4 x uint32 - of which 8 bits are ECC computed over the
+     * other 120.  HAL_FLASH_Program() hard-codes that width: it copies
+     * exactly FLASH_NB_32BITWORD_IN_FLASHWORD uint32 in its own loop
+     * (stm32h7xx_hal_flash.c), and there is no variant that takes more.
+     * The ECC granularity is the hardware's, so 16 bytes per call is not a
+     * choice we can optimise away.
+     *
+     * It is also not safe to merge calls: programming part of a word and
+     * then coming back for the rest corrupts the ECC, and the next read of
+     * that address raises a bus fault that hardfaults the core.  Never
+     * retry a failed program on the same address either - erase the sector
+     * instead.
+     *
+     * The data pointer therefore has to advance EEPROM_WORD_U32 elements
+     * per call, not one.  Each call reads a full 16 bytes out of it, and the
+     * destination advances 16 bytes too, so the two stay in step.
+     *
+     * DataAddress is an ADDRESS, not a pointer to the data - the HAL casts
+     * it straight back to a pointer and dereferences it
+     * (stm32h7xx_hal_flash.c:164: `src_addr = (__IO uint32_t*)DataAddress`).
+     * Passing `words` itself would hand the HAL the pointer *value*, so it
+     * would read from wherever that number happens to be an address and
+     * program that garbage into flash.  Hence the explicit cast of the
+     * buffer to its own address. */
+    bool r= true;
+    __disable_irq();
     for (uint32_t i = 0U; i < n; i++) {
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD,
                               address + i * EEPROM_WORD_BYTES,
-                              (uint32_t)(&words[i])) != HAL_OK) {
-            return false;
+                              (uint32_t)(uintptr_t)&words[i * EEPROM_WORD_U32])
+            != HAL_OK)
+        {
+            r = false;
+            break;
         }
     }
-    return true;
+    __enable_irq();
+    return r;
 }
+
+#endif /* !HOST_TEST_NATIVE */
 
 /* Read the record id out of a slot's header word 1, without touching the
  * payload. */
@@ -264,14 +354,18 @@ bool eeprom_record_is_intact(const uint32_t *words, uint32_t avail_words)
     /* The commit word is programmed last, so an interrupted save leaves it
      * erased.  It must also agree with the header: a mismatch means the two
      * halves came from different saves. */
-    if (words[need - 1U] != EEPROM_RECORD_MAGIC) {
-        return false;
-    }
-    if (eeprom_header_id(words) != (words[need - 1U] >> 16)) {
-        return false;
-    }
-    if (len != (words[need - 1U] & 0xFFFFU)) {
-        return false;
+    {
+        uint32_t cmt = eeprom_word_to_u32(need - EEPROM_COMMIT_WORDS);
+
+        if (words[cmt + 0U] != EEPROM_RECORD_MAGIC) {
+            return false;
+        }
+        if (eeprom_header_id(words) != (words[cmt + 1U] >> 16)) {
+            return false;
+        }
+        if (len != (words[cmt + 1U] & 0xFFFFU)) {
+            return false;
+        }
     }
     return true;
 }
@@ -283,7 +377,13 @@ static bool eeprom_word_is_erased(const uint32_t *words)
 
 /*============================================================================
  *  Public API
+ *
+ *  These drive the real flash array through the eeprom_hal_* wrappers above,
+ *  so they are compiled out of the host test build - which exercises the
+ *  codec and the framing checks above instead.
  *==========================================================================*/
+
+#ifndef HOST_TEST_NATIVE
 
 bool eeprom_load(void *out, uint32_t out_size)
 {
@@ -516,20 +616,23 @@ bool eeprom_save(const void *src, uint32_t len)
     next_id = eeprom_current_id() + 1U;
 
     {
-        /* Sized to the record, not the sector: ConfigType is 124 bytes so a
-         * record is 144 bytes = 9 words.  A sector-sized buffer would be
-         * 2 KB of static RAM for nothing. */
-        static uint32_t staging[EEPROM_MAX_RECORD_WORDS];
+        /* Sized to the record, not the sector: ConfigType is 128 bytes so a
+         * record is 1 + 8 + 1 = 10 flash words = 160 bytes = 40 uint32.  A
+         * sector-sized buffer would be 2 KB of static RAM for nothing.
+         *
+         * EEPROM_RECORD_U32, not EEPROM_MAX_RECORD_WORDS: the array is
+         * uint32_t[], so it needs four elements per 16-byte flash word. */
+        static uint32_t staging[EEPROM_RECORD_U32];
         uint32_t words;
 
-        if (need > EEPROM_MAX_RECORD_WORDS) {
+        if (need * EEPROM_WORD_U32 > EEPROM_RECORD_U32) {
             s_stats.save_failures++;
             return false;
         }
 
         words = eeprom_encode(next_id, src, len,
                               crc32_calculate((const uint8_t *)src, len),
-                              staging, EEPROM_MAX_RECORD_WORDS);
+                              staging, EEPROM_RECORD_U32);
         if (words != need) {
             s_stats.save_failures++;
             return false;

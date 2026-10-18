@@ -73,15 +73,48 @@ extern "C" {
 #define EEPROM_FIRST_SECTOR        12U
 
 /*!< Largest payload this layer will store.  ConfigType is ~128 bytes,
- *   which needs 10 words including header and commit; the cap leaves
+ *   which needs 22 words including header and commit; the cap leaves
  *   room for the structure to grow without silently overflowing the
  *   staging buffer.  Kept in sync with the layout test in
  *   User/Tests/test_config_layout.c. */
 #define EEPROM_MAX_PAYLOAD_BYTES   256U
 
-/*!< Header + padded payload + commit, for EEPROM_MAX_PAYLOAD_BYTES. */
+/*!< Record framing, in 16-byte flash words:
+ *
+ *       flash word 0        header  (magic, id|len, flags, spare) = 4 x uint32
+ *       flash word 1 .. pw   payload (raw struct bytes, 0xFF padded)
+ *       flash word 1+pw      commit  (magic, id|len, crc, spare)   = 4 x uint32
+ *
+ *   One header word and one commit word is exactly the 4 uint32 each side
+ *   writes below, and it is what EEPROM_WORD_BYTES granularity demands: a
+ *   partially programmed word corrupts its ECC and the next read of that
+ *   address hardfaults the core.
+ *
+ *   NOTE the unit.  These counts are FLASH WORDS (16 bytes), but the staging
+ *   buffer is a uint32_t array, so every index derived from them must be
+ *   scaled by EEPROM_WORD_U32.  Getting that wrong is what used to place the
+ *   payload four times too early and run it off the end of the buffer. */
+#define EEPROM_HEADER_WORDS       1U
+#define EEPROM_COMMIT_WORDS       1U
+
+/*!< uint32_t elements in one 16-byte flash word. */
+#define EEPROM_WORD_U32           (EEPROM_WORD_BYTES / 4U)
+
+/*!< Header + padded payload + commit, for EEPROM_MAX_PAYLOAD_BYTES, in
+ *   flash words.  A uint32_t staging buffer needs EEPROM_RECORD_U32 of them. */
 #define EEPROM_MAX_RECORD_WORDS \
-    (1U + ((EEPROM_MAX_PAYLOAD_BYTES + EEPROM_WORD_BYTES - 1U) / EEPROM_WORD_BYTES) + 1U)
+    (EEPROM_HEADER_WORDS \
+     + ((EEPROM_MAX_PAYLOAD_BYTES + EEPROM_WORD_BYTES - 1U) / EEPROM_WORD_BYTES) \
+     + EEPROM_COMMIT_WORDS)
+
+/*!< Size of the uint32_t staging buffer eeprom_encode() writes into. */
+#define EEPROM_RECORD_U32         (EEPROM_MAX_RECORD_WORDS * EEPROM_WORD_U32)
+
+/*!< Flash words a record spends on framing, i.e. everything that is not
+ *   payload.  eeprom_record_words() clamps the payload to
+ *   EEPROM_SECTOR_BYTES - this, so its rounding arithmetic can never wrap. */
+#define EEPROM_MAX_RECORD_OVERHEAD_BYTES \
+    ((EEPROM_HEADER_WORDS + EEPROM_COMMIT_WORDS) * EEPROM_WORD_BYTES)
 
 /*!< Highest number of records the ring can hold.  eeprom_load() uses this to
  *   size its candidate table, so it must not be raised past what the sectors

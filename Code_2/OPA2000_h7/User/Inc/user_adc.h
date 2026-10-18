@@ -35,7 +35,7 @@ extern ADC_HandleTypeDef hadc2;
 extern DMA_HandleTypeDef hdma_adc1;
 extern DMA_HandleTypeDef hdma_adc2;
 
-/* DMA buffer size = 16-sample rolling average. */
+/* DMA buffer size = 1-sample rolling average. */
 #define ADC_DMA_BUFFER_SIZE    16U
 
 /*============================================================================
@@ -68,6 +68,24 @@ void adc_init(void);
  * Reads g_adc_data.fwd2_mW / rev2_mW (so adc_process() must have run at
  * least once) and writes fwd2_peak_mW / rev2_peak_mW. */
 void adc_peak_hold_tick(void);
+
+/* Re-arm the ADC2 injected sequence (NTC core, NTC aux, MCU die temp) so it
+ * keeps producing fresh readings.
+ *
+ * WHY THIS IS NEEDED: MX_ADC2_Init() asks for ADC_INJECTED_SOFTWARE_START
+ * with no trigger source and InjectedDiscontinuousConvMode = DISABLE, so
+ * HAL_ADCEx_InjectedStart() runs the three ranks exactly once and the
+ * sequence then parks.  Nothing in hardware re-arms it, so without this
+ * call adc2_inj_*_raw stay frozen at the values measured at boot.
+ *
+ * Call from task context (the ADC task) at its own tick rate; the function
+ * gates on its own 100 ms period, so calling it more often is free and
+ * calling it less often stretches the interval.  One tick comparison plus,
+ * every 100 ms, three microsecond-long conversions.
+ *
+ * Note this is unrelated to the NTC over-temperature protection, which
+ * watches the ADC1 analog watchdog and never touches the injected path. */
+void adc_injected_tick(void);
 
 /* Power-on stabilisation gate.  This is the only entry point the ADC task
  * needs: it owns the whole power-up sequence, so a caller cannot forget a

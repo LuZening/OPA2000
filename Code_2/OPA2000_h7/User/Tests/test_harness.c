@@ -155,6 +155,9 @@ extern const test_entry_t g_suite_freq_detect[];
 extern const test_entry_t g_suite_cmsis_os_shim[];
 extern const test_entry_t g_suite_config_mutex[];
 extern const test_entry_t g_suite_boot[];
+extern const test_entry_t g_suite_flash_eeprom[];
+extern const test_entry_t g_suite_config_layout[];
+extern const test_entry_t g_suite_fan_tach[];
 
 static const test_entry_t *const s_suites[] = {
     g_suite_opa2000,
@@ -167,6 +170,9 @@ static const test_entry_t *const s_suites[] = {
     g_suite_cmsis_os_shim,
     g_suite_config_mutex,
     g_suite_boot,
+    g_suite_flash_eeprom,
+    g_suite_config_layout,
+    g_suite_fan_tach,
 };
 
 #define SUITE_COUNT (sizeof s_suites / sizeof s_suites[0])

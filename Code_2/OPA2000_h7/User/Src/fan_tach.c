@@ -1,50 +1,65 @@
 /**
  * @file fan_tach.c
- * @brief Fan / pump TACH (RPM) detection - 500 us polling in TIM7 ISR.
+ * @brief Fan / pump TACH (RPM) detection - edge counting in the TIM7 ISR.
  *
  * @details Pulse counting:
- *   - ISR reads GPIOD->IDR for PD4 / PD5.
- *   - Tracks previous level.  Falling edge (high->low) increments a
- *     per-channel pulse counter.
- *   - Counters are reset by the task side every 100 ms.
- *   - RPM = count * 60 / poles / (window_seconds)
- *     where window = 100 ms, poles = 2 -> RPM = count * 300.
+ *   - fan_tach_tick() is called from TIM7_IRQHandler, which freq_detect.c
+ *     has already programmed for a 100 us update tick.  fan_tach never
+ *     touches PSC/ARR itself.
+ *   - The ISR reads PD4 / PD5 and counts falling edges.  The pins are
+ *     GPIO inputs with a pull-up, so the line idles high and each tach
+ *     pulse pulls it low.
+ *   - fan_tach_calculate_rpm() runs from the monitor task, snapshots the
+ *     counters, and divides by the elapsed tick count measured with
+ *     HAL_GetTick().  Using the measured window rather than a compile-time
+ *     constant means the reading cannot silently go wrong when the
+ *     caller's period changes.
  *
- * The ISR is integer-only (no FPU).  TIM7 is configured at 500 us
- * (prescaler = 19, period = 4999).
+ *   RPM = pulses * 60 / (PPR * window_seconds), with PPR per channel -
+ *   see FAN_POLES / PUMP_POLES in fan_tach.h.
+ *
+ * The ISR is integer-only (no FPU).
  */
 
 #include "fan_tach.h"
 #include "stm32h7xx_hal.h"
 
-/* TIM7: 200 MHz / 20 = 10 MHz, period = 4999 -> 500 us tick. */
-#define FAN_TACH_TIM_PRESCALER  19U
-#define FAN_TACH_TIM_PERIOD     4999U
+/* FAN_POLES / PUMP_POLES come from fan_tach.h - that is the single place
+ * to edit them when a part's pulse-per-revolution figure is known. */
 
-/* Typical PC fan = 2 poles. */
-#define FAN_POLES               2U
-#define FAN_WINDOW_MS           100U
+/* Sanity bounds on the measured window.  A window shorter than this
+ * cannot resolve anything useful (at 12000 rpm / 2 PPR that is still
+ * 40 pulses, but the division gets noisy), and a window longer than a
+ * few seconds means the caller stalled - in both cases holding the last
+ * reading is more honest than publishing a wild number. */
+#define FAN_WINDOW_MIN_MS       200U
+#define FAN_WINDOW_MAX_MS       5000U
 
 /*============================================================================
  *  Private state (volatile for ISR/task sharing)
- *============================================================================*/
+ *==========================================================================*/
 
 /* Pulse count accumulated during the current window. */
 static volatile uint32_t s_fan_pulse_count  = 0U;
 static volatile uint32_t s_pump_pulse_count = 0U;
 
-/* Last sampled GPIO level (active high - active low signal with pull-up
- * gives a high idle and a low pulse, so we detect falling edges). */
+/* Last sampled GPIO level.  Active-low signal with a pull-up gives a
+ * high idle and a low pulse, so we detect falling edges. */
 static volatile uint8_t  s_fan_last_level  = 1U;
 static volatile uint8_t  s_pump_last_level = 1U;
 
-/* Latest RPM computed by the task.  Read-only for GUI. */
+/* Latest RPM computed by the task.  Read-only for GUI / CAT. */
 static volatile uint32_t s_fan_rpm  = 0U;
 static volatile uint32_t s_pump_rpm = 0U;
 
+/* HAL_GetTick() at the previous snapshot, for the measured window. */
+static uint32_t s_last_calc_tick = 0U;
+/* The first snapshot has no previous timestamp to measure against. */
+static uint8_t  s_have_last_tick = 0U;
+
 /*============================================================================
  *  Public API
- *============================================================================*/
+ *==========================================================================*/
 
 void fan_tach_init(void)
 {
@@ -54,24 +69,11 @@ void fan_tach_init(void)
     s_pump_last_level  = 1U;
     s_fan_rpm          = 0U;
     s_pump_rpm         = 0U;
+    s_last_calc_tick   = HAL_GetTick();
+    s_have_last_tick   = 1U;
 
     /* PD4 / PD5 are already configured as GPIO_Input with PULLUP in ioc;
-     * nothing else to do here. */
-}
-
-void fan_tach_start(void)
-{
-    HAL_TIM_Base_Stop_IT(&htim7);
-    htim7.Instance->PSC = FAN_TACH_TIM_PRESCALER;
-    htim7.Instance->ARR = FAN_TACH_TIM_PERIOD;
-    __HAL_TIM_SET_COUNTER(&htim7, 0);
-    __HAL_TIM_CLEAR_FLAG(&htim7, TIM_FLAG_UPDATE);
-    HAL_TIM_Base_Start_IT(&htim7);
-}
-
-void fan_tach_stop(void)
-{
-    HAL_TIM_Base_Stop_IT(&htim7);
+     * nothing else to do here.  TIM7 belongs to freq_detect.c. */
 }
 
 void fan_tach_tick(void)
@@ -91,22 +93,33 @@ void fan_tach_tick(void)
     }
     s_fan_last_level  = fan_now;
     s_pump_last_level = pump_now;
-
-    /* Task side reads s_fan_pulse_count every 100 ms and computes RPM. */
 }
 
 uint32_t fan_tach_get_fan_rpm(void)  { return s_fan_rpm;  }
 uint32_t fan_tach_get_pump_rpm(void) { return s_pump_rpm; }
 
+uint32_t fan_tach_get_fan2_rpm(void)
+{
+#if FAN2_TACH_MIRRORS_FAN1
+    /* No PWM channel and no TACH pin of its own - see fan_tach.h. */
+    return s_fan_rpm;
+#else
+    return s_pump_rpm;
+#endif
+}
+
 /*============================================================================
- *  Task-side periodic RPM calculation (100 ms tick)
+ *  Task-side periodic RPM calculation
  *  Not in ISR; integer math, no FPU.
  *============================================================================*/
 void fan_tach_calculate_rpm(void)
 {
-    /* Read pulse counts atomically by stopping the TIM7 interrupt
-     * briefly.  Acceptable because 100 ms / 500 us = 200 ticks = ~1 ms
-     * max gap; no fan-pulse is missed during that small window. */
+    uint32_t now  = HAL_GetTick();
+    uint32_t win_ms;
+
+    /* Read pulse counts atomically by masking interrupts briefly.  This
+     * is a handful of instructions, so no tach pulse is lost - and even
+     * if one were, it would cost 30 RPM for one window. */
     __disable_irq();
     uint32_t fan_count  = s_fan_pulse_count;
     uint32_t pump_count = s_pump_pulse_count;
@@ -114,9 +127,29 @@ void fan_tach_calculate_rpm(void)
     s_pump_pulse_count = 0U;
     __enable_irq();
 
-    /* RPM = count * 60 / (poles * window_seconds)
-     *      = count * 60 * 1000 / (poles * window_ms)
-     *      = count * 60000 / (2 * 100) = count * 300             */
-    s_fan_rpm  = fan_count  * 60U * 1000U / (FAN_POLES * FAN_WINDOW_MS);
-    s_pump_rpm = pump_count * 60U * 1000U / (FAN_POLES * FAN_WINDOW_MS);
+    if (s_have_last_tick == 0U) {
+        /* First call after boot: consume the window, publish nothing. */
+        s_last_calc_tick = now;
+        s_have_last_tick = 1U;
+        return;
+    }
+
+    win_ms = now - s_last_calc_tick;   /* unsigned, wraps correctly */
+    s_last_calc_tick = now;
+
+    if ((win_ms < FAN_WINDOW_MIN_MS) || (win_ms > FAN_WINDOW_MAX_MS)) {
+        /* Window too short to mean anything, or the caller stalled.
+         * Keep the previous reading rather than publish noise. */
+        return;
+    }
+
+    /* RPM = count * 60 / (PPR * window_s)
+     *      = count * 60 * 1000 / (PPR * window_ms)
+     * The uint64_t keeps count * 60000 from overflowing if the window
+     * is long and the fan is fast.  Each channel uses its own PPR - see
+     * the FAN_POLES / PUMP_POLES note at the top of this file. */
+    s_fan_rpm  = (uint32_t)(((uint64_t)fan_count  * 60000ULL) /
+                            (FAN_POLES  * win_ms));
+    s_pump_rpm = (uint32_t)(((uint64_t)pump_count * 60000ULL) /
+                            (PUMP_POLES * win_ms));
 }

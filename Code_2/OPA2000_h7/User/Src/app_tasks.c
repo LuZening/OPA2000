@@ -15,12 +15,26 @@
 #include "fan_tach.h"
 #include "radio_uart.h"
 #include "config.h"
+/* g_freertos_fault, latched by app_task_create_failed() and the FreeRTOS
+ * failure hooks in freertos_hooks.c. */
+#include "opa2000.h"
+/* osDelay() for the external-latch reset pulse in the protection task. */
+#include "cmsis_os2.h"
+/* CLEAR_FAULTX_OC_LOW/HIGH and RF_BIAS_ENABLE/DISABLE pin macros. */
+#include "hw_pinmap.h"
+#include "lv_port_disp.h"
+
+/*!< How long the protection task holds CLEAR_FAULTX_OC and RF_BIAS low when
+ *   the operator dismisses an alert.  Long enough for the external latch to
+ *   reset, short enough that the operator does not notice the PA blink. */
+#define PROTECT_LATCH_CLEAR_MS    100U
 
 /*============================================================================
  * Private Variables
  *============================================================================*/
 
 /* Task handles */
+static TaskHandle_t gui_handler_task_handle = NULL;
 static TaskHandle_t gui_task_handle = NULL;
 static TaskHandle_t adc_task_handle = NULL;
 static TaskHandle_t comm_task_handle = NULL;
@@ -39,82 +53,86 @@ void app_tasks_create(void)
 {
     BaseType_t result;
 
+    /* A task that failed to create never runs, and the symptom appears
+     * somewhere else entirely: a missing Protect task looks exactly like a
+     * working one whose comparator interrupt never fires, and a missing
+     * Monitor task looks like the power rail never coming up.  There is no
+     * way to recover from it either - the scheduler is already running by
+     * the time anyone notices.  So: name the task, then stop.  No printing
+     * (the heap is exactly what just ran out) and no RTOS calls. */
+#define OPA2000_REQUIRE_TASK(name, fn, stack, prio, handle)          \
+    do {                                                             \
+        result = xTaskCreate((fn), (name), (stack), NULL, (prio),    \
+                             &(handle));                              \
+        if (result != pdPASS) {                                      \
+            g_freertos_fault = 0xDEAD0003U;                          \
+            app_task_create_failed(name);                           \
+        }                                                            \
+    } while (0)
+
     /* GUI Task */
-    result = xTaskCreate(
-        app_gui_task,
-        "GUI Task",
-        STACK_SIZE_GUI_TASK,
-        NULL,
-        PRIORITY_GUI_TASK,
-        &gui_task_handle
-    );
-    if (result != pdPASS) {
-        /* Error handling */
-    }
+    OPA2000_REQUIRE_TASK("GUI Handler", app_gui_handler_task,
+                         STACK_SIZE_GUI_TASK, PRIORITY_GUI_TASK,
+                         gui_handler_task_handle);
+
+    OPA2000_REQUIRE_TASK("GUI Task", app_gui_task,
+                         STACK_SIZE_GUI_TASK, PRIORITY_GUI_TASK,
+                         gui_task_handle);
 
     /* ADC Task */
-    result = xTaskCreate(
-        app_adc_task,
-        "ADC Task",
-        STACK_SIZE_ADC_TASK,
-        NULL,
-        PRIORITY_ADC_TASK,
-        &adc_task_handle
-    );
-    if (result != pdPASS) {
-        /* Error handling */
-    }
+    OPA2000_REQUIRE_TASK("ADC Task", app_adc_task,
+                         STACK_SIZE_ADC_TASK, PRIORITY_ADC_TASK,
+                         adc_task_handle);
 
     /* Communication Task */
-    result = xTaskCreate(
-        app_comm_task,
-        "Comm Task",
-        STACK_SIZE_COMM_TASK,
-        NULL,
-        PRIORITY_COMM_TASK,
-        &comm_task_handle
-    );
-    if (result != pdPASS) {
-        /* Error handling */
-    }
+    OPA2000_REQUIRE_TASK("Comm Task", app_comm_task,
+                         STACK_SIZE_COMM_TASK, PRIORITY_COMM_TASK,
+                         comm_task_handle);
 
     /* Monitor Task */
-    result = xTaskCreate(
-        app_monitor_task,
-        "Monitor Task",
-        STACK_SIZE_MONITOR_TASK,
-        NULL,
-        PRIORITY_MONITOR_TASK,
-        &monitor_task_handle
-    );
-    if (result != pdPASS) {
-        /* Error handling */
-    }
+    OPA2000_REQUIRE_TASK("Monitor Task", app_monitor_task,
+                         STACK_SIZE_MONITOR_TASK, PRIORITY_MONITOR_TASK,
+                         monitor_task_handle);
 
     /* Protection Task */
-    result = xTaskCreate(
-        app_protect_task,
-        "Protect Task",
-        STACK_SIZE_PROTECT_TASK,
-        NULL,
-        PRIORITY_PROTECT_TASK,
-        &protect_task_handle
-    );
-    if (result != pdPASS) {
-        /* Error handling */
-    }
+    OPA2000_REQUIRE_TASK("Protect Task", app_protect_task,
+                         STACK_SIZE_PROTECT_TASK, PRIORITY_PROTECT_TASK,
+                         protect_task_handle);
 
     /* Config Save Task - lowest priority, see app_config_task() */
-    result = xTaskCreate(
-        app_config_task,
-        "Config Task",
-        STACK_SIZE_CONFIG_TASK,
-        NULL,
-        PRIORITY_CONFIG_TASK,
-        &config_task_handle
-    );
-    if (result != pdPASS) {
-        /* Error handling */
+    OPA2000_REQUIRE_TASK("Config Task", app_config_task,
+                         STACK_SIZE_CONFIG_TASK, PRIORITY_CONFIG_TASK,
+                         config_task_handle);
+
+#undef OPA2000_REQUIRE_TASK
+}
+
+void app_gui_handler_task(void* argument)
+{
+    (void)argument;
+
+
+    /* Start GUI */
+    osThreadFlagsWait(0x01U, osFlagsWaitAll, osWaitForever); // wait for start signal, after GUI init
+    while (1)
+    {
+        gui_lock();
+        /* Process LVGL handler */
+        uint32_t time_till_next_ms = lv_task_handler();
+        gui_unlock();
+        osDelay(pdMS_TO_TICKS(time_till_next_ms));
+    }
+}
+
+void app_task_create_failed(const char *task_name)
+{
+    /* g_freertos_fault is already latched by the caller.  Park here with
+     * interrupts off: a half-built task set is not a state the protection
+     * chain can safely run in, and continuing would let the PA be keyed
+     * with no Protect task watching. */
+    (void)task_name;
+    __disable_irq();
+    for (;;) {
     }
 }
 
@@ -124,45 +142,39 @@ void app_tasks_create(void)
 void app_gui_task(void *argument)
 {
     TickType_t last_wake_time;
-
-    (void)argument;
-
-    last_wake_time = xTaskGetTickCount();
-
-    /* Initialize GUI */
-    gui_init();
-
-    /* Start GUI */
-    gui_start();
-
     /* touch_init() and the g_calibration_required flag were already set
      * by main() before osKernelStart().  We only need to land on the
      * right first screen.  Re-check the flag once here in case the
      * touch calibration menu (if displayed) toggles it. */
+//    for(int i = 0; i< LCD_WIDTH * LCD_HEIGHT; ++i)
+//        lcd_framebuffer[i] = 0x1234;
+
+    /* Initialize GUI */
+    gui_init();
+#if 1
     if (g_calibration_required) {
         gui_show_calibration();
     }
-
+#endif
     /* Note: touch driver is already running (probed in main() during
      * the single-threaded boot step), so we go straight into the
      * polling loop here. */
-
+    osThreadFlagsSet(gui_handler_task_handle, 0x01U); // allow LVGL handler routine to start
+    last_wake_time = xTaskGetTickCount();
     while (1) {
-        /* Process LVGL tick */
-        gui_tick();
-
+        gui_lock();
+        /* Process LVGL handler */
+//        HAL_IWDG_Refresh(&hiwdg1);
         /* Kick off the next touch poll.  The samples themselves arrive via
          * the I2C2 DMA completion interrupt and are read by LVGL's indev
          * read_cb inside gui_tick() above - the GUI never has to look at a
          * touch sample itself. */
         touch_process();
-
         /* Process calibration input during calibration */
         gui_process_calibration();
         gui_process_coupler_cal();
         gui_update_sensor_inspect();
-
-        /* Update display values */
+        /* Update display values, enable TFT display */
         gui_update_display();
 
         /* ================= 保护告警弹窗 =================
@@ -189,10 +201,13 @@ void app_gui_task(void *argument)
             }
         }
 
-        /* 10ms tick */
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(10));
+        gui_unlock();
+        /* 50ms tick */
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(50));
     }
 }
+
+
 
 /**
  * @brief ADC Task - processes ADC data
@@ -214,7 +229,7 @@ void app_adc_task(void *argument)
            runs from the ADC1 DMA interrupt, so the task-side call is only
            a second, slower consumer of the same data - not the primary
            path. */
-        adc_process();
+//        adc_process();
 
         /* 上电稳定等待 + CC6920 主电流零点校准（user_adc.c 里的状态机）。
            它一次性包办了整段上电流程，所以这里不可能漏掉某一步，也不
@@ -240,14 +255,22 @@ void app_adc_task(void *argument)
            的情况下把 ADC 噪声平均掉，而上电时高压还没建立。
 
            自限：g_config.im_calibrated 一旦置位状态机立刻返回，所以成功
-           之后每拍只剩一次取值+分支。失败则自己重试 3 次，仍不过就自己
-           拉起 ALERT_HARDWARE_FAULT——两种情况都不需要操作员干预。 */
+           之后每拍只剩一次取值+分支。失败则一直重试下去、不再告警——
+           零点偏移不收敛多半是冷机/热机漂移而不是硬件坏了，对它报警只会
+           训练操作员忽略告警。代价是失败时放大器一直无法起振
+           （g_allow_rf 保持为假），但不会有误动作。 */
         (void)adc_stabilisation_tick();
 
         /* Advance the coupler-2 peak holds for the GUI bar graphs.  Task
            context on purpose: the release step uses expf(), which must not
            run in the priority-0 DMA interrupt. */
         adc_peak_hold_tick();
+
+        /* Re-arm the ADC2 injected conversions (NTC core, NTC aux, die
+           temp).  They are configured software-start with no trigger, so
+           they run once and park - without this the NTC numbers freeze at
+           whatever they read at boot.  Self-gated to 100 ms. */
+        adc_injected_tick();
 
         /* Transmit gate (design spec step 6): the amplifier may only be
            keyed once ALL THREE halves are true -
@@ -343,7 +366,7 @@ void app_comm_task(void *argument)
         /* 5) Plain delay rather than vTaskDelayUntil(): radio_uart_wait_frame
          *    blocks for an unpredictable time, so the "absolute deadline"
          *    anchor no longer matches.  10 ms keeps the loop responsive. */
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -366,6 +389,11 @@ void app_monitor_task(void *argument)
     /* Initialize power control */
     power_init();
     buzzer_init();
+
+    /* TACH edge counters.  The ISR itself is armed by freq_detect_init()
+     * (it owns TIM7); this only clears the counters and seeds the RPM
+     * window timestamp so the first snapshot has a baseline. */
+    fan_tach_init();
 
     /* Initialize PTT state tracking based on current GPIO state */
     ptt_last_handled = power_get_ptt_state();
@@ -439,8 +467,53 @@ void app_monitor_task(void *argument)
         }   /* slow_div */
 
         /* 10ms tick: sets the HV rail sequencing resolution. */
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(10));
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
     }
+}
+
+/**
+ * @brief External fault latch reset pulse - runs in the protection task
+ *
+ *  CLEAR_FAULTX_OC (PG1) is open-drain into C65-2 / D10-1 / R71-1.  Holding
+ *  it low is what actually resets the external fault latch; left floating,
+ *  the latch stays closed - so the operator taps "OK", the firmware's own
+ *  latch clears, and the hardware fault survives.
+ *
+ *  RF_BIAS (PG2) goes down for the same window.  The latch reset is only
+ *  meaningful while the PA is not being driven, and cutting the bias for
+ *  100 ms stops an RF-side event from re-latching the fault in the instant
+ *  the reset takes effect.
+ *
+ *  RF_BIAS is restored to whatever it was, not blindly enabled: a P0
+ *  shutdown already dropped it (protection_trigger_locked() step 4) and a P1
+ *  dismissal never raised it.  Enabling it unconditionally would key a PA
+ *  the operator had deliberately left idle, or undo a shutdown that is
+ *  still meant to hold.
+ *
+ *  Why this task does the delay: app_monitor_task (priority 5) runs
+ *  power_rail_step() on a 10 ms tick, and power_rail_step() calls
+ *  RF_BIAS_ENABLE().  The protection task sits at priority 6, so osDelay()
+ *  here keeps the monitor out for the whole window and the level we restore
+ *  is genuinely the level we sampled.  Nothing of consequence runs below
+ *  priority 5, so the 100 ms costs only the monitor's fan curve.
+ */
+static void protect_task_latch_clear_pulse(void)
+{
+    /* Sample BEFORE pulling anything down - reading afterwards would of
+     * course just return the level we ourselves wrote. */
+    GPIO_PinState bias_was = HAL_GPIO_ReadPin(RF_BIAS_GPIO_Port, RF_BIAS_Pin);
+
+    CLEAR_FAULTX_OC_LOW();
+    RF_BIAS_DISABLE();
+
+    osDelay(pdMS_TO_TICKS(PROTECT_LATCH_CLEAR_MS));
+
+    CLEAR_FAULTX_OC_HIGH();
+    if (bias_was == GPIO_PIN_SET) {
+        RF_BIAS_ENABLE();
+    }
+    /* else: leave it low.  It was low going in, so either the PA is idle or
+     * a P0 shutdown is still in force - both want it to stay down. */
 }
 
 /**
@@ -464,6 +537,14 @@ void app_protect_task(void *argument)
     freq_detect_start();
 
     while (1) {
+        /* External latch reset requested by a dismiss.  Runs before
+         * protection_check() so the hardware latch is back to a known state
+         * as early as possible, and costs one 100 ms osDelay in which only
+         * the monitor task (priority 5) gets to run. */
+        if (protection_take_latch_clear_request()) {
+            protect_task_latch_clear_pulse();
+        }
+
         /* Backstop for the conditions that have no hardware watchdog.  Runs
          * unconditionally: NTC over-temperature applies while idle too, and
          * the coupler limits inside protection_check() gate on g_tx_active

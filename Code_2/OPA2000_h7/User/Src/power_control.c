@@ -238,6 +238,13 @@ void power_set_fan_speed(uint8_t speed_percent)
     uint32_t pulse = ((uint32_t)speed_percent * (PWM_TIM3_PERIOD + 1U) + 50U) / 100U;
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pulse);
 
+    /* The coolant pump runs in lockstep with FAN1 on this board: same duty,
+     * no separate control.  Writing its CCR here rather than leaving it to
+     * a caller is what makes the PUMP TACH (PD5) actually pulse - with the
+     * pump parked at 0 % the tach line is static and reports 0 rpm, which
+     * reads exactly like a failed pump. */
+    power_set_pump_speed(speed_percent);
+
     if      (speed_percent == 0U)  g_fan_speed = FAN_SPEED_LOW; /* off still maps to LOW */
     else if (speed_percent < 70U)  g_fan_speed = FAN_SPEED_LOW;
     else if (speed_percent < 90U)  g_fan_speed = FAN_SPEED_MED;

@@ -172,6 +172,18 @@ volatile uint32_t g_touch_recoveries  = 0U;
  *  调试用：把阈值调准之前，先看这个数在按与不按时的实际范围。 */
 volatile uint32_t g_touch_raw_z       = 0U;
 
+/*!< Z1 / Z2 两笔 12 位转换的**未经合成**的原始读数，各 0..4095。
+ *
+ *  g_touch_raw_z 是 NS2009_PRESSURE() 合成后的压力
+ *  (|(4095-Z2)+Z1|)，掉了阈值到底该动 Z1 还是 Z2 的信息就看不出来了。
+ *  判定门限 NS2009_Z_PRESS_THRESHOLD 比的正是 g_touch_raw_z，所以现场
+ *  标定时需要的是这两个数本身：空闲基线多少、轻触时哪个动、动多少。
+ *
+ *  只在 NS2009 路径更新。GT911（电容屏）没有这两笔转换，这两个值保持
+ *  0 - 电容屏本来就不测压力。 */
+volatile uint16_t g_touch_raw_z1      = 0U;
+volatile uint16_t g_touch_raw_z2      = 0U;
+
 /*============================================================================
  * 私有状态
  *============================================================================*/
@@ -576,14 +588,15 @@ void HAL_I2C_AbortCpltCallback(I2C_HandleTypeDef *hi2c)
  */
 void touch_init(void)
 {
+    HAL_GPIO_WritePin(CTouch_RSTX_GPIO_Port, CTouch_RSTX_Pin, 0);
+    HAL_Delay(10);
+    HAL_GPIO_WritePin(CTouch_RSTX_GPIO_Port, CTouch_RSTX_Pin, 1);
     detected_touch_type = touch_detect_type();
     g_touch_type = detected_touch_type;
 
     if (detected_touch_type == TOUCH_RESISTIVE) {
-        s_resistive_is_ns2009 = true;
         /* NS2009 上电后无需配置，探测成功即代表就绪。 */
     } else if (detected_touch_type == TOUCH_CAPACITIVE) {
-        s_resistive_is_ns2009 = false;
         touch_capacitive_init();
     }
 

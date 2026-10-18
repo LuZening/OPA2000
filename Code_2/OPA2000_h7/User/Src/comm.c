@@ -41,6 +41,7 @@
 #include "opa2000.h"
 #include "freq_detect.h"
 #include "flash_eeprom.h"
+#include "fan_tach.h"
 #include "string.h"
 #include "stdio.h"
 #include <stdlib.h>
@@ -296,11 +297,14 @@ static void comm_format_status_line(char *buf, size_t cap)
     uint8_t ptt = g_tx_active ? 1U : 0U;
     uint8_t hv  = g_hv_on ? 1U : 0U;
     uint8_t psu = g_psu_on ? 1U : 0U;
-    /* fan= 字段：mode|status|ntc_fault
+    /* set_fan= 字段：mode|status|ntc_fault
      *   mode: 'A' = AUTO, 'M' = MANUAL
      *   status: 0/1/2 = LOW/MED/HIGH  (与现有 status banner 复用)
      *   ntc_fault: 1 = 传感器开路/短路，0 = 正常
-     * 用 '|' 分隔避免与现有 ',' 风格冲突。 */
+     * 用 '|' 分隔避免与现有 ',' 风格冲突。
+     * 叫 set_fan 而不是 fan：这里报的是"命令"（模式+档位），而
+     * rpm1/rpm2/pump 是 TACH "测量"。两者混在一个 fan= 里，PC 端
+     * 分不清读到的是设定值还是实测值。 */
     char fan_buf[8];
     snprintf(fan_buf, sizeof fan_buf, "%c|%u|%u",
              (power_get_fan_mode() == FAN_MODE_AUTO) ? 'A' : 'M',
@@ -310,7 +314,7 @@ static void comm_format_status_line(char *buf, size_t cap)
     snprintf(buf, cap,
         "status pwr=%s band=%s freq=%lu fwd=%ld rev=%ld "
         "swr=%ld.%ld v=%ld im=%ld.%02ld temp=%ld "
-        "ptt=%u hv=%u psu=%u fan=%s alert=%d",
+        "ptt=%u hv=%u psu=%u set_fan=%s rpm1=%lu rpm2=%lu pump=%lu alert=%d",
         comm_power_state_str(),
         comm_band_str(g_current_band),
         (unsigned long)freq,
@@ -321,6 +325,9 @@ static void comm_format_status_line(char *buf, size_t cap)
         (long)temp_t,
         (unsigned)ptt, (unsigned)hv, (unsigned)psu,
         fan_buf,
+        (unsigned long)fan_tach_get_fan_rpm(),
+        (unsigned long)fan_tach_get_fan2_rpm(),
+        (unsigned long)fan_tach_get_pump_rpm(),
         (int)g_alert_active);
 }
 
@@ -504,6 +511,14 @@ static void comm_query_var(const char *name)
         comm_send_line(buf);
         return;
     }
+    if (strcmp(name, "fan") == 0 || strcmp(name, "rpm") == 0) {
+        snprintf(buf, sizeof buf, "rpm1=%lu rpm2=%lu pump=%lu",
+                 (unsigned long)fan_tach_get_fan_rpm(),
+                 (unsigned long)fan_tach_get_fan2_rpm(),
+                 (unsigned long)fan_tach_get_pump_rpm());
+        comm_send_line(buf);
+        return;
+    }
     if (strcmp(name, "config") == 0) {
         comm_format_status_line(buf, sizeof buf);
         comm_send_line(buf);
@@ -533,9 +548,11 @@ static void comm_action_help(void)
         "Response: each line ends with \\r\\n.",
         "",
         "-- Query (name?) --",
-        "  status         one line: pwr band freq fwd rev swr v im temp ptt hv psu alert",
+        "  status         one line: pwr band freq fwd rev swr v im temp ptt hv",
+        "                  psu set_fan rpm1 rpm2 pump alert",
         "  config         alias of status",
         "  freq           last valid radio frequency in Hz",
+        "  fan / rpm      measured TACH rpm: rpm1 rpm2 pump",
         "  band / protocol   auto|icom|yaesu|kenwood",
         "  lang           chinese|english",
         "  radio_baud     current CAT baud in bps",

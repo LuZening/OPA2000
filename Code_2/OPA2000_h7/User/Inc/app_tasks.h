@@ -19,7 +19,7 @@ extern "C" {
 
 #define PRIORITY_GUI_TASK        3
 #define PRIORITY_ADC_TASK        4
-#define PRIORITY_COMM_TASK       3
+#define PRIORITY_COMM_TASK       2
 #define PRIORITY_MONITOR_TASK    5
 #define PRIORITY_PROTECT_TASK    6
 
@@ -48,6 +48,21 @@ extern "C" {
  * @brief Create all FreeRTOS tasks
  */
 void app_tasks_create(void);
+
+
+void app_gui_handler_task(void* argument);
+
+/**
+ * @brief Called when xTaskCreate fails, for any task
+ *
+ * Latches g_freertos_fault and halts with interrupts off.  There is no
+ * safe way to carry on: a task set with a hole in it looks, from the
+ * outside, exactly like a healthy system whose interrupts never fire.
+ * Never returns.
+ *
+ * @param task_name Name of the task that could not be created
+ */
+void app_task_create_failed(const char *task_name);
 
 /**
  * @brief GUI Task

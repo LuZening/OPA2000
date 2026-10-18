@@ -173,6 +173,28 @@ HAL_StatusTypeDef HAL_DAC_SetValue(DAC_HandleTypeDef *hdac, uint32_t Channel,
                                    uint32_t Alignment, uint32_t Data);
 HAL_StatusTypeDef HAL_DAC_Start (DAC_HandleTypeDef *hdac, uint32_t Channel);
 
+/*============================================================================
+ *  COMP stub
+ *
+ *  user_adc.c starts both comparators at the moment the stabilisation gate
+ *  arms, so the host build needs the handles and the call to link.  Only the
+ *  "did it succeed" answer matters here - the analog behaviour is the
+ *  firmware's business, not the host tests'.
+ *==========================================================================*/
+
+typedef struct {
+    uint32_t CR;
+} COMP_TypeDef;
+
+typedef struct {
+    COMP_TypeDef *Instance;
+} COMP_HandleTypeDef;
+
+extern COMP_HandleTypeDef hcomp1;
+extern COMP_HandleTypeDef hcomp2;
+
+HAL_StatusTypeDef HAL_COMP_Start_IT(COMP_HandleTypeDef *hcomp);
+
 
 typedef enum {
     DMA_PERIPH_TO_MEMORY = 0U,
@@ -244,6 +266,13 @@ void     HAL_Delay(uint32_t ms);
  * does not come back. */
 void __WFI(void);
 void     Error_Handler(void);
+
+/* CMSIS interrupt-mask intrinsics.  On the host there is nothing to mask:
+ * the "ISR" is fan_tach_tick() called straight from the test, so these
+ * are no-ops that only need to exist for the linker.  A real build gets
+ * them from stm32h7xx_hal.h / cmsis_gcc.h. */
+#define __disable_irq()  ((void)0)
+#define __enable_irq()   ((void)0)
 
 void     test_wall_clock_reset(void);
 void     test_wall_clock_advance(uint32_t ms);

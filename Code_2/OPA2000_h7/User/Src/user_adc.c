@@ -30,6 +30,7 @@
  */
 
 #include "user_adc.h"
+#include "boot.h"
 #include "stm32h7xx_hal.h"
 #include <string.h>
 #include <math.h>
@@ -84,6 +85,51 @@ static im_cal_state_t s_im_cal = { .phase = 1U, .retry = 0U,
  * Tolerance: ±40 mV -> ±1048 LSB. */
 #define IM_ZERO_EXPECTED     43254
 #define IM_ZERO_TOLERANCE    1048
+
+/*============================================================================
+ *  Power-on stabilisation gate
+ *============================================================================
+ *
+ *  The analog front end is not trustworthy the instant the peripherals come
+ *  up: the rail is still charging, the D5/R40 peak detector is climbing out
+ *  of its reset floor, and the CC6920 output is wherever the bias network
+ *  happens to sit.  Sampling it early yields a wrong zero offset and, worse,
+ *  a displayed reading that jumps around.
+ *
+ *  Three stages, in this order:
+ *
+ *    SETTLING   1 s from the first tick.  Nothing is believed and no
+ *               threshold is armed - boot_hold_thresholds_open() already
+ *               parked every watchdog at full scale, so nothing can latch.
+ *               CLEAR_FAULTX_OC is held low throughout, which keeps the
+ *               external fault latch in its cleared state.
+ *    CALIBRATING  the CC6920 zero-offset calibration runs (the existing
+ *               IM_CAL_SAMPLE_COUNT-window state machine below).
+ *    ARMED      calibration passed: the real AWD/COMP limits are pushed,
+ *               CLEAR_FAULTX_OC is released, the GUI starts showing ADC
+ *               values, and g_ptt_ready may finally go true.
+ *
+ *  Only the ADC task ticks this, so the stage advances at a predictable
+ *  50 ms regardless of what the other tasks are doing.
+ *==========================================================================*/
+
+#define STAB_SETTLE_TICKS    20U   /* 20 ticks x 50 ms = 1.0 s */
+
+typedef enum {
+    STAB_SETTLING = 0,
+    STAB_CALIBRATING,
+    STAB_ARMED
+} stab_stage_t;
+
+static stab_stage_t s_stab_stage = STAB_SETTLING;
+static uint8_t       s_stab_ticks = 0U;
+
+/** @brief True once the settling period has passed and the limits are armed.
+ *  Power_control gates PTT on this via g_ptt_ready. */
+bool adc_stabilisation_done(void)
+{
+    return s_stab_stage == STAB_ARMED;
+}
 
 /*============================================================================
  *  Peak-hold (peak detector with exponential release)
@@ -201,6 +247,15 @@ void adc_init(void)
     g_adc_data.fwd2_peak_mW = 0;
     g_adc_data.rev2_peak_mW = 0;
 
+    /* Power-on stabilisation restarts too.  adc_init() runs once per boot
+     * from app_adc_task(), so without this a soft restart (or a unit test
+     * calling adc_init() to reset the module) would leave the gate sitting
+     * in STAB_ARMED from the previous run and skip the settling window
+     * entirely - i.e. it would key the amplifier on readings taken while
+     * the analog side was still moving. */
+    s_stab_stage          = STAB_SETTLING;
+    s_stab_ticks          = 0U;
+
     /* Allow calibration to re-arm on every boot. */
     g_config.im_calibrated    = 0U;
     g_allow_rf                = false;
@@ -310,11 +365,61 @@ void adc_process(void)
 }
 
 /*============================================================================
+ *  Power-on stabilisation driver
+ *============================================================================*/
+
+bool adc_stabilisation_tick(void)
+{
+    switch (s_stab_stage) {
+    case STAB_SETTLING:
+        /* Hold CLEAR_FAULTX_OC low for the whole settling window.  The pin
+         * is open-collector on the board (C65-2 / D10-1 / R71-1), so driving
+         * it low is what actually resets the external fault latch - a plain
+         * GPIO write high would merely release it. */
+        CLEAR_FAULTX_OC_LOW();
+
+        if (++s_stab_ticks >= STAB_SETTLE_TICKS) {
+            s_stab_stage = STAB_CALIBRATING;
+            /* Fresh calibration window: main() may have loaded a stored
+             * im_zero_offset_adc, but we want one measured now that the
+             * analog side is settled. */
+            g_config.im_calibrated   = 0U;
+            g_allow_rf               = false;
+            s_im_cal.phase           = 1U;
+            s_im_cal.retry           = 0U;
+            s_im_cal.sample_idx      = 0U;
+        }
+        return false;
+
+    case STAB_CALIBRATING:
+        /* CLEAR_FAULTX_OC stays low until the calibration has actually
+         * produced a usable offset. */
+        CLEAR_FAULTX_OC_LOW();
+
+        if (adc_im_zero_offset_tick()) {
+            /* Calibration passed.  This is the first moment the readings
+             * can be believed, so this is where the real limits go out -
+             * boot_arm_thresholds() both closes the settling gate and
+             * applies, so the very next call to boot_apply_thresholds()
+             * (a band change, a Settings edit) works normally again. */
+            boot_arm_thresholds((int)g_current_band);
+            CLEAR_FAULTX_OC_HIGH();
+            s_stab_stage = STAB_ARMED;
+            return true;
+        }
+        return false;
+
+    case STAB_ARMED:
+    default:
+        return true;
+    }
+}
+
+/*============================================================================
  *  IM zero-offset state machine
  *============================================================================*/
 
-bool adc_im_zero_offset_tick(void)
-{
+bool adc_im_zero_offset_tick(void){
     if (g_config.im_calibrated) {
         return true;
     }

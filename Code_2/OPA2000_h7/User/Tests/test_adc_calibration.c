@@ -319,37 +319,28 @@ TEST_CASE(mcu_internal_sensor_clamps_below_range)
 
 /*============================================================================
  *  Analog watchdog threshold setters
+ *
+ *  AWD2 (main current) has a published transfer function, so its threshold is
+ *  computed from the datasheet sensor law and is tested against that law.
+ *
+ *  AWD1 (RF input) and AWD3 (coupler 1 reverse) deliberately do NOT convert
+ *  milliwatts into ADC codes yet: the divider network in front of each pin is
+ *  still being brought up, and a single shared "mW to raw" formula would be
+ *  wrong for at least one of them.  adc_calibration.c leaves the high
+ *  threshold at 0 with a TODO until each channel's analog path is measured.
+ *
+ *  The tests below pin that known state: the threshold stays 0 and only the
+ *  low threshold is cleared.  When the conversion is filled in, these cases
+ *  are the ones to replace with round-trip checks.
  *==========================================================================*/
 
-TEST_CASE(awd1_threshold_saturates_at_full_scale)
+TEST_CASE(awd1_threshold_stays_disabled_until_the_divider_is_known)
 {
     opa2000_init();
-    /* Full scale is about 1579 W with 33 turns, so 2000 W must clamp. */
+    /* TODO: replace with a round-trip once adc_awd_set_rf_in_mW() converts
+       milliwatts using the measured RF input divider. */
     adc_awd_set_rf_in_mW(2000000);
-    ASSERT_EQ(ADC1->HTR1, 65535);
-    ASSERT_EQ(ADC1->LTR1, 0);
-}
-
-/* The AWD setters take milliwatts but the watchdog compares raw codes, so
- * they invert the coupler curve.  Rather than pinning magic code values,
- * round-trip the programmed code back through the forward conversion and
- * require the power to come back within 2 %. */
-static void assert_awd_code_round_trips(uint32_t code, uint32_t want_mW)
-{
-    int32_t back = adc1_raw_to_fwd1_mW((uint16_t)code);
-    int32_t lo   = (int32_t)((uint64_t)want_mW * 98 / 100);
-    int32_t hi   = (int32_t)((uint64_t)want_mW * 102 / 100);
-    ASSERT_GE(back, lo);
-    ASSERT_LE(back, hi);
-}
-
-TEST_CASE(awd1_threshold_inverts_the_coupler_curve)
-{
-    opa2000_init();
-    adc_awd_set_rf_in_mW(400000);
-    assert_awd_code_round_trips(ADC1->HTR1, 400000);
-    adc_awd_set_rf_in_mW(1100000);
-    assert_awd_code_round_trips(ADC1->HTR1, 1100000);
+    ASSERT_EQ(ADC1->HTR1, 0);
     ASSERT_EQ(ADC1->LTR1, 0);
 }
 
@@ -364,40 +355,39 @@ TEST_CASE(awd2_threshold_is_offset_from_the_zero_point)
     ASSERT_EQ(ADC1->LTR2, 0);
 }
 
-TEST_CASE(awd3_threshold_inverts_the_coupler_curve)
+TEST_CASE(awd3_threshold_stays_disabled_until_the_coupler_is_known)
 {
+    opa2000_init();
+    /* TODO: replace with a round-trip once adc_awd_set_rev1_mW() converts
+       milliwatts using the measured coupler 1 / diode detector path. */
     adc_awd_set_rev1_mW(800000);
-    assert_awd_code_round_trips(ADC1->HTR3, 800000);
+    ASSERT_EQ(ADC1->HTR3, 0);
     ASSERT_EQ(ADC1->LTR3, 0);
 }
 
-TEST_CASE(awd_thresholds_saturate_instead_of_wrapping)
+TEST_CASE(awd2_threshold_saturates_instead_of_wrapping)
 {
     opa2000_init();
     /* A threshold beyond the 16-bit code range must clamp to full scale,
      * not wrap around to a tiny value that would trip instantly. */
-    adc_awd_set_rf_in_mW(4000000);
-    ASSERT_EQ(ADC1->HTR1, 65535);
-
     adc_awd_set_im_mA(60000);
     ASSERT_EQ(ADC1->HTR2, 65535);
+    ASSERT_EQ(ADC1->LTR2, 0);
 }
 
-TEST_CASE(awd_thresholds_are_independent_per_watchdog)
+TEST_CASE(awd2_threshold_is_independent_of_the_uncalibrated_ones)
 {
     opa2000_init();
     g_config.im_calibrated      = 1U;
     g_config.im_zero_offset_adc = 43254U;
 
-    adc_awd_set_rf_in_mW(200000);   /* 200 W */
-    adc_awd_set_im_mA(10000);       /* 10 A  */
-    adc_awd_set_rev1_mW(300000);     /* 300 W */
+    adc_awd_set_rf_in_mW(200000);   /* not converted yet */
+    adc_awd_set_im_mA(10000);       /* 10 A above the zero point */
+    adc_awd_set_rev1_mW(300000);    /* not converted yet */
 
-    assert_awd_code_round_trips(ADC1->HTR1, 200000);
-    ASSERT_EQ(ADC1->HTR2, 43254U + 6920U);   /* 10 A above the zero point */
-    assert_awd_code_round_trips(ADC1->HTR3, 300000);
-    ASSERT_NE(ADC1->HTR1, ADC1->HTR2);
-    ASSERT_NE(ADC1->HTR2, ADC1->HTR3);
+    ASSERT_EQ(ADC1->HTR1, 0);
+    ASSERT_EQ(ADC1->HTR2, 43254U + 6920U);
+    ASSERT_EQ(ADC1->HTR3, 0);
 }
 
 /*============================================================================
@@ -432,11 +422,10 @@ const test_entry_t g_suite_adc_calibration[] = {
     TEST_ENTRY(mcu_internal_sensor_zero_c_is_300mV),
     TEST_ENTRY(mcu_internal_sensor_100c_is_4_3V),
     TEST_ENTRY(mcu_internal_sensor_clamps_below_range),
-    TEST_ENTRY(awd1_threshold_saturates_at_full_scale),
-    TEST_ENTRY(awd1_threshold_inverts_the_coupler_curve),
+    TEST_ENTRY(awd1_threshold_stays_disabled_until_the_divider_is_known),
     TEST_ENTRY(awd2_threshold_is_offset_from_the_zero_point),
-    TEST_ENTRY(awd3_threshold_inverts_the_coupler_curve),
-    TEST_ENTRY(awd_thresholds_saturate_instead_of_wrapping),
-    TEST_ENTRY(awd_thresholds_are_independent_per_watchdog),
+    TEST_ENTRY(awd3_threshold_stays_disabled_until_the_coupler_is_known),
+    TEST_ENTRY(awd2_threshold_saturates_instead_of_wrapping),
+    TEST_ENTRY(awd2_threshold_is_independent_of_the_uncalibrated_ones),
     TEST_SUITE_END
 };

@@ -163,6 +163,25 @@ extern "C" {
 #define RF_IN_PROTECT_RAISE()   HAL_GPIO_WritePin(RF_IN_PROTECT_GPIO_Port, RF_IN_PROTECT_Pin, GPIO_PIN_SET)
 #define RF_IN_PROTECT_CLEAR()   HAL_GPIO_WritePin(RF_IN_PROTECT_GPIO_Port, RF_IN_PROTECT_Pin, GPIO_PIN_RESET)
 
+/* CLEAR_FAULTX_OC (PG1): GPIO output, open-drain (GPIO_MODE_OUTPUT_OD),
+ * wired to C65-2 / D10-1 / R71-1.  Open-drain means the pin can only pull
+ * the net down - it cannot drive it high.  So:
+ *
+ *   LOW  = the pin pulls the net low  -> the external fault latch is held
+ *          in its cleared state and no latched alarm survives.
+ *   HIGH = the output stage is released -> the net floats back to its
+ *          pull-up and the latch works normally again.
+ *
+ * Written HIGH at the end of MX_GPIO_Init(), i.e. the reset state is
+ * "normal operation"; boot then drives it LOW for the whole power-on
+ * stabilisation window (see adc_stabilisation_tick() in user_adc.c) and
+ * releases it only once the readings are trustworthy.
+ *
+ * CLEAR_FAULTX_OC_GPIO_Port / CLEAR_FAULTX_OC_Pin come straight from
+ * main.h (PG1), so no alias is needed. */
+#define CLEAR_FAULTX_OC_LOW()   HAL_GPIO_WritePin(CLEAR_FAULTX_OC_GPIO_Port, CLEAR_FAULTX_OC_Pin, GPIO_PIN_RESET)
+#define CLEAR_FAULTX_OC_HIGH()  HAL_GPIO_WritePin(CLEAR_FAULTX_OC_GPIO_Port, CLEAR_FAULTX_OC_Pin, GPIO_PIN_SET)
+
 /* CPU_READY (PD8): GPIO output (status indication).
  * CPU_READY_GPIO_Port / CPU_READY_Pin come straight from main.h. */
 

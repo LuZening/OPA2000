@@ -143,6 +143,7 @@ static int32_t dc_raw_to_mW(uint16_t raw)
  * thresholds, which live in ADC code space. */
 static uint32_t dc_mW_to_raw(uint32_t mw)
 {
+    // TODO: 由用户根据电路结构来修改
     uint32_t vrf_mV, v_mV, raw;
 
     if (mw == 0U) return 0U;
@@ -265,7 +266,8 @@ static uint32_t ma_to_adc_code(uint32_t ma)
 
 void adc_awd_set_rf_in_mW(uint32_t max_mW)
 {
-    ADC1->HTR1 = dc_mW_to_raw(max_mW);
+    // TODO: 由用户根据输入探测分压电路结构来计算
+//    ADC1->HTR1 = dc_mW_to_raw(max_mW);
     ADC1->LTR1 = 0u;
 }
 
@@ -278,6 +280,7 @@ void adc_awd_set_im_mA(uint16_t max_mA)
 /*! AWD3 watches coupler 1 reverse power (PA -> LPF side). */
 void adc_awd_set_rev1_mW(uint32_t max_mW)
 {
-    ADC1->HTR3 = dc_mW_to_raw(max_mW);
+    // TODO: 由用户根据Coupler1电路结构来计算
+//    ADC1->HTR3 = dc_mW_to_raw(max_mW);
     ADC1->LTR3 = 0u;
 }

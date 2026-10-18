@@ -69,8 +69,32 @@ void adc_init(void);
  * least once) and writes fwd2_peak_mW / rev2_peak_mW. */
 void adc_peak_hold_tick(void);
 
+/* Power-on stabilisation gate.  This is the only entry point the ADC task
+ * needs: it owns the whole power-up sequence, so a caller cannot forget a
+ * step or run two of them concurrently.
+ *
+ *   1. SETTLING    1 s.  Nothing is believed yet, CLEAR_FAULTX_OC is held
+ *                  low and every watchdog is still parked at full scale by
+ *                  boot_hold_thresholds_open().
+ *   2. CALIBRATING the IM zero-offset calibration runs.
+ *   3. ARMED       calibration passed: boot_apply_thresholds() pushes the
+ *                  real AWD/COMP limits out and CLEAR_FAULTX_OC is released.
+ *
+ * Call from the ADC task at the task tick rate (50 ms); the return value
+ * tells you the tick where the transition happened, so the task can raise
+ * g_ptt_ready on that tick and not before.  Returns true once (and after)
+ * ARMED. */
+bool adc_stabilisation_tick(void);
+
+/* True once the settling + calibration sequence has completed and the real
+ * protection limits are armed.  PTT must stay disabled until this is true. */
+bool adc_stabilisation_done(void);
+
 /* IM zero-offset state machine.  Run from a task at >= 10 ms tick.
- * Returns true once calibration has succeeded (g_allow_rf set). */
+ * Returns true once calibration has succeeded (g_allow_rf set).
+ *
+ * NOTE: adc_stabilisation_tick() calls this for you.  Call it directly
+ * only from a test. */
 bool adc_im_zero_offset_tick(void);
 
 /* Place the DMA buffers in a dedicated linker section so the linker

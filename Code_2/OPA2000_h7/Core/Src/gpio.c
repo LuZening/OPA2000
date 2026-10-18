@@ -62,7 +62,10 @@ void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, LPF6_Pin|PTT_OUT_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOF, CTouch_RSTX_Pin|REAR_RESERVED1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(CTouch_RSTX_GPIO_Port, CTouch_RSTX_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(REAR_RESERVED1_GPIO_Port, REAR_RESERVED1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOG, ALC_PWM_OUT_Pin|RF_BIAS_ON_Pin|RELAY2_Pin|RELAY1_Pin
@@ -95,7 +98,7 @@ void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : CTouch_INTX_Pin */
   GPIO_InitStruct.Pin = CTouch_INTX_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(CTouch_INTX_GPIO_Port, &GPIO_InitStruct);
 
@@ -116,7 +119,7 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = ALC_PWM_OUT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(ALC_PWM_OUT_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : CLEAR_FAULTX_OC_Pin */
@@ -132,12 +135,12 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(HARDPWR_ERR_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : RF_IN_PROTECT_CPU_SIG_Pin LIGHTNING_PROTECTION_A_Pin */
-  GPIO_InitStruct.Pin = RF_IN_PROTECT_CPU_SIG_Pin|LIGHTNING_PROTECTION_A_Pin;
+  /*Configure GPIO pin : RF_IN_PROTECT_CPU_SIG_Pin */
+  GPIO_InitStruct.Pin = RF_IN_PROTECT_CPU_SIG_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(RF_IN_PROTECT_CPU_SIG_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : CPU_READY_Pin LIGHTNING_PROTECTION_B_Pin */
   GPIO_InitStruct.Pin = CPU_READY_Pin|LIGHTNING_PROTECTION_B_Pin;
@@ -166,6 +169,13 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(SDMMC2_CD_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LIGHTNING_PROTECTION_A_Pin */
+  GPIO_InitStruct.Pin = LIGHTNING_PROTECTION_A_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LIGHTNING_PROTECTION_A_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI2_IRQn, 5, 0);

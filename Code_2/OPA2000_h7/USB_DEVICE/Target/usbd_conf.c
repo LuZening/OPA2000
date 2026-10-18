@@ -38,7 +38,19 @@
 
 /* USER CODE END PV */
 
+/* USER CODE BEGIN PCD_LEGACY_DISABLED */
+/* CubeMX now emits a dedicated Core/Src/usb_otg.c that owns the PCD handle and
+   the Msp callbacks (hpcd_USB_OTG_HS, HAL_PCD_MspInit, HAL_PCD_MspDeInit).
+   The block below is the pre-1.21 layout, kept here only because this file was
+   restored from git after a regeneration wiped the USB_DEVICE tree.  Defining
+   the same symbols in two translation units is a link error, so it is disabled.
+   If a future CubeMX drops Core/Src/usb_otg.c, delete this block instead. */
+#if 0
 PCD_HandleTypeDef hpcd_USB_OTG_HS;
+#endif
+/* The handle still has to be visible to USBD_LL_Init below, but it is defined
+   exactly once, in Core/Src/usb_otg.c. */
+extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 void Error_Handler(void);
 
 /* External functions --------------------------------------------------------*/
@@ -62,6 +74,8 @@ USBD_StatusTypeDef USBD_Get_USB_Status(HAL_StatusTypeDef hal_status);
                        LL Driver Callbacks (PCD -> USB Device Library)
 *******************************************************************************/
 /* MSP Init */
+/* USER CODE BEGIN PCD_LEGACY_DISABLED */
+#if 0
 
 void HAL_PCD_MspInit(PCD_HandleTypeDef* pcdHandle)
 {
@@ -148,6 +162,7 @@ void HAL_PCD_MspDeInit(PCD_HandleTypeDef* pcdHandle)
   /* USER CODE END USB_OTG_HS_MspDeInit 1 */
   }
 }
+#endif /* USER CODE END PCD_LEGACY_DISABLED */
 
 /**
   * @brief  Setup stage callback

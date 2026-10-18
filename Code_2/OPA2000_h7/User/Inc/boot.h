@@ -13,9 +13,10 @@
  *                                and force the backlight PWM to 0 %.
  *    2. config_init()           - load or rebuild the config.
  *    3. touch_init()            - probe GT911 / NS2009.
- *    4. boot_apply_thresholds() - push the config's protection limits
- *                                into the AWD registers and the two
- *                                COMP DAC references.
+ *    4. boot_hold_thresholds_open() - park every watchdog at full scale
+ *                                (AWD1/2/3 high threshold = 65535, both
+ *                                COMP DAC references = VDDA rail) and
+ *                                drive CLEAR_FAULTX_OC low.
  *    5. osKernelStart()         - tasks take over; the backlight comes
  *                                up once the GUI has painted a frame.
  *
@@ -23,7 +24,12 @@
  *  are already armed by MX_COMP1/2_Init().  If the DAC references are
  *  still 0 then any noise on the compared analog inputs would trip the
  *  comparator and latch a protection flag before the operator ever sees
- *  the screen.  Writing sane thresholds first costs microseconds.
+ *  the screen.  Parking everything wide open costs microseconds and
+ *  cannot be crossed.
+ *
+ *  The operator's REAL limits are pushed much later - from the ADC task's
+ *  adc_stabilisation_tick(), after a 1 s settling window plus a successful
+ *  IM zero-offset calibration.  See user_adc.c.
  */
 #ifndef BOOT_H
 #define BOOT_H
@@ -34,6 +40,28 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * @brief Program the watchdogs wide open for the power-on settling period.
+ *
+ *  Called from main() once the peripherals are up but before the analog
+ *  side has settled.  Every high threshold goes to full scale:
+ *
+ *    - AWD1/AWD2/AWD3 high threshold = 16-bit full scale (65535)
+ *    - DAC1 CH1 / CH2 -> COMP1/COMP2 = the top of the DAC, so the reference
+ *      pin sits at the VDDA rail
+ *
+ *  A watchdog whose threshold is at full scale cannot be crossed and a
+ *  comparator referenced to the rail cannot trip, so nothing latches while
+ *  the rail charges and the detector outputs settle.
+ *
+ *  The real limits replace these in boot_apply_thresholds(), which the ADC
+ *  task calls once the IM zero-offset calibration has passed - see
+ *  app_adc_task() and adc_stabilisation_tick().
+ *
+ *  Idempotent; safe to call more than once.
+ */
+void boot_hold_thresholds_open(void);
 
 /**
  * @brief Pin the three safety pins and blank the display.
@@ -60,8 +88,30 @@ void boot_gpio_safe_state(void);
  *  @param band  band whose band_rf_in_max_w[] entry should be used;
  *               pass the current band so the RF-in limit tracks the
  *               operator's band choice.
+ *
+ *  @note SILENT NO-OP until boot_arm_thresholds() has run.  Between
+ *        boot_hold_thresholds_open() and the end of the power-on settling
+ *        window every watchdog is parked at full scale, and this function
+ *        refuses to touch the hardware.  That gate is load-bearing, not
+ *        defensive: power_init() -> switch_band() -> this function runs
+ *        from the Power task a few milliseconds after the scheduler
+ *        starts, i.e. inside the window.  Dropping the request loses
+ *        nothing, because boot_arm_thresholds() re-reads the same
+ *        g_config when the window closes.
  */
 void boot_apply_thresholds(int band);
+
+/**
+ * @brief Close the settling gate and push the real limits in one step.
+ *
+ *  Called exactly once, by adc_stabilisation_tick() on the tick where the
+ *  IM zero-offset calibration passes.  From here on boot_apply_thresholds()
+ *  behaves normally, so later band changes and Settings edits take effect
+ *  immediately again.
+ *
+ *  @param band  the current band, as for boot_apply_thresholds().
+ */
+void boot_arm_thresholds(int band);
 
 /**
  * @brief Re-program just the two COMP DAC references from g_config.
@@ -100,7 +150,7 @@ void boot_panel_off(void);
  *   than 100 %: the calibration screen is often the first thing the
  *   operator sees, and full brightness on a panel that has just woken is
  *   harsh and warms the LCD. */
-#define BOOT_BACKLIGHT_PCT      90U
+#define BOOT_BACKLIGHT_PCT      100U
 
 /**
  * @brief Drive BL_PWM to a duty cycle in percent (0..100).

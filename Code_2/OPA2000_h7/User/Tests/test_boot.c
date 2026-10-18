@@ -25,7 +25,15 @@
 #include "boot.h"
 #include "config.h"
 #include "opa2000.h"
+/* Brings in ADC_FULL_SCALE, the "parked at 16-bit full scale" value the
+ * AWD assertions below compare against. */
+#include "adc_calibration.h"
 #include "stm32h7xx_hal_stub.h"
+/* For the pin macros (CLEAR_FAULTX_OC_*): it is the header that pulls
+ * stm32h7xx_hal.h / main.h in, so this is the project's way of making a
+ * pin visible to a host test - same as test_protection.c and
+ * test_power_control.c do. */
+#include "hw_pinmap.h"
 
 #include <string.h>
 
@@ -221,6 +229,82 @@ TEST_CASE(boot_non_identity_gain_skips_prompt)
 }
 
 /*============================================================================
+ *  Test 3b: boot_hold_thresholds_open() must be uncrossable
+ *
+ *  This is the first thing main() does once the peripherals are up, and it
+ *  exists purely to stop the amplifier coming up already alarming.  The
+ *  property that matters is that neither limit can be reached by any
+ *  conversion result, so a settling transient cannot trip anything:
+ *
+ *    - both COMP DAC references sit at code 4095 = the VDDA rail,
+ *    - CLEAR_FAULTX_OC is pulled low, so the external latch is held clear.
+ *==========================================================================*/
+TEST_CASE(boot_hold_thresholds_open_parks_every_limit)
+{
+    /* Start from a config with real, low limits, so the test fails if the
+     * function silently reverts to programming from g_config. */
+    config_reset_default();
+    g_config.comp1_ref_mV = 1650U;
+    g_config.comp2_ref_mV = 1650U;
+
+    boot_hold_thresholds_open();
+
+    ASSERT_EQ(hdac1.Instance->DHR12R1, DAC_FULL_SCALE);
+    ASSERT_EQ(hdac1.Instance->DHR12R2, DAC_FULL_SCALE);
+    /* Both channels started, or the pins never reach the rail at all. */
+    ASSERT_TRUE((hdac1.Instance->CR & 0x03U) == 0x03U);
+
+    ASSERT_EQ(stub_gpio_get_last(CLEAR_FAULTX_OC_GPIO_Port,
+                                 CLEAR_FAULTX_OC_Pin), 0);
+
+    /* The apply gate is closed by the same call, and that is the part that
+     * actually keeps the false alarm away.  power_init() -> switch_band()
+     * reaches boot_apply_thresholds() a few milliseconds after the
+     * scheduler starts, i.e. deep inside the settling window; if this apply
+     * went through, the operator's real limits would land while the rail is
+     * still charging and everything above would be undone. */
+    g_config.band_im_max_mA = 10000U;
+    boot_apply_thresholds((int)BAND_15M_10M);
+
+    ASSERT_EQ(ADC1->HTR2, ADC_FULL_SCALE);            /* still parked wide */
+    ASSERT_EQ(hdac1.Instance->DHR12R1, DAC_FULL_SCALE);
+    ASSERT_EQ(hdac1.Instance->DHR12R2, DAC_FULL_SCALE);
+    ASSERT_EQ(stub_gpio_get_last(CLEAR_FAULTX_OC_GPIO_Port,
+                                 CLEAR_FAULTX_OC_Pin), 0);
+}
+
+/*============================================================================
+ *  Test 3c: boot_arm_thresholds() re-opens the gate
+ *
+ *  The settling window is only useful if it ends.  boot_arm_thresholds() is
+ *  the one call that ends it, made by adc_stabilisation_tick() on the tick
+ *  the IM zero-offset calibration passes.  After it a band change or a
+ *  Settings edit must reach the hardware again, otherwise the operator
+ *  would be stuck with the parked limits for the rest of the session.
+ *==========================================================================*/
+TEST_CASE(boot_arm_thresholds_opens_the_gate)
+{
+    config_reset_default();
+    g_config.im_zero_offset_adc = 43254U;
+    g_config.band_im_max_mA    = 10000U;
+    g_config.comp1_ref_mV      = 1650U;
+    g_config.comp2_ref_mV      = 2442U;
+
+    boot_hold_thresholds_open();
+    ASSERT_EQ(ADC1->HTR2, ADC_FULL_SCALE);      /* parked, gate closed */
+
+    boot_arm_thresholds((int)BAND_15M_10M);
+
+    /* Both references came down off the rail to the configured values, so
+     * the comparators are live again. */
+    ASSERT_EQ(hdac1.Instance->DHR12R1, expected_dac_code(1650U));
+    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(2442U));
+    /* AWD2 now holds a real limit: 10000 mA is 6920 codes above the
+     * 43254-code zero point of the CC6920 law. */
+    ASSERT_EQ(ADC1->HTR2, 43254U + 6920U);
+}
+
+/*============================================================================
  *  Suite registration
  *============================================================================*/
 const test_entry_t g_suite_boot[] = {
@@ -230,6 +314,8 @@ const test_entry_t g_suite_boot[] = {
     TEST_ENTRY(comp2_reference_matches_the_current_sensor_law),
     TEST_ENTRY(boot_band_index_mapping),
     TEST_ENTRY(boot_rf_limit_array_size),
+    TEST_ENTRY(boot_hold_thresholds_open_parks_every_limit),
+    TEST_ENTRY(boot_arm_thresholds_opens_the_gate),
     TEST_ENTRY(boot_fresh_config_needs_touch_cal),
     TEST_ENTRY(boot_calibrated_config_skips_touch_cal),
     TEST_ENTRY(boot_non_identity_gain_skips_prompt),

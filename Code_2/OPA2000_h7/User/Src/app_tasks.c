@@ -216,25 +216,33 @@ void app_adc_task(void *argument)
            path. */
         adc_process();
 
-        /* Drive the CC6920 IM zero-offset calibration.  This is the ONLY
-           writer of g_allow_rf = true (see adc_im_zero_offset_tick()), and
-           adc_init() deliberately clears both im_calibrated and g_allow_rf
-           on every boot, so without this call the amplifier could never
-           key at all - ptt_apply_level() refuses every request while
-           g_allow_rf is false.
+        /* 上电稳定等待 + CC6920 主电流零点校准（user_adc.c 里的状态机）。
+           它一次性包办了整段上电流程，所以这里不可能漏掉某一步，也不
+           可能有两个地方同时在跑：
 
-           It runs at the 50 ms task tick rather than the 10 ms the state
-           machine was dimensioned for, which stretches the 50-sample
-           window from ~500 ms to ~2.5 s.  That is fine: the window only has
-           to average out ADC noise while the PA draws no current, and at
-           boot the rail is still down.
+             1. SETTLING     前 1 s，什么都不信。CLEAR_FAULTX_OC 持续
+                             拉低，外部故障锁存器被按住不放；同时
+                             boot_hold_thresholds_open() 在进入 RTOS 之前
+                             就已把 AWD1/2/3 和两路 COMP 的 DAC 全部推到
+                             满量程，所以这 1 s 里不会误报。
+             2. CALIBRATING  跑 IM 零点校准（50 次采样 + 校验）。
+             3. ARMED        校准通过，此刻才认为 ADC 值有效：
+                             boot_apply_thresholds() 把真正的 AWD/COMP
+                             门槛下发下去，CLEAR_FAULTX_OC 释放，GUI 才开始
+                             显示这些读数。
 
-           Self-limiting: the state machine returns immediately once
-           g_config.im_calibrated is set, so after the first successful
-           pass this is a single load-and-branch per tick.  On failure it
-           retries up to 3 times and then raises ALERT_HARDWARE_FAULT by
-           itself (user_adc.c) - no operator action required either way. */
-        (void)adc_im_zero_offset_tick();
+           这是 g_allow_rf = true 的唯一写者，而 adc_init() 每次上电都会
+           清掉 im_calibrated 和 g_allow_rf，所以没有这次调用放大器永远
+           无法起振——ptt_apply_level() 在 g_allow_rf 为假时拒绝一切请求。
+
+           校准窗口在 50 ms 的任务节拍上跑（状态机按 10 ms 设计），所以
+           50 次采样从 ~500 ms 拉长到 ~2.5 s。无妨：它只要在 PA 不取流
+           的情况下把 ADC 噪声平均掉，而上电时高压还没建立。
+
+           自限：g_config.im_calibrated 一旦置位状态机立刻返回，所以成功
+           之后每拍只剩一次取值+分支。失败则自己重试 3 次，仍不过就自己
+           拉起 ALERT_HARDWARE_FAULT——两种情况都不需要操作员干预。 */
+        (void)adc_stabilisation_tick();
 
         /* Advance the coupler-2 peak holds for the GUI bar graphs.  Task
            context on purpose: the release step uses expf(), which must not
@@ -242,7 +250,10 @@ void app_adc_task(void *argument)
         adc_peak_hold_tick();
 
         /* Transmit gate (design spec step 6): the amplifier may only be
-           keyed once BOTH halves are true -
+           keyed once ALL THREE halves are true -
+             adc_stabilisation_done()  上电稳定等待期结束：模拟量稳定，
+                           零点校准完成，真正的 AWD/COMP 门槛已下发，
+                           CLEAR_FAULTX_OC 已释放。
              g_allow_rf    the IM zero-offset calibration finished, so the
                            main-current reading is trustworthy, and
              g_gui_ready   the GUI painted a frame, so the operator can
@@ -250,7 +261,7 @@ void app_adc_task(void *argument)
            Until then power_control's ptt_apply_level() refuses every
            request.  Re-evaluated every 50 ms; the flags are volatile so
            this is a cheap poll. */
-        g_ptt_ready = (g_allow_rf && g_gui_ready);
+        g_ptt_ready = (adc_stabilisation_done() && g_allow_rf && g_gui_ready);
 
         /* 50ms - 20Hz update rate */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(50));

@@ -26,12 +26,6 @@
 #include "stm32h7xx_hal.h"
 #include "bsp_driver_sd.h"
 #include "cmsis_os.h" /* _FS_REENTRANT set to 1 and CMSIS API chosen */
-/* USER CODE BEGIN */
-/* This project's cmsis_os.h does not pull in FreeRTOS.h (unlike newer
-   CubeMX FreeRTOS middleware), so ff_malloc/ff_free further down would
-   otherwise expand to undeclared pvPortMalloc/vPortFree. */
-#include "FreeRTOS.h"
-/* USER CODE END */
 
 /*-----------------------------------------------------------------------------/
 / Function Configurations

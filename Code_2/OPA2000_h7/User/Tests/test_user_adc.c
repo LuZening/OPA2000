@@ -24,6 +24,10 @@
 #define IM_SAMPLE_COUNT      50
 #define IM_TICKS_PER_PASS    (IM_SAMPLE_COUNT + 1)   /* 50 samples + 1 validate */
 
+/* Power-on settling window, in ADC-task ticks.  Must match
+ * STAB_SETTLE_TICKS in user_adc.c: 20 x 50 ms = 1.0 s. */
+#define STAB_SETTLE_TICKS    20
+
 /* Reset the module and seed the IM rank of the newest DMA row. */
 static void im_feed(uint16_t raw)
 {
@@ -176,6 +180,165 @@ TEST_CASE(im_calibration_recovers_on_second_pass)
     ASSERT_EQ(g_config.im_calibrated, 1);
     ASSERT_TRUE(g_allow_rf);
     ASSERT_FALSE(g_alert_flag);
+}
+
+/*============================================================================
+ *  Power-on stabilisation gate (adc_stabilisation_tick / _done)
+ *
+ *  The amplifier must not treat its own analog front end as trustworthy
+ *  during the first second after power-up.  These cases pin the three
+ *  properties that make that safe:
+ *
+ *    - nothing is armed and PTT stays blocked for the whole window,
+ *    - CLEAR_FAULTX_OC is held low for every tick of it, so nothing can
+ *      latch an alarm from the settling transient,
+ *    - the real limits go out and the pin is released only after the IM
+ *      zero-offset calibration has actually passed.
+ *
+ *  A "tick" here is one ADC-task iteration, i.e. 50 ms; STAB_SETTLE_TICKS
+ *  (20) is therefore 1.0 s, matching the spec.
+ *==========================================================================*/
+
+/* Ticks the settling window with the IM rank already at its true zero, so
+ * the calibration can pass as soon as it is allowed to start. */
+static void stab_tick_settling(int count)
+{
+    for (int i = 0; i < count; i++) {
+        im_feed(IM_ZERO_EXPECTED);
+        ASSERT_FALSE(adc_stabilisation_tick());
+        ASSERT_FALSE(adc_stabilisation_done());
+    }
+}
+
+/* Ticks past the settling window, seeding `raw` before each one. */
+static bool stab_tick_calibrating(uint16_t raw, int count)
+{
+    bool armed = false;
+    for (int i = 0; i < count; i++) {
+        im_feed(raw);
+        armed = adc_stabilisation_tick();
+    }
+    return armed;
+}
+
+static uint8_t clear_faultx_level(void)
+{
+    return stub_gpio_get_last(CLEAR_FAULTX_OC_GPIO_Port, CLEAR_FAULTX_OC_Pin);
+}
+
+TEST_CASE(stabilisation_blocks_the_first_second_entirely)
+{
+    im_reset();
+
+    /* One tick short of the window must still be un-armed. */
+    stab_tick_settling(STAB_SETTLE_TICKS - 1);
+
+    ASSERT_FALSE(adc_stabilisation_done());
+    ASSERT_FALSE(g_config.im_calibrated);
+    ASSERT_FALSE(g_allow_rf);
+}
+
+TEST_CASE(stabilisation_holds_clear_fault_low_for_the_whole_window)
+{
+    im_reset();
+    /* Put the pin somewhere other than the level we are about to assert, so
+     * a missing write cannot accidentally look like a pass. */
+    stub_gpio_set(CLEAR_FAULTX_OC_GPIO_Port, CLEAR_FAULTX_OC_Pin, 1U);
+
+    stab_tick_settling(STAB_SETTLE_TICKS);
+
+    ASSERT_EQ(clear_faultx_level(), 0);
+    /* Still low one tick into calibration, i.e. held across the boundary. */
+    (void)stab_tick_calibrating(IM_ZERO_EXPECTED, 1);
+    ASSERT_EQ(clear_faultx_level(), 0);
+}
+
+TEST_CASE(stabilisation_arms_only_after_the_calibration_passes)
+{
+    im_reset();
+    stab_tick_settling(STAB_SETTLE_TICKS);
+
+    /* 50 sampling ticks then the validation tick, all fed the true zero.
+     * The last of them is the one that arms, which is what makes this the
+     * earliest possible moment the readings may be believed. */
+    ASSERT_TRUE(stab_tick_calibrating(IM_ZERO_EXPECTED, IM_TICKS_PER_PASS));
+
+    ASSERT_TRUE(adc_stabilisation_done());
+    ASSERT_EQ(g_config.im_calibrated, 1);
+    ASSERT_TRUE(g_allow_rf);
+    ASSERT_FALSE(g_alert_flag);
+}
+
+TEST_CASE(stabilisation_releases_clear_fault_when_it_arms)
+{
+    im_reset();
+    stub_gpio_set(CLEAR_FAULTX_OC_GPIO_Port, CLEAR_FAULTX_OC_Pin, 0U);
+
+    stab_tick_settling(STAB_SETTLE_TICKS);
+    ASSERT_TRUE(stab_tick_calibrating(IM_ZERO_EXPECTED, IM_TICKS_PER_PASS));
+
+    /* Released, not left low: the latch must work normally from now on. */
+    ASSERT_EQ(clear_faultx_level(), 1);
+}
+
+TEST_CASE(stabilisation_holds_clear_fault_low_when_calibration_fails)
+{
+    const uint16_t bad = (uint16_t)(IM_ZERO_EXPECTED + 3000);
+
+    im_reset();
+    stub_gpio_set(CLEAR_FAULTX_OC_GPIO_Port, CLEAR_FAULTX_OC_Pin, 1U);
+
+    stab_tick_settling(STAB_SETTLE_TICKS);
+
+    /* Three failed passes -> ALERT_HARDWARE_FAULT, but still not armed and
+     * still holding the pin low, so a bad sensor cannot both alarm and then
+     * leave a latched fault behind for the next power cycle. */
+    for (int pass = 0; pass < 3; pass++) {
+        (void)stab_tick_calibrating(bad, IM_TICKS_PER_PASS);
+    }
+
+    ASSERT_TRUE(g_alert_flag);
+    ASSERT_EQ(g_alert_active, ALERT_HARDWARE_FAULT);
+    ASSERT_FALSE(adc_stabilisation_done());
+    ASSERT_FALSE(g_allow_rf);
+    ASSERT_EQ(clear_faultx_level(), 0);
+}
+
+TEST_CASE(stabilisation_stays_armed_and_is_idempotent)
+{
+    im_reset();
+    stab_tick_settling(STAB_SETTLE_TICKS);
+    ASSERT_TRUE(stab_tick_calibrating(IM_ZERO_EXPECTED, IM_TICKS_PER_PASS));
+    ASSERT_TRUE(adc_stabilisation_done());
+
+    /* The recorded zero must survive further ticks: a later ARMED tick must
+     * not re-run the calibration and overwrite it with a fresh average. */
+    uint32_t offset = g_config.im_zero_offset_adc;
+
+    for (int i = 0; i < 200; i++) {
+        im_feed(1000U);              /* garbage on the bus */
+        ASSERT_TRUE(adc_stabilisation_tick());
+    }
+
+    ASSERT_TRUE(adc_stabilisation_done());
+    ASSERT_EQ(g_config.im_zero_offset_adc, offset);
+    ASSERT_FALSE(g_alert_flag);
+}
+
+TEST_CASE(stabilisation_restarts_when_adc_init_reruns)
+{
+    im_reset();
+    stab_tick_settling(STAB_SETTLE_TICKS);
+    ASSERT_TRUE(stab_tick_calibrating(IM_ZERO_EXPECTED, IM_TICKS_PER_PASS));
+    ASSERT_TRUE(adc_stabilisation_done());
+
+    /* A soft restart re-runs adc_init(); the gate must go back to square one
+     * rather than carry the armed state over from the previous run. */
+    adc_init();
+
+    ASSERT_FALSE(adc_stabilisation_done());
+    ASSERT_FALSE(g_config.im_calibrated);
+    ASSERT_FALSE(g_allow_rf);
 }
 
 /*============================================================================
@@ -615,6 +778,13 @@ const test_entry_t g_suite_user_adc[] = {
     TEST_ENTRY(im_calibration_short_circuits_once_calibrated),
     TEST_ENTRY(im_calibration_retries_three_times_then_alarms),
     TEST_ENTRY(im_calibration_recovers_on_second_pass),
+    TEST_ENTRY(stabilisation_blocks_the_first_second_entirely),
+    TEST_ENTRY(stabilisation_holds_clear_fault_low_for_the_whole_window),
+    TEST_ENTRY(stabilisation_arms_only_after_the_calibration_passes),
+    TEST_ENTRY(stabilisation_releases_clear_fault_when_it_arms),
+    TEST_ENTRY(stabilisation_holds_clear_fault_low_when_calibration_fails),
+    TEST_ENTRY(stabilisation_stays_armed_and_is_idempotent),
+    TEST_ENTRY(stabilisation_restarts_when_adc_init_reruns),
     TEST_ENTRY(adc_process_averages_the_rolling_dma_window),
     TEST_ENTRY(adc_process_publishes_all_engineering_units),
     TEST_ENTRY(adc_process_derives_swr_from_fwd2_and_rev2),

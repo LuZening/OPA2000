@@ -36,7 +36,7 @@
 #include "sdmmc.h"
 #include "spi.h"
 #include "tim.h"
-#include "usb_device.h"
+#include "usb_otg.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -94,7 +94,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  HAL_GPIO_WritePin(CPU_READY_GPIO_Port,CPU_READY_Pin,1);
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
@@ -157,7 +157,9 @@ int main(void)
   MX_TIM4_Init();
   MX_SPI6_Init();
   MX_FATFS_Init();
+  MX_USB_OTG_HS_PCD_Init();
   /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(CPU_READY_GPIO_Port,CPU_READY_Pin,0);
   /* =========================================================================
    *  BOOT SEQUENCE (design spec 2026-10-14)
    *
@@ -194,21 +196,29 @@ int main(void)
   g_calibration_required = !have_valid_config || config_touch_needs_calibration();
   g_touch_calibrated     = !g_calibration_required;
 
-  /* --- Step 4: push the config's protection limits into the hardware - */
-  /* AWD1/AWD2/AWD3 thresholds plus the two COMP DAC references.  This
-   * MUST happen before the kernel starts: MX_COMP1/2_Init() already
-   * armed the comparator interrupts, and a DAC reference of 0 would let
-   * noise on the compared inputs latch a protection fault before the
-   * operator ever sees the screen. */
-  boot_apply_thresholds((int)BAND_15M_10M);
+  /* --- Step 4: park every watchdog wide open, then start the comparators - */
+  /* MX_COMP1/2_Init() already armed the comparator interrupts, and the DAC
+   * references still hold their power-on value of 0 V.  A reference of 0 V
+   * means "any input at all is over the limit", so the very first tick of
+   * the comparator would latch an over-drive / over-current fault out of pure
+   * noise - which is exactly the false alarm seen at power-up.
+
+   * So instead of pushing the operator's real limits now, park AWD1/AWD2/AWD3
+   * at full scale and both COMP DAC references at the VDDA rail: nothing in
+   * the analog chain can possibly cross them.  boot_apply_thresholds() runs
+   * later, from adc_stabilisation_tick(), once the front end has settled and
+   * the IM zero-offset calibration has produced a trustworthy reading.  By
+   * then CLEAR_FAULTX_OC has been held low for the whole window, so the
+   * false alarm can never be latched in the first place. */
+  boot_hold_thresholds_open();
 
   /* --- Enable the two comparators ------------------------------------ */
   /* MX_COMPx_Init() only configures the peripheral; without this the
    * comparators stay disabled and HAL_COMP_TriggerCallback() would never
    * fire, i.e. the COMP1 overdrive and COMP2 over-current protections
-   * would be dead code.  Started only after the DAC references above are
-   * in place, so the very first comparison already uses the configured
-   * threshold instead of the DAC's power-on value of 0 V. */
+   * would be dead code.  Started only after the references above are at the
+   * unreachable end of the DAC range, so the first comparison already runs
+   * against a threshold that cannot be crossed. */
   if (HAL_COMP_Start_IT(&hcomp1) != HAL_OK) {
     Error_Handler();
   }
@@ -227,13 +237,15 @@ int main(void)
    * idle task whose only job was to call MX_USB_DEVICE_Init() once and
    * then spin on osDelay(1).  Folding that one call into the boot
    * sequence retires the task and reclaims 512 B of stack + its TCB. */
-  MX_USB_DEVICE_Init();
+//  MX_USB_DEVICE_Init();
 
   /* --- Step 6: hand over to the scheduler (below) --------------------- */
   /* From here on g_gui_ready / g_ptt_ready take over: the GUI task opens
    * the backlight after its first repaint, and app_adc_task raises
    * g_ptt_ready once the IM zero-offset calibration has finished.  Until
    * both are true, power_control refuses every PTT request. */
+  
+  HAL_GPIO_WritePin(CPU_READY_GPIO_Port,CPU_READY_Pin,1);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -356,7 +368,7 @@ void PeriphCommonClock_Config(void)
   PeriphClkInitStruct.PLL2.PLL2N = 16;
   PeriphClkInitStruct.PLL2.PLL2P = 4;
   PeriphClkInitStruct.PLL2.PLL2Q = 8;
-  PeriphClkInitStruct.PLL2.PLL2R = 4;
+  PeriphClkInitStruct.PLL2.PLL2R = 9;
   PeriphClkInitStruct.PLL2.PLL2RGE = RCC_PLL2VCIRANGE_3;
   PeriphClkInitStruct.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;
   PeriphClkInitStruct.PLL2.PLL2FRACN = 0;

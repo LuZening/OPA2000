@@ -36,7 +36,8 @@ void MX_SDMMC2_SD_Init(void)
   /* USER CODE END SDMMC2_Init 0 */
 
   /* USER CODE BEGIN SDMMC2_Init 1 */
-
+  if (HAL_GPIO_ReadPin(SDMMC2_CD_GPIO_Port, SDMMC2_CD_Pin) == 0)
+  {
   /* USER CODE END SDMMC2_Init 1 */
   hsd2.Instance = SDMMC2;
   hsd2.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
@@ -49,7 +50,7 @@ void MX_SDMMC2_SD_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN SDMMC2_Init 2 */
-
+  }
   /* USER CODE END SDMMC2_Init 2 */
 
 }

@@ -227,7 +227,8 @@ void power_init_fan_pwm(void)
 void power_set_backlight_duty(uint8_t percent)
 {
     if (percent > 100U) percent = 100U;
-    uint32_t pulse = ((uint32_t)percent * (PWM_TIM4_PERIOD + 1U) + 50U) / 100U;
+    uint32_t ratio = 100U - percent;
+    uint32_t pulse = ((uint32_t)ratio * (PWM_TIM4_PERIOD + 1U) + 50U) / 100U / 10U;
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, pulse);
 }
 

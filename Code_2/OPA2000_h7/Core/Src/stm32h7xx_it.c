@@ -61,7 +61,6 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
 extern DMA_HandleTypeDef hdma_adc1;
 extern DMA_HandleTypeDef hdma_adc2;
 extern ADC_HandleTypeDef hadc1;
@@ -604,48 +603,6 @@ void I2C3_ER_IRQHandler(void)
   /* USER CODE BEGIN I2C3_ER_IRQn 1 */
 
   /* USER CODE END I2C3_ER_IRQn 1 */
-}
-
-/**
-  * @brief This function handles USB On The Go HS End Point 1 Out global interrupt.
-  */
-void OTG_HS_EP1_OUT_IRQHandler(void)
-{
-  /* USER CODE BEGIN OTG_HS_EP1_OUT_IRQn 0 */
-
-  /* USER CODE END OTG_HS_EP1_OUT_IRQn 0 */
-  HAL_PCD_IRQHandler(&hpcd_USB_OTG_HS);
-  /* USER CODE BEGIN OTG_HS_EP1_OUT_IRQn 1 */
-
-  /* USER CODE END OTG_HS_EP1_OUT_IRQn 1 */
-}
-
-/**
-  * @brief This function handles USB On The Go HS End Point 1 In global interrupt.
-  */
-void OTG_HS_EP1_IN_IRQHandler(void)
-{
-  /* USER CODE BEGIN OTG_HS_EP1_IN_IRQn 0 */
-
-  /* USER CODE END OTG_HS_EP1_IN_IRQn 0 */
-  HAL_PCD_IRQHandler(&hpcd_USB_OTG_HS);
-  /* USER CODE BEGIN OTG_HS_EP1_IN_IRQn 1 */
-
-  /* USER CODE END OTG_HS_EP1_IN_IRQn 1 */
-}
-
-/**
-  * @brief This function handles USB OTG HS global interrupt.
-  */
-void OTG_HS_IRQHandler(void)
-{
-  /* USER CODE BEGIN OTG_HS_IRQn 0 */
-
-  /* USER CODE END OTG_HS_IRQn 0 */
-  HAL_PCD_IRQHandler(&hpcd_USB_OTG_HS);
-  /* USER CODE BEGIN OTG_HS_IRQn 1 */
-
-  /* USER CODE END OTG_HS_IRQn 1 */
 }
 
 /**

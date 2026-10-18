@@ -104,4 +104,11 @@
 #define SDMMC2_CD_Pin GPIO_PIN_15
 #define SDMMC2_CD_GPIO_Port GPIOG
 
+/* External fault latch clear, open-drain (see hw_pinmap.h).  Cleared by
+ * boot_hold_thresholds_open() and held low for the whole power-on
+ * stabilisation window, so test_user_adc.c can watch it through the GPIO
+ * stub like any other safety pin. */
+#define CLEAR_FAULTX_OC_Pin GPIO_PIN_1
+#define CLEAR_FAULTX_OC_GPIO_Port GPIOG
+
 #endif /* MAIN_HOST_TEST_SHIM_H */

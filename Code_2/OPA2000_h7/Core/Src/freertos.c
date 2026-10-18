@@ -26,6 +26,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_tasks.h"
 
 /* USER CODE END Includes */
 
@@ -63,7 +64,6 @@ const osThreadAttr_t defaultTask_attributes = {
 
 void StartDefaultTask(void *argument);
 
-extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
 /**
@@ -97,15 +97,17 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* The defaultTask that previously lived here (a 512 B idle task that
-   * only called MX_USB_DEVICE_Init() and then osDelay(1)) was retired.
-   * The USB init is now done in main.c just before osKernelInitialize()
-   * - it has no RTOS dependencies, so the indirection through a task
-   * was buying nothing but 512 B of stack + a TCB.  The real
-   * application tasks (GUI/ADC/Comm/Monitor/Protect/Config) are still
-   * created in app_tasks.c via app_tasks_create() - call that from
-   * USER CODE BEGIN RTOS_THREADS below if it ever needs to be moved
-   * here for CubeMX regen reasons. */
+  /* The defaultTask above is a leftover from CubeMX's template: it spins on
+   * osDelay(1) and does nothing.  Its original job - calling
+   * MX_USB_DEVICE_Init() once - was folded into main()'s boot sequence,
+   * which needs no RTOS primitives, so the task only burns a TCB.
+
+   * The six real application tasks (GUI / ADC / Comm / Monitor / Protect /
+   * Config) live in app_tasks.c.  app_tasks_create() has to be called from
+   * inside this USER CODE block: it is the only region CubeMX preserves
+   * across "Generate Code", and losing it leaves the scheduler with nothing
+   * but idle. */
+  app_tasks_create();
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -123,8 +125,6 @@ void MX_FREERTOS_Init(void) {
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
-  /* init code for USB_DEVICE */
-  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN StartDefaultTask */
   /* Infinite loop */
   for(;;)

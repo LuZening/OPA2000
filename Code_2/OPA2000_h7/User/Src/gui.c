@@ -19,13 +19,55 @@
 #include "touch.h"
 #include "power_control.h"
 #include "boot.h"
+#include "user_adc.h"
 #endif
 #include "string.h"
 #include "stdio.h"
 
 /*============================================================================
+ * Integer-only number formatting
+ *
+ * printf's %f pulls in newlib's float printf support, which costs several KB
+ * of code and drags in soft-float helpers we otherwise never call.  Every
+ * value on these screens comes from integer milliwatts / milliamps / tenths of
+ * a degree, so format them as integers with a decimal point inserted by hand.
+ *==========================================================================*/
+
+/** @brief Format scaled_int / 10^decimals with a fixed number of decimals.
+ *  @param scaled_int  value already multiplied by 10^decimals
+ *  @param decimals    0..3; how many digits follow the point
+ *  @param buf         destination
+ *  @param len         destination size
+ */
+static void gui_fmt_fixed(char *buf, size_t len, int32_t scaled_int,
+                          uint8_t decimals)
+{
+    uint32_t mag;
+    bool negative = (scaled_int < 0);
+
+    if (negative) {
+        scaled_int = -scaled_int;
+    }
+    mag = (uint32_t)scaled_int;
+
+    if (decimals == 0U) {
+        snprintf(buf, len, negative ? "-%lu" : "%lu",
+                 (unsigned long)mag);
+    } else if (decimals == 1U) {
+        snprintf(buf, len, negative ? "-%lu.%lu" : "%lu.%lu",
+                 (unsigned long)(mag / 10U), (unsigned long)(mag % 10U));
+    } else if (decimals == 2U) {
+        snprintf(buf, len, negative ? "-%lu.%02lu" : "%lu.%02lu",
+                 (unsigned long)(mag / 100U), (unsigned long)(mag % 100U));
+    } else {
+        snprintf(buf, len, negative ? "-%lu.%03lu" : "%lu.%03lu",
+                 (unsigned long)(mag / 1000U), (unsigned long)(mag % 1000U));
+    }
+}
+
+/*============================================================================
  * Private Variables
- *============================================================================*/
+ *==========================================================================*/
 
 /*============================================================================
  *  Deferred-save staging
@@ -882,31 +924,67 @@ static void gui_update_main_values(void)
     lv_obj_set_style_local_text_color(status_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
 
+    /* 上电稳定等待期：零点校准还没做完之前，ADC 读数是没有意义的
+     * （模拟量还在爬升，读出来会乱跳）。这一段时间里主界面一律显示
+     * "--"，而不是把一屏噪声当成真实功率给操作员看。校准一完成
+     * （adc_stabilisation_tick() 走到 ARMED）下面照常显示。
+     * 这里只替换测量值，状态条/频段/协议等照旧刷新，操作员看得出
+     * 机器活着、只是还没进入可发射状态。 */
+    if (!adc_stabilisation_done()) {
+        lv_label_set_text(val_fwd, "--W");
+        lv_label_set_text(val_ref, "--W");
+        lv_label_set_text(val_swr, "--");
+        lv_bar_set_value(bar_fwd, 0, LV_ANIM_OFF);
+        lv_bar_set_value(bar_ref, 0, LV_ANIM_OFF);
+        lv_bar_set_value(bar_swr, 0, LV_ANIM_OFF);
+        lv_obj_set_style_local_text_color(val_swr, LV_LABEL_PART_MAIN,
+                                           LV_STATE_DEFAULT, LV_COLOR_WHITE);
+        lv_label_set_text(lbl_voltage, "--V");
+        lv_label_set_text(lbl_current, "--A");
+        lv_label_set_text(lbl_temp, "--\xC2\xB0" "C");
+
+        lv_label_set_text(lbl_fan, "-");
+        lv_label_set_text(lbl_temp_cap, "--");
+
+        /* Band / Frequency range — indexed from BandType (BAND_160M=1, etc.) */
+        if (g_current_band > BAND_NONE && g_current_band <= BAND_15M_10M) {
+            lv_label_set_text(band_label, strFreqRanges[g_current_band - 1]);
+            lv_label_set_text(lbl_radio_mode, strBands[g_current_band - 1]);
+        } else {
+            lv_label_set_text(band_label, "---");
+            lv_label_set_text(lbl_radio_mode, "");
+        }
+        gui_update_protocol_label();
+        return;
+    }
+
     /* Peak hold with slow release (tau = 500 ms) is produced by the Control
      * agent in adc_peak_hold_tick(), driven from the ADC task - deliberately
      * not from the DMA ISR, because the release needs expf().  The GUI is a
      * pure consumer: it never writes these two fields. */
-    float fwd_peak_mW = (float)g_adc_data.fwd2_peak_mW;
-    float rev_peak_mW = (float)g_adc_data.rev2_peak_mW;
-/* Forward power, in Watts */
-    float fwd = fwd_peak_mW / 1000.0f;
-    snprintf(buf, sizeof(buf), "%.0fW", fwd);
+    int32_t fwd_peak_mW = (int32_t)g_adc_data.fwd2_peak_mW;
+    int32_t rev_peak_mW = (int32_t)g_adc_data.rev2_peak_mW;
+/* Forward power, in Watts - round to nearest before dropping the fraction */
+    int32_t fwd_w = (fwd_peak_mW + 500) / 1000;
+    gui_fmt_fixed(buf, sizeof(buf), fwd_w, 0U);
+    strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
     lv_label_set_text(val_fwd, buf);
-    lv_bar_set_value(bar_fwd, (int16_t)(fwd * BAR_MAX_FWD / 1000.0f), LV_ANIM_OFF);
+    lv_bar_set_value(bar_fwd, (int16_t)((fwd_peak_mW * BAR_MAX_FWD) / (1000 * 1000)), LV_ANIM_OFF);
 
     /* Reflected power, in Watts */
-    float refp = rev_peak_mW / 1000.0f;
-    snprintf(buf, sizeof(buf), "%.0fW", refp);
+    int32_t ref_w = (rev_peak_mW + 500) / 1000;
+    gui_fmt_fixed(buf, sizeof(buf), ref_w, 0U);
+    strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
     lv_label_set_text(val_ref, buf);
-    lv_bar_set_value(bar_ref, (int16_t)(refp * BAR_MAX_REF / 300.0f), LV_ANIM_OFF);
+    lv_bar_set_value(bar_ref, (int16_t)((rev_peak_mW * BAR_MAX_REF) / (300 * 1000)), LV_ANIM_OFF);
 
-    /* SWR derived from the same peak values so the three bars agree */
-    float swr = calculate_swr_x100((int32_t)fwd_peak_mW,
-                                   (int32_t)rev_peak_mW) / 100.0f;
-    snprintf(buf, sizeof(buf), "%.1f", swr);
+    /* SWR derived from the same peak values so the three bars agree.
+     * calculate_swr_x100 returns hundredths; one decimal means /10. */
+    int32_t swr_x100 = calculate_swr_x100(fwd_peak_mW, rev_peak_mW);
+    gui_fmt_fixed(buf, sizeof(buf), swr_x100 / 10, 1U);
     lv_label_set_text(val_swr, buf);
-    lv_bar_set_value(bar_swr, (int16_t)((swr - 1.0f) * BAR_MAX_SWR / 3.0f), LV_ANIM_OFF);
-    if (swr > 2.0f) {
+    lv_bar_set_value(bar_swr, (int16_t)(((swr_x100 - 100) * BAR_MAX_SWR) / 300), LV_ANIM_OFF);
+    if (swr_x100 > 200) {
         lv_obj_set_style_local_text_color(val_swr, LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_RED);
     } else {
@@ -914,20 +992,27 @@ static void gui_update_main_values(void)
                                            LV_STATE_DEFAULT, LV_COLOR_WHITE);
     }
 
-    /* Voltage */
-    snprintf(buf, sizeof(buf), "%.1fV", (float)g_adc_data.vm_mV / 1000.0f);
+    /* Voltage - vm_mV is millivolts, whole volts means /1000 */
+    gui_fmt_fixed(buf, sizeof(buf), ((int32_t)g_adc_data.vm_mV + 500) / 1000, 0U);
+    strncat(buf, "V", sizeof(buf) - strlen(buf) - 1U);
     lv_label_set_text(lbl_voltage, buf);
 
-    /* Current */
-    snprintf(buf, sizeof(buf), "%.1fA", (float)g_adc_data.im_mA / 1000.0f);
+    /* Current - one decimal amp means /100 of the milliamp reading */
+    gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.im_mA, 2U);
+    strncat(buf, "A", sizeof(buf) - strlen(buf) - 1U);
     lv_label_set_text(lbl_current, buf);
 
-    /* Temperature — unit follows the setting chosen in the language menu */
-    float tc = (float)g_adc_data.ntc_core_tenth_c / 10.0f;
+    /* Temperature — unit follows the setting chosen in the language menu.
+     * ntc_core_tenth_c is tenths of a degree Celsius; whole degrees. */
+    int32_t tc_tenth = (int32_t)g_adc_data.ntc_core_tenth_c;
     if (temp_fahrenheit) {
-        snprintf(buf, sizeof(buf), "%.0f°F", tc * 9.0f / 5.0f + 32.0f);
+        /* F = C * 9 / 5 + 32, kept in tenths so this stays integer. */
+        int32_t f_tenth = (tc_tenth * 9L) / 5L + 320L;
+        gui_fmt_fixed(buf, sizeof(buf), (f_tenth + 5) / 10, 0U);
+        strncat(buf, "\xC2\xB0" "F", sizeof(buf) - strlen(buf) - 1U);
     } else {
-        snprintf(buf, sizeof(buf), "%.0f°C", tc);
+        gui_fmt_fixed(buf, sizeof(buf), (tc_tenth + 5) / 10, 0U);
+        strncat(buf, "\xC2\xB0" "C", sizeof(buf) - strlen(buf) - 1U);
     }
     lv_label_set_text(lbl_temp, buf);
 
@@ -1309,12 +1394,20 @@ static void cal_build_results_ui(void)
 
     char buf[128];
     lv_obj_t *params_lbl = lv_label_create(cal_container, NULL);
+    /* The least-squares fit itself is genuinely floating point; only the
+     * rendering is converted to fixed point, so printf never sees a float. */
+    char slope_x[16], off_x[16], slope_y[16], off_y[16], resid[16];
+    gui_fmt_fixed(slope_x, sizeof(slope_x), (int32_t)(x_slope * 1000.0f), 3U);
+    gui_fmt_fixed(off_x,   sizeof(off_x),   (int32_t)(x_off   *  10.0f), 1U);
+    gui_fmt_fixed(slope_y, sizeof(slope_y), (int32_t)(y_slope * 1000.0f), 3U);
+    gui_fmt_fixed(off_y,   sizeof(off_y),   (int32_t)(y_off   *  10.0f), 1U);
+    gui_fmt_fixed(resid,   sizeof(resid),   (int32_t)(residual *  10.0f), 1U);
     snprintf(buf, sizeof(buf),
-        "X: y = %.3f * x + %.1f\n"
-        "Y: y = %.3f * x + %.1f\n"
-        "%s: %.1f%% (max 5%%)",
-        x_slope, x_off, y_slope, y_off,
-        gui_get_string(STR_CAL_RESIDUAL), residual);
+        "X: y = %s * x + %s\n"
+        "Y: y = %s * x + %s\n"
+        "%s: %s%% (max 5%%)",
+        slope_x, off_x, slope_y, off_y,
+        gui_get_string(STR_CAL_RESIDUAL), resid);
     lv_label_set_text(params_lbl, buf);
     lv_obj_align(params_lbl, cal_container, LV_ALIGN_CENTER, 0, -20);
     lv_obj_set_style_local_text_color(params_lbl, LV_LABEL_PART_MAIN,
@@ -2529,8 +2622,8 @@ static const char *cc_coupler_name(void)
 static void cc_step_desc(uint8_t step, char *buf, size_t len)
 {
     const char *dir = (step < 2) ? "Forward" : "Reflected";
-    float power = (step == 0 || step == 2) ? 5.0f : 20.0f;
-    snprintf(buf, len, "%s %.0fW", dir, power);
+    const char *watts = ((step == 0 || step == 2) ? "5W" : "20W");
+    snprintf(buf, len, "%s %s", dir, watts);
 }
 
 /* Read ADC raw value for the current coupler + step */
@@ -2727,9 +2820,9 @@ static void cc_refresh_ui(uint8_t step)
     snprintf(buf, sizeof(buf), "%d/%d  %s", step + 1, CC_STEPS, step_str);
     lv_label_set_text(cc_step_label, buf);
 
-    snprintf(buf, sizeof(buf), "%s %.0fW AM  |  %s",
+    snprintf(buf, sizeof(buf), "%s %s AM  |  %s",
              gui_get_string(STR_CAL_POINT),
-             (step == 0 || step == 2) ? 5.0f : 20.0f,
+             ((step == 0 || step == 2) ? "5" : "20"),
              gui_get_string(STR_START_MEAS));
     lv_label_set_text(cc_instr_label, buf);
 
@@ -2875,12 +2968,13 @@ void gui_process_coupler_cal(void)
         cal = (cc_coupler_id == 1) ? &g_config.rev1 : &g_config.rev2;
     int32_t power_mW = (int32_t)((int64_t)adc * cal->gain_uW_per_code / 1000)
                      + cal->offset_mW;
-    snprintf(cc_buf, sizeof(cc_buf), "%.2f W", (float)power_mW / 1000.0f);
+    gui_fmt_fixed(cc_buf, sizeof(cc_buf), (power_mW + 500) / 1000, 0U);
+    strncat(cc_buf, " W", sizeof(cc_buf) - strlen(cc_buf) - 1U);
 #else
     /* Simulator: show the nominal power of the current step so the layout
      * can be verified without a calibrated coupler in the config. */
-    snprintf(cc_buf, sizeof(cc_buf), "%.0f W",
-             (cc_step == 0 || cc_step == 2) ? 5.0f : 20.0f);
+    snprintf(cc_buf, sizeof(cc_buf), "%s W",
+             (cc_step == 0 || cc_step == 2) ? "5" : "20");
 #endif
     lv_label_set_text(cc_adc_val_label, cc_buf);
     gui_unlock();
@@ -3201,28 +3295,42 @@ void gui_update_sensor_inspect(void)
 
         switch (i) {
             case ADC1_RANK_RF_IN:
-                snprintf(buf, sizeof(buf), "%.2fW", (float)g_adc_data.rf_in_mW / 1000.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.rf_in_mW + 500) / 1000, 0U);
+                strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_IM:
-                snprintf(buf, sizeof(buf), "%.2fA", (float)g_adc_data.im_mA / 1000.0f);
+                gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.im_mA, 2U);
+                strncat(buf, "A", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_REV1:
-                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.rev1_mW / 1000.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.rev1_mW + 500) / 1000, 0U);
+                strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_FWD1:
-                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.fwd1_mW / 1000.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.fwd1_mW + 500) / 1000, 0U);
+                strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_REV2:
-                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.rev2_mW / 1000.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.rev2_mW + 500) / 1000, 0U);
+                strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_VBIAS:
-                snprintf(buf, sizeof(buf), "%.0fmV", (double)g_adc_data.vbias_mV);
+                gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.vbias_mV, 0U);
+                strncat(buf, "mV", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_FWD2:
-                snprintf(buf, sizeof(buf), "%.1fW", (float)g_adc_data.fwd2_mW / 1000.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.fwd2_mW + 500) / 1000, 0U);
+                strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_VM:
-                snprintf(buf, sizeof(buf), "%.2fV", (float)g_adc_data.vm_mV / 1000.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.vm_mV + 500) / 1000, 0U);
+                strncat(buf, "V", sizeof(buf) - strlen(buf) - 1U);
                 break;
             default:
                 snprintf(buf, sizeof(buf), "code");
@@ -3272,16 +3380,19 @@ void gui_update_sensor_inspect(void)
                 snprintf(buf, sizeof(buf), "%u", raw);
                 break;
             case 2:
-                snprintf(buf, sizeof(buf), "%.1fC",
-                         (float)g_adc_data.ntc_core_tenth_c / 10.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.ntc_core_tenth_c + 5) / 10, 0U);
+                strncat(buf, "C", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case 3:
-                snprintf(buf, sizeof(buf), "%.1fC",
-                         (float)g_adc_data.ntc_aux_tenth_c / 10.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.ntc_aux_tenth_c + 5) / 10, 0U);
+                strncat(buf, "C", sizeof(buf) - strlen(buf) - 1U);
                 break;
             default:
-                snprintf(buf, sizeof(buf), "%.1fC",
-                         (float)g_adc_data.mcu_int_tenth_c / 10.0f);
+                gui_fmt_fixed(buf, sizeof(buf),
+                              ((int32_t)g_adc_data.mcu_int_tenth_c + 5) / 10, 0U);
+                strncat(buf, "C", sizeof(buf) - strlen(buf) - 1U);
                 break;
         }
 #else
@@ -3498,59 +3609,65 @@ static lv_obj_t *prot_val_labels[PROT_COUNT];
 
 /* Editable protection thresholds, held as plain floats for readability.
  * prot_from_config() / prot_to_config() translate to the integer units
- * actually stored in ConfigType (SWR is x100, temperature is 0.1 C). */
-static float prot_val[PROT_COUNT];
-static float prot_val_backup[PROT_COUNT];
+ * actually stored in ConfigType (SWR is x100, temperature is 0.1 C).
+ *
+ * prot_val is int32 in tenths of the display unit.  lv_slider works in
+ * integers anyway (that is why it was divided by 10 on the way in), and
+ * keeping the whole chain integral means the labels can be rendered without
+ * any float printf. */
+static int32_t prot_val[PROT_COUNT];
+static int32_t prot_val_backup[PROT_COUNT];
 
 /* CC6920BSO-50A main-current sensor, used only to SHOW what the COMP2
  * reference voltage means in amps.  The sensor law is fixed by the
  * datasheet (V = 1650 mV + I * 26.4), so this is a display convenience
  * and not a calibration: the stored and applied quantity stays the
- * reference voltage in mV. */
-#define IM_SENSOR_ZERO_MV     1650.0f
-#define IM_SENSOR_MV_PER_A    26.4f
+ * reference voltage in mV.  Both constants are scaled by 10 to match the
+ * tenths used by prot_val / prot_format. */
+#define IM_SENSOR_ZERO_MV_TENTH   16500   /* 1650 mV in tenths */
+#define IM_SENSOR_MV_PER_A_TENTH   264    /*  26.4 mV/A in tenths */
 
 typedef struct {
     const char *name;
-    float vmin, vmax;      /* slider range in display units */
+    int32_t vmin, vmax;      /* slider range in tenths of the display unit */
     const char *unit;
     int decimals;
     /* When non-zero, the row also shows the engineering equivalent
      * derived from the stored millivolts.  Only COMP2 has a published
-     * transfer function; COMP1 is uncalibrated (TODO-COMP1标定待办.txt). */
+     * transfer function; COMP1 is uncalibrated (TODO-COMP1标定待办.txt).*/
     int derived_from_mv;
 } ProtField;
 
 static const ProtField prot_fields[PROT_COUNT] = {
-    {"REV2",     100,  600, "W", 0, 0},
-    {"REV2+SWR",  50,  400, "W", 0, 0},
-    {"SWR",         1,    5, "",  1, 0},
-    {"REV1",     100, 1000, "W", 0, 0},
-    {"Main I",    10,   30, "A", 0, 0},
-    {"Temp",      60,  120, "C", 0, 0},
-    {"FWD1",     500, 1500, "W", 0, 0},
-    {"FWD2",     500, 1500, "W", 0, 0},
+    {"REV2",     1000,  6000, "W", 0, 0},
+    {"REV2+SWR",  500,  4000, "W", 0, 0},
+    {"SWR",        10,    50, "",  1, 0},
+    {"REV1",     1000, 10000, "W", 0, 0},
+    {"Main I",    100,   300, "A", 0, 0},
+    {"Temp",      600,  1200, "C", 0, 0},
+    {"FWD1",     5000, 15000, "W", 0, 0},
+    {"FWD2",     5000, 15000, "W", 0, 0},
     /* COMP1: reference voltage only.  No wattage, because the D5/R40
      * peak detector in front of PB2 has not been calibrated yet. */
-    {"C1 ref",   200, (float)COMP1_REF_MV_MAX, "mV", 0, 0},
+    {"C1 ref",   2000, COMP1_REF_MV_MAX * 10, "mV", 0, 0},
     /* COMP2: reference voltage, with the derived amp rating alongside. */
-    {"C2 ref",  1700, (float)COMP2_REF_MV_MAX, "mV", 0, 1},
+    {"C2 ref", 17000, COMP2_REF_MV_MAX * 10, "mV", 0, 1},
 };
 
-/* Load the thresholds from g_config (float display units). */
+/* Load the thresholds from g_config (tenths of the display unit). */
 static void prot_from_config(void)
 {
 #ifndef LVGL_SIM
-    prot_val[0] = (float)g_config.band_rev2_max_w;
-    prot_val[1] = (float)g_config.band_rev2_swr_w;
-    prot_val[2] = (float)g_config.band_swr_max_x100     / 100.0f;
-    prot_val[3] = (float)g_config.band_rev1_max_w;
-    prot_val[4] = (float)g_config.band_im_max_mA / 1000.0f;   /* mA -> A */
-    prot_val[5] = (float)g_config.band_ntc_max_tenth_c / 10.0f;
-    prot_val[6] = (float)g_config.band_fwd1_max_w;
-    prot_val[7] = (float)g_config.band_fwd2_max_w;
-    prot_val[8] = (float)g_config.comp1_ref_mV;
-    prot_val[9] = (float)g_config.comp2_ref_mV;
+    prot_val[0] = (int32_t)g_config.band_rev2_max_w      * 10;
+    prot_val[1] = (int32_t)g_config.band_rev2_swr_w      * 10;
+    prot_val[2] = (int32_t)g_config.band_swr_max_x100         / 10;  /* x100 -> tenths */
+    prot_val[3] = (int32_t)g_config.band_rev1_max_w      * 10;
+    prot_val[4] = (int32_t)g_config.band_im_max_mA          / 100; /* mA -> A */
+    prot_val[5] = (int32_t)g_config.band_ntc_max_tenth_c     ;      /* already tenths */
+    prot_val[6] = (int32_t)g_config.band_fwd1_max_w      * 10;
+    prot_val[7] = (int32_t)g_config.band_fwd2_max_w      * 10;
+    prot_val[8] = (int32_t)g_config.comp1_ref_mV         * 10;
+    prot_val[9] = (int32_t)g_config.comp2_ref_mV         * 10;
 #endif
 }
 
@@ -3558,33 +3675,54 @@ static void prot_from_config(void)
 static void prot_to_config(void)
 {
 #ifndef LVGL_SIM
-    g_config.band_rev2_max_w      = (uint16_t)prot_val[0];
-    g_config.band_rev2_swr_w       = (uint16_t)prot_val[1];
-    g_config.band_swr_max_x100    = (uint16_t)(prot_val[2] * 100.0f);
-    g_config.band_rev1_max_w      = (uint16_t)prot_val[3];
-    g_config.band_im_max_mA       = (uint16_t)(prot_val[4] * 1000.0f);  /* A -> mA */
-    g_config.band_ntc_max_tenth_c = (uint16_t)(prot_val[5] * 10.0f);
-    g_config.band_fwd1_max_w      = (uint16_t)prot_val[6];
-    g_config.band_fwd2_max_w      = (uint16_t)prot_val[7];
-    g_config.comp1_ref_mV         = (uint16_t)prot_val[8];
-    g_config.comp2_ref_mV         = (uint16_t)prot_val[9];
+    g_config.band_rev2_max_w      = (uint16_t)(prot_val[0] / 10);
+    g_config.band_rev2_swr_w       = (uint16_t)(prot_val[1] / 10);
+    g_config.band_swr_max_x100    = (uint16_t)(prot_val[2] * 10);
+    g_config.band_rev1_max_w      = (uint16_t)(prot_val[3] / 10);
+    g_config.band_im_max_mA       = (uint16_t)(prot_val[4] * 100);  /* A -> mA */
+    g_config.band_ntc_max_tenth_c = (uint16_t)prot_val[5];
+    g_config.band_fwd1_max_w      = (uint16_t)(prot_val[6] / 10);
+    g_config.band_fwd2_max_w      = (uint16_t)(prot_val[7] / 10);
+    g_config.comp1_ref_mV         = (uint16_t)(prot_val[8] / 10);
+    g_config.comp2_ref_mV         = (uint16_t)(prot_val[9] / 10);
 #endif
 }
 
-/* Format a threshold value for display.  Celsius gets its Fahrenheit
- * twin; the COMP2 row additionally shows what the reference voltage works
- * out to in amps, which is the number the operator actually reasons
- * about ("30 A") even though the stored quantity is millivolts. */
-static void prot_format(const ProtField *pf, float val, char *buf, size_t len)
+/* Format a threshold value for display.  val is in tenths of the display
+ * unit.  Celsius gets its Fahrenheit twin; the COMP2 row additionally shows
+ * what the reference voltage works out to in amps, which is the number the
+ * operator actually reasons about ("30 A") even though the stored quantity
+ * is millivolts. */
+static void prot_format(const ProtField *pf, int32_t val_tenth,
+                        char *buf, size_t len)
 {
     if (pf->unit[0] == 'C') {
-        float f = val * 9.0f / 5.0f + 32.0f;
-        snprintf(buf, len, "%.0f%s / %.0fF", val, pf->unit, f);
+        /* F = C * 9 / 5 + 32, kept in tenths so this stays integer. */
+        int32_t f_tenth = (val_tenth * 9L) / 5L + 320L;
+        gui_fmt_fixed(buf, len, val_tenth, 0U);
+        strncat(buf, pf->unit, len - strlen(buf) - 1U);
+        strncat(buf, " / ", len - strlen(buf) - 1U);
+        {
+            char tmp[24];
+            gui_fmt_fixed(tmp, sizeof(tmp), f_tenth, 0U);
+            strncat(buf, tmp, len - strlen(buf) - 1U);
+        }
+        strncat(buf, "F", len - strlen(buf) - 1U);
     } else if (pf->derived_from_mv) {
-        float amps = (val - IM_SENSOR_ZERO_MV) / IM_SENSOR_MV_PER_A;
-        snprintf(buf, len, "%.0fmV/%.1fA", val, amps);
+        /* A = (mV - 1650) / 26.4, carried in tenths. */
+        int32_t amps_tenth =
+            (val_tenth - IM_SENSOR_ZERO_MV_TENTH) / IM_SENSOR_MV_PER_A_TENTH;
+        gui_fmt_fixed(buf, len, val_tenth, 0U);
+        strncat(buf, "mV/", len - strlen(buf) - 1U);
+        {
+            char tmp[24];
+            gui_fmt_fixed(tmp, sizeof(tmp), amps_tenth, 1U);
+            strncat(buf, tmp, len - strlen(buf) - 1U);
+        }
+        strncat(buf, "A", len - strlen(buf) - 1U);
     } else {
-        snprintf(buf, len, "%.*f%s", pf->decimals, val, pf->unit);
+        gui_fmt_fixed(buf, len, val_tenth, (uint8_t)pf->decimals);
+        strncat(buf, pf->unit, len - strlen(buf) - 1U);
     }
 }
 
@@ -3597,9 +3735,9 @@ static void prot_slider_cb(lv_obj_t *slider, lv_event_t e)
         }
         if (idx < 0 || !prot_val_labels[idx]) return;
 
-        /* lv_slider works in integers, so use a 0.1x scale internally
-         * (SWR 1.0..5.0 -> 10..50) and keep everything else in float. */
-        prot_val[idx] = (float)lv_slider_get_value(slider) / 10.0f;
+        /* prot_val is in tenths, and so is the slider range, so the two
+         * are the same integer - no scaling needed in either direction. */
+        prot_val[idx] = (int32_t)lv_slider_get_value(slider);
         char buf[48];
         prot_format(&prot_fields[idx], prot_val[idx], buf, sizeof(buf));
         lv_label_set_text(prot_val_labels[idx], buf);
@@ -3660,8 +3798,7 @@ static void prot_slider_create(lv_obj_t *parent, int idx, lv_coord_t x,
                                       LV_STATE_DEFAULT, &MyCJK_12);
 
     lv_obj_t *val_lbl = lv_label_create(parent, NULL);
-    float init_val = prot_val[idx];
-    prot_format(pf, init_val, buf, sizeof(buf));
+    prot_format(pf, prot_val[idx], buf, sizeof(buf));
     lv_label_set_text(val_lbl, buf);
     /* Park the value in the right half of the cell.  Explicit positioning is
      * used rather than right-alignment because a bare label ignores
@@ -3675,11 +3812,10 @@ static void prot_slider_create(lv_obj_t *parent, int idx, lv_coord_t x,
     lv_obj_t *slider = lv_slider_create(parent, NULL);
     lv_obj_set_size(slider, w, 14);
     lv_obj_set_pos(slider, x, y + 17);
-    /* Slider uses a 0.1x integer scale so SWR 1.0..5.0 fits lv_slider's
-     * integer range with usable resolution. */
-    lv_slider_set_range(slider, (int16_t)(pf->vmin * 10.0f),
-                               (int16_t)(pf->vmax * 10.0f));
-    lv_slider_set_value(slider, (int16_t)(init_val * 10.0f), LV_ANIM_OFF);
+    /* prot_fields already carries tenths (SWR 1.0..5.0 -> 10..50), which is
+     * what gives lv_slider usable resolution in its integer range. */
+    lv_slider_set_range(slider, (int16_t)pf->vmin, (int16_t)pf->vmax);
+    lv_slider_set_value(slider, (int16_t)prot_val[idx], LV_ANIM_OFF);
 
     prot_sliders[idx] = slider;
     prot_val_labels[idx] = val_lbl;

@@ -45,7 +45,6 @@
 #include "stdio.h"
 #include <stdlib.h>
 #include "main.h"
-#include "usbd_cdc_if.h"
 #include "usart.h"
 
 /*============================================================================
@@ -144,7 +143,7 @@ static void comm_send_bytes(const char *data, uint16_t len)
         return;
     }
     /* USB CDC：失败静默 */
-    (void)CDC_Transmit_HS((uint8_t *)data, len);
+//    (void)CDC_Transmit_HS((uint8_t *)data, len);
 
     /* LPUART1 TX ring：满则覆盖（牺牲老数据，保留最新的）。 */
 #ifndef LVGL_SIM
@@ -280,13 +279,17 @@ static const char *comm_band_str(BandType b)
 
 static void comm_format_status_line(char *buf, size_t cap)
 {
-    float fwd_w   = (float)g_adc_data.fwd2_mW / 1000.0f;
-    float rev_w   = (float)g_adc_data.rev2_mW / 1000.0f;
-    float swr     = (float)g_adc_data.swr_x100 / 100.0f;
-    float v       = (float)g_adc_data.vm_mV / 1000.0f;
-    float im_a    = (float)g_adc_data.im_mA / 1000.0f;
-    float temp_c  = (float)g_adc_data.ntc_core_tenth_c / 10.0f;
-    uint32_t freq = g_radio_freq_hz;
+    /* All of these arrive as integer engineering units (mW, x100, mV, mA,
+     * tenths of a degree).  Scale them by hand into the fixed-point the
+     * report format uses so printf never sees a float.  Power, voltage and
+     * temperature report whole units; SWR and current carry one decimal. */
+    int32_t fwd_w   = ((int32_t)g_adc_data.fwd2_mW + 500) / 1000;   /* whole W */
+    int32_t rev_w   = ((int32_t)g_adc_data.rev2_mW + 500) / 1000;
+    int32_t swr_d   = (int32_t)g_adc_data.swr_x100 / 10;           /* 0.1 */
+    int32_t v       = ((int32_t)g_adc_data.vm_mV + 500) / 1000;     /* whole V */
+    int32_t im_ca   = (int32_t)g_adc_data.im_mA;                    /* 0.01 A */
+    int32_t temp_t  = ((int32_t)g_adc_data.ntc_core_tenth_c + 5) / 10;
+    uint32_t freq   = g_radio_freq_hz;
 
     /* ptt: 1 = keyed, 0 = idle. freq_detect_task 在 PTT 时把 g_tx_active 置
      * true；这里直接读它。 */
@@ -305,13 +308,17 @@ static void comm_format_status_line(char *buf, size_t cap)
              (unsigned)(power_fan_ntc_fault() ? 1U : 0U));
 
     snprintf(buf, cap,
-        "status pwr=%s band=%s freq=%lu fwd=%.1f rev=%.1f swr=%.2f "
-        "v=%.1f im=%.2f temp=%.1f ptt=%u hv=%u psu=%u fan=%s alert=%d",
+        "status pwr=%s band=%s freq=%lu fwd=%ld rev=%ld "
+        "swr=%ld.%ld v=%ld im=%ld.%02ld temp=%ld "
+        "ptt=%u hv=%u psu=%u fan=%s alert=%d",
         comm_power_state_str(),
         comm_band_str(g_current_band),
         (unsigned long)freq,
-        (double)fwd_w, (double)rev_w, (double)swr,
-        (double)v, (double)im_a, (double)temp_c,
+        (long)fwd_w, (long)rev_w,
+        (long)(swr_d / 10), (long)((swr_d < 0 ? -swr_d : swr_d) % 10),
+        (long)v,
+        (long)(im_ca / 100), (long)((im_ca < 0 ? -im_ca : im_ca) % 100),
+        (long)temp_t,
         (unsigned)ptt, (unsigned)hv, (unsigned)psu,
         fan_buf,
         (int)g_alert_active);

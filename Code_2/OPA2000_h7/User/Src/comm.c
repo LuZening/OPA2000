@@ -288,7 +288,7 @@ static void comm_format_status_line(char *buf, size_t cap)
     int32_t rev_w   = ((int32_t)g_adc_data.rev2_mW + 500) / 1000;
     int32_t swr_d   = (int32_t)g_adc_data.swr_x100 / 10;           /* 0.1 */
     int32_t v       = ((int32_t)g_adc_data.vm_mV + 500) / 1000;     /* whole V */
-    int32_t im_ca   = (int32_t)g_adc_data.im_mA;                    /* 0.01 A */
+    int32_t im_ca   = (int32_t)g_adc_data.im_mA / 10;                /* mA -> 0.01 A */
     int32_t temp_t  = ((int32_t)g_adc_data.ntc_core_tenth_c + 5) / 10;
     uint32_t freq   = g_radio_freq_hz;
 
@@ -352,7 +352,13 @@ static void comm_set_var(const char *name, const char *value)
             comm_send_err("lang must be chinese|english|zh|en");
             return;
         }
-        (void)config_save();
+        /* Persist through the deferred-save machinery rather than writing
+         * the flash here.  A direct config_save() would race the config
+         * task's own write: two eeprom_save() calls can pick the same
+         * target slot, and one of the two records would be silently lost.
+         * config_mark_dirty() wakes the save task, which takes the lock
+         * and does the write on its own. */
+        config_mark_dirty();
         comm_send_ok();
         return;
     }
@@ -368,6 +374,18 @@ static void comm_set_var(const char *name, const char *value)
             return;
         }
         g_config.radio_baud_rate = baud;
+        comm_send_ok();
+        return;
+    }
+
+    /* 保护总开关。0 = 固件不再判断任何阈值、不再执行任何保护动作。
+     * 注意这挡不住硬件：AWD1/2/3 看门狗、COMP1/2 比较器、PB12 硬故障
+     * 信号仍会各自动作。 */
+    if (strcmp(name, "allow_protection") == 0
+        || strcmp(name, "protection") == 0) {
+        uint32_t v = (uint32_t)strtoul(value, NULL, 10);
+        if (v > 1U) { comm_send_err("allow_protection must be 0 or 1"); return; }
+        g_config.allow_protection = (uint8_t)v;
         comm_send_ok();
         return;
     }
@@ -447,6 +465,12 @@ static void comm_query_var(const char *name)
     if (strcmp(name, "radio_baud") == 0 || strcmp(name, "radiobaud") == 0) {
         snprintf(buf, sizeof buf, "radio_baud=%lu", (unsigned long)g_config.radio_baud_rate);
         comm_send_line(buf);
+        return;
+    }
+    if (strcmp(name, "allow_protection") == 0
+        || strcmp(name, "protection") == 0) {
+        comm_send_line(g_config.allow_protection
+                       ? "allow_protection=1" : "allow_protection=0");
         return;
     }
     if (strcmp(name, "swr_max") == 0) {
@@ -556,6 +580,7 @@ static void comm_action_help(void)
         "  band / protocol   auto|icom|yaesu|kenwood",
         "  lang           chinese|english",
         "  radio_baud     current CAT baud in bps",
+        "  allow_protection  1=armed (default)  0=firmware ignores all limits",
         "  swr_max / rev2_max / rev1_max / fwd1_max / fwd2_max",
         "  im_max / vbias_max / ntc_max",
         "",
@@ -567,6 +592,8 @@ static void comm_action_help(void)
         "  im_max=1..50000                 (mA)",
         "  vbias_max=100..5000             (mV)",
         "  ntc_max=100..1500               (0.1 C)",
+        "  allow_protection=0|1            (0 = firmware takes no protective",
+        "                                   action; hardware AWD/COMP still do)",
         "  NB: SET only updates RAM. Use 'save' to persist.",
         "",
         "-- Action --",
@@ -627,7 +654,21 @@ static void comm_action_alert_off(void)
 
 static void comm_action_save(void)
 {
-    if (config_save()) {
+    /* An explicit "save" from the CAT link.  It still writes here, because
+     * the operator asked for it and wants an answer right now - but it
+     * takes the config lock, so it cannot land in the middle of the save
+     * task's own write (two eeprom_save() calls picking the same target
+     * slot would lose one of the two records).
+     *
+     * The dirty flag is cleared afterwards: the write that just happened
+     * IS the requested save, so the save task must not write the same
+     * record again on its next wake. */
+    config_lock();
+    config_clear_dirty();
+    bool ok = config_save();
+    config_unlock();
+
+    if (ok) {
         comm_send_ok();
     } else {
         comm_send_err("save failed");
@@ -636,7 +677,20 @@ static void comm_action_save(void)
 
 static void comm_action_reset_cfg(void)
 {
+    /* config_reset_default() does NOT lock (the module rule is that public
+     * config_*() never do), so the lock is taken here.  Without it this
+     * memset of all 128 bytes of g_config could land in the middle of the
+     * save task's CRC-and-write, producing a record whose CRC does not
+     * match its payload - which the next boot rejects, i.e. the restore
+     * silently does nothing.
+     *
+     * The dirty flag is cleared because the write that just happened IS
+     * the requested save; leaving it set would have the save task write
+     * the same defaults again for nothing. */
+    config_lock();
     config_reset_default();
+    config_clear_dirty();
+    config_unlock();
     comm_send_ok();
 }
 
@@ -691,7 +745,7 @@ static void comm_dispatch_action(char *lower, const char *first_token)
     /* 两 token: psu on / psu off / hv on / hv off / bias on / bias off */
     const char *arg = strchr(lower, ' ');
     if (arg == NULL) {
-        char buf[64];
+        char buf[96];
         snprintf(buf, sizeof buf, "unknown action '%s'", first_token);
         comm_send_err(buf);
         return;
@@ -795,7 +849,7 @@ void comm_alert_pump(void)
 {
 #ifndef LVGL_SIM
     while (s_alert_evt_tail != s_alert_evt_head) {
-        AlertEvent ev = s_alert_evt_ring[s_alert_evt_tail];
+        AlertEvent ev = s_alert_evt_ring[s_alert_evt_tail]; // Note: Hard fault right after dismiss
         s_alert_evt_tail = (uint8_t)((s_alert_evt_tail + 1U) % COMM_ALERT_EVT_RING_SIZE);
 
         char buf[48];

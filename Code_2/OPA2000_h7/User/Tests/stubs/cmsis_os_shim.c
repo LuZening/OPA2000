@@ -42,6 +42,11 @@ typedef struct {
 /* Counters visible to tests (declared in header) */
 static uint32_t s_active_acquires = 0U;
 
+/* Thread-flag state (declared in header) */
+static uint32_t     s_flag_set_count   = 0U;
+static uint32_t     s_last_flag_set    = 0U;
+static osThreadId_t s_last_flag_target = NULL;
+
 uint32_t cmsis_os_shim_active_acquires(void)
 {
     return s_active_acquires;
@@ -50,6 +55,44 @@ uint32_t cmsis_os_shim_active_acquires(void)
 void cmsis_os_shim_reset_counters(void)
 {
     s_active_acquires = 0U;
+}
+
+uint32_t cmsis_os_shim_flag_set_count(void)
+{
+    return s_flag_set_count;
+}
+
+uint32_t cmsis_os_shim_last_flag_set(void)
+{
+    return s_last_flag_set;
+}
+
+osThreadId_t cmsis_os_shim_last_flag_target(void)
+{
+    return s_last_flag_target;
+}
+
+void cmsis_os_shim_reset_flag_counters(void)
+{
+    s_flag_set_count   = 0U;
+    s_last_flag_set    = 0U;
+    s_last_flag_target = NULL;
+}
+
+/*============================================================================
+ *  Thread flags
+ *
+ *  Only the Set() half is modelled: the config save task's wait lives in
+ *  app_tasks.c, which is not part of the host build.  What the host test
+ *  needs to observe is "did the code under test wake the save task, and
+ *  with which flags" - which is exactly what is recorded here.
+ *==========================================================================*/
+uint32_t osThreadFlagsSet (osThreadId_t thread_id, uint32_t flags)
+{
+    s_flag_set_count++;
+    s_last_flag_set    = flags;
+    s_last_flag_target = thread_id;
+    return flags;
 }
 
 /*============================================================================

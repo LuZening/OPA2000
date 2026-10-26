@@ -14,7 +14,8 @@
  *          Duty      = (CCR2 - CCR1) / (ARR + 1)
  *
  *          Per the firmware design spec the frequency should be
- *          ~200 kHz.  TIM2 clock = 200 MHz, so ARR = 999.
+ *          ~200 kHz.  TIM2 clock = 250 MHz (2 x APB1, prescaler 0),
+ *          so ARR = 1249.
  */
 
 #ifndef ALC_PWM_H

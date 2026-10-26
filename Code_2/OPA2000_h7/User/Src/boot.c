@@ -108,10 +108,10 @@ void boot_hold_thresholds_open(void)
     HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
     HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);
 
-    /* ADC watchdogs.  ma_to_adc_code() clamps to ADC_FULL_SCALE, and the
-     * two DC-coupled paths currently return 0 for everything anyway, so
-     * the exact argument does not matter yet - what matters is that this
-     * is a deliberate full-scale write and not a config-derived one. */
+    /* ADC watchdogs.  Each of these parks its own threshold at full
+     * scale, so nothing can be crossed by any conversion result.  The
+     * exact argument does not matter - what matters is that these are
+     * deliberate full-scale writes and not config-derived ones. */
     adc_awd_set_rf_in_mW(UINT32_MAX);
     adc_awd_set_im_mA(UINT16_MAX);
     adc_awd_set_rev1_mW(UINT32_MAX);
@@ -120,7 +120,8 @@ void boot_hold_thresholds_open(void)
      * left this open-drain pin at its reset value (released), which is
      * exactly what lets a power-up transient latch a fault - so pull it
      * low now, before the kernel even starts.  adc_stabilisation_tick()
-     * keeps re-asserting it every tick and releases it when armed. */
+     * releases it when the power-on silence is over and the protection
+     * chain goes live. */
     CLEAR_FAULTX_OC_LOW();
 #endif
 }
@@ -206,6 +207,26 @@ void boot_apply_comp_thresholds(void)
 
     if (ref1 > COMP1_REF_MV_MAX) { ref1 = COMP1_REF_MV_MAX; }
     if (ref2 > COMP2_REF_MV_MAX) { ref2 = COMP2_REF_MV_MAX; }
+
+    /* COMP2 watches the main-current node, and its reference is derived
+     * from the sensor's zero offset (V = Vrest + I * 26.4).  Until
+     * that offset has actually been measured, the reference would be
+     * placed at the wrong voltage - a comparator that trips at the wrong
+     * current is worse than one that does not trip at all.
+     *
+     * So COMP2 joins AWD2 in being parked at the rail until the
+     * zero-offset calibration has produced a usable number.  COMP1 (the
+     * RF input overdrive) is independent of the current measurement and
+     * stays armed either way. */
+    if (!adc_im_protection_valid()) {
+        ref2 = DAC_VDDA_MV;
+    } else {
+        /* The reference depends on WHICH sensor is fitted: the operator's
+         * stored value is expressed against the bidirectional sensor's
+         * 1.65 V baseline, so on a unidirectional board it has to be
+         * derived from the measured zero point instead. */
+        ref2 = adc_im_comp2_ref_mV(ref2, g_config.band_im_max_mA);
+    }
 
     /* Data first.  Errata 2.8.1 wants a write to a data register before
      * the MODE field is programmed; MX_DAC1_Init() already established

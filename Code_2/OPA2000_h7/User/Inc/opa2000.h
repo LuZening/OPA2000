@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file opa2000.h
  * @brief OPA2000 Global Definitions and Types
  *
@@ -51,12 +51,12 @@ extern "C" {
 #define ADC2_INJ_TSENSE        2U  /*!< InjRank 3 = TEMPSENSOR             */
 
 /* Protection defaults (overridable by config_t) */
-#define DEFAULT_PROTECT_REFLECT_POWER2_W     400     /* Watts */
+#define DEFAULT_PROTECT_REFLECT_POWER2_W     300     /* Watts */
 #define DEFAULT_PROTECT_REFLECT_POWER2_SWR   200     /* Watts */
-#define DEFAULT_PROTECT_SWR_THRESHOLD_X100   200     /* 2.00 */
+#define DEFAULT_PROTECT_SWR_THRESHOLD_X100   210     /* 2.10 */
 #define DEFAULT_PROTECT_REFLECT_POWER1_W     600     /* Watts */
 #define DEFAULT_PROTECT_MAIN_CURRENT_A       30      /* Amperes */
-#define DEFAULT_PROTECT_NTC_TEMP_C           90      /* Celsius */
+#define DEFAULT_PROTECT_NTC_TEMP_C           60      /* Celsius */
 #define DEFAULT_PROTECT_TX_POWER1_W         1100    /* Watts */
 #define DEFAULT_PROTECT_TX_POWER2_W         1050    /* Watts */
 
@@ -69,10 +69,127 @@ extern "C" {
 #define FAN_HYSTERESIS           10      /* degrees - sticky decrease */
 
 /* Software protection limits */
-#define MAX_NTC_TEMP_C           90
+#define MAX_NTC_TEMP_C           70
 #define MAX_TX_POWER1_W          1100
 #define MAX_TX_POWER2_W          1050
 #define MAX_MAIN_CURRENT_A       30
+
+/*==============================================================================
+ *  Hardware protection feature switches
+ *
+ *  These are COMPILE-TIME switches.  They exist because the hardware
+ *  protection paths are not interchangeable, and during bring-up it is
+ *  sometimes necessary to remove one of them to see what the others do.
+ *
+ *  Both are "defined = enabled", the same polarity as the HAL's own
+ *  USE_HAL_ADC_REGISTER_CALLBACKS.  Uncomment to ENABLE; comment out to
+ *  disable.  Nothing defines them on the compiler command line - they
+ *  live here so that there is exactly ONE place to look.
+ *
+ *  The DEFAULT state of each switch matches what the firmware does today,
+ *  so adding these macros changes no behaviour on its own:
+ *    USE_AWD  - ENABLED  (the watchdogs have always been live)
+ *    USE_COMP - ENABLED  (the comparators were switched off during
+ *                         bring-up and the switch was never thrown back;
+ *                         the settling window has since made it safe)
+ *
+ *  USE_AWD - the ADC analog watchdogs (AWD1 RF input, AWD2 main current,
+ *            AWD3 coupler-1 reverse).
+ *
+ *    When disabled, the three HAL_ADC*LevelOutOfWindow*Callback() handlers
+ *    become empty, so a watchdog trip no longer reaches
+ *    protection_trigger_locked().  The thresholds are ALSO parked at full
+ *    scale, which is what actually stops the hardware: an unwatched
+ *    threshold would still raise the ADC interrupt on every conversion
+ *    above it, and at main priority 0 that is an interrupt storm that
+ *    starves everything else.
+ *
+ *    >>> WARNING - READ THIS BEFORE USING IT <<<
+ *    The main-current over-current protection has NO software backstop.
+ *    protection_check() and protection_check_adc1_dma() compare the
+ *    coupler channels, SWR and VBIAS, but there is deliberately no
+ *    software comparison of g_adc_data.im_mA against
+ *    g_config.band_im_max_mA: the current limit is a HARDWARE limit by
+ *    design, because the software path (100 ms task tick) is far too slow
+ *    for a short-circuit.
+ *
+ *    So with USE_AWD disabled, the amplifier keeps ONE over-current path
+ *    (COMP2) - but only if USE_COMP is also enabled.  Switching BOTH off
+ *    leaves the amplifier with no over-current protection of any kind.
+ *    If the amplifier can draw a lethal current, do not ship that
+ *    combination.
+ *
+ * USE_COMP - the hardware comparators (COMP1 RF overdrive, COMP2
+ *            over-current).
+ *
+ *    When disabled, HAL_COMP_Start_IT() is not called, so neither
+ *    comparator's interrupt is ever armed.  The DAC references are still
+ *    programmed (boot_apply_comp_thresholds()) - that costs nothing and
+ *    keeps the pins in a known state - but nothing listens to the
+ *    comparator outputs.
+ *
+ *    Note that the comparators ARE enabled in this build.  They were
+ *    switched off during bring-up to stop a power-on overdrive trip, and
+ *    that switch was never thrown back - which left the firmware with
+ *    ONE over-current path (AWD2) where the design calls for two.  The
+ *    one-second settling window in user_adc.c is the proper fix for the
+ *    original problem, and it is what makes switching them back on safe.
+ *
+ *  Both switches are checked in the HAL callback bodies and in the
+ *  threshold setters, so the firmware cannot end up in a state where the
+ *  hardware is live but the software is ignoring it (or the other way
+ *  round).
+ *==========================================================================*/
+
+/* The ADC analog watchdogs.  ENABLED - the watchdogs have always been
+ * live in this firmware, and AWD2 is one of the two over-current
+ * protection paths (COMP2 is the other).  Comment this out to take the
+ * three watchdogs out of the build.
+ *
+ * The two-step form below is what makes that possible from a build.  A
+ * bare "#ifdef USE_AWD" around the feature code cannot be switched OFF
+ * from the compiler command line, because the header itself would have to
+ * define the macro to make the default work - and once it is defined,
+ * -UUSE_AWD on the command line has no effect (the header redefines it).
+ *
+ * So the header asks for a NEGATIVE switch and the feature code tests
+ * the positive one:
+ *      USE_COMP         - defined => the comparators are IN
+ *      USE_AWD          - derived,  => the watchdogs are IN
+ *
+ * A build that wants the watchdogs out defines OPA2000_NO_AWD (or simply
+ * comments the OPA2000_NO_AWD line out of the header).  The host test
+ * suite uses exactly that to build a second copy of the watchdog setters
+ * with the watchdogs switched off, and assert that the thresholds end up
+ * parked where they cannot trip. */
+
+#ifdef OPA2000_NO_AWD
+/* #define USE_AWD */
+#else
+#define USE_AWD
+#endif
+
+#ifdef OPA2000_NO_COMP
+/* #define USE_COMP */
+#else
+#define USE_COMP
+#endif
+
+
+/* The hardware comparators.  ENABLED.
+ *
+ * They were switched off during bring-up to stop a power-on overdrive
+ * trip, and that switch was never thrown back.  The one-second settling
+ * window in user_adc.c (STAB_COMPARATOR_WAIT) is exactly the fix the
+ * original problem needed - the comparators are started only after the
+ * input has settled and the references have been sitting at their real
+ * values for a full second - so the reason for switching them off is
+ * gone.
+ *
+ * They are also the SECOND of the two over-current paths (AWD2 is the
+ * first), and the design spec calls for the two to be independent.
+ */
+
 
 /*==============================================================================
  *  COMP comparator references (DAC1 outputs)
@@ -95,18 +212,28 @@ extern "C" {
  *    mis-typed config cannot pin the output at the rail. */
 #define COMP1_REF_MV_MAX              3000U
 /*!< COMP2 ceiling.  COMP2 watches the same node as ADC1_INP5, whose full
- *    scale is 2500 mV (VREFBUF), so anything above that is meaningless as
- *    a current threshold - 2442 mV is exactly the 30 A design limit. */
-#define COMP2_REF_MV_MAX              2442U
+ *    scale is 2500 mV (VREFBUF), so a reference above that cannot be
+ *    reached by the signal at all and 2500 is the real ceiling.
+ *
+ *    Note this is NOT the 30 A design limit any more.  The reference is
+ *    derived from the sensor's MEASURED resting point
+ *    (adc_im_comp2_ref_mV), and the tolerance band on that point spans
+ *    roughly +/-190 mV, i.e. +/-7 A.  A sensor resting above 1.65 V
+ *    therefore needs a reference above 1650 + 792 = 2442 mV to trip at
+ *    30 A, and clamping it to 2442 would make the backstop fire
+ *    EARLY - the exact failure the derivation exists to remove. */
+#define COMP2_REF_MV_MAX              2500U
 
 /*!< Ship default for COMP2: the 30 A design limit through the documented
- *    CC6920BSO-50A transfer function, V = 1650 + I * 26.4. */
+ *    CC6920BSO-50A transfer function, V = 1650 + I * 26.4.  Used only as
+ *    a stored fallback for an unrecognised sensor; on a fitted one the
+ *    reference is always derived from the measured zero point. */
 #define DEFAULT_COMP2_REF_MV          2442U
 /*!< Ship default for COMP1: deliberately conservative (about 45 % of full
  *    scale).  The D5/R40 peak detector ahead of PB2 is uncalibrated, so
  *    this only has to sit far above the detector noise floor; the precise
- *    RF-input limit is enforced by AWD1 in firmware. */
-#define DEFAULT_COMP1_REF_MV          1500U
+ *    RF-input limit is enforced by AWD1 in firmware. 2378 = 68K + 2.2K @ 30W input */
+#define DEFAULT_COMP1_REF_MV          2378U
 
 /* Band frequency ranges (Hz) - 5 combined bands.
  * freq_to_band() returns BAND_* based on these. */
@@ -259,11 +386,12 @@ typedef struct {
      * user_adc.c; the GUI reads them and must never write.
      *
      * Semantics: attack is instantaneous (a new maximum replaces the held
-     * value at once), release is an exponential decay with a 500 ms time
-     * constant, i.e. the held value falls to 1/e (36.8 %) of its starting
-     * amplitude 500 ms after the input drops below it, and to 5 % after
-     * 1.5 s.  This is what makes a short power spike readable on a bar
-     * graph without the needle flickering back to zero between syllables.
+     * value at once), release is an exponential decay with the time constant
+     * PEAK_TAU_MS (user_adc.h), i.e. the held value falls to 1/e (36.8 %) of
+     * its starting amplitude one tau after the input drops below it, and to
+     * 5 % after three tau.  This is what makes a short power spike readable
+     * on a bar graph without the needle flickering back to zero between
+     * syllables.
      *
      * These are a measurement, not a function of the keying state: they
      * track the coupler unconditionally and are NOT gated on g_tx_active /
@@ -342,7 +470,20 @@ typedef struct {
     uint16_t comp1_ref_mV;            /*!< DAC1 CH1 -> COMP1_INP- (PB2)    */
     uint16_t comp2_ref_mV;            /*!< DAC1 CH2 -> COMP2_INP- (PE9)    */
 
-    /* IM zero-offset calibration */
+    /* IM zero-offset calibration.
+     *
+     * im_zero_offset_adc is the measured resting code of the CC6920
+     * (0 A reads 1650 mV = 43254 codes on a 2.5 V reference).  The
+     * value is kept across reboots because it is useful as a starting
+     * point, but it is re-measured on every boot.
+     *
+     * im_calibrated is a per-boot MEASUREMENT flag, not a setting: it is
+     * true only after the calibration has succeeded in THIS session, and
+     * it is never persisted (config_save() clears it).  It is also what
+     * arms the main-current protection - AWD2's threshold and COMP2's
+     * reference are both "zero offset plus the current limit", so until
+     * this flag is set they are parked where they cannot trip.  See
+     * adc_im_protection_valid() in adc_calibration.h. */
     uint16_t im_zero_offset_adc;
     uint8_t  im_calibrated;
 
@@ -359,11 +500,58 @@ typedef struct {
     LanguageType language;
     uint8_t  buzzer_enable;
     uint8_t  temp_fahrenheit;         /*!< display temperatures in degF     */
-    uint8_t  reserved[5];
+
+    /* Master protection enable.  Non-zero = protection armed (default);
+     * zero = the firmware stops judging every threshold and stops taking
+     * any protective action.  See protection_trigger_locked() for exactly
+     * what that does and does not cover - the hardware watchdogs (AWD1/2/3),
+     * the COMP comparators and the PB12 hard-fault line are NOT gated by
+     * this and still act on their own.
+     *
+     * Carved out of the old reserved[] padding rather than appended, so the
+     * struct layout and therefore the CRC coverage are unchanged and every
+     * already-stored config record stays valid. */
+    uint8_t  allow_protection;
+
+    /* Which main-current sensor is fitted.  Detected automatically at
+     * power-on from the sensor's own resting output, so the same firmware
+     * runs on both board variants:
+     *
+     *   IM_SENSOR_UNKNOWN       not detected yet (or the reading was
+     *                           nonsense - neither signature matched)
+     *   IM_SENSOR_BIDIRECTIONAL the CC6920BSO-50A and relatives: 1.65 V
+     *                           at 0 A, so the raw code rests near
+     *                           43254 and a zero-offset calibration is
+     *                           needed
+     *   IM_SENSOR_UNIDIRECTIONAL  a one-way sensor: below 0.3 V at 0 A, so
+     *                           the raw code rests near zero
+     *
+     * The two differ in what the resting level MEANS, not in how it is
+     * measured: both are read the same way, and both need the resting
+     * level known before the current can be read and before the
+     * main-current protection can be armed.  See
+     * adc_im_detect_sensor() in adc_calibration.h.
+     *
+     * Also carved out of reserved[] for the same reason as
+     * allow_protection above. */
+    uint8_t  im_sensor_type;
+
+    uint8_t  reserved[3];
 
     /* MUST stay last: config.c computes the CRC over everything ahead of it. */
     uint32_t crc32;
 } ConfigType;
+
+/*============================================================================
+ * Main-current sensor models
+ *
+ *  Two families are fitted to the same board and are told apart by their
+ *  own resting output, which the firmware samples during the power-on
+ *  zero-offset window.  See adc_im_detect_sensor() in adc_calibration.h.
+ *============================================================================*/
+#define IM_SENSOR_UNKNOWN        0U   /*!< not detected (or nonsense)     */
+#define IM_SENSOR_BIDIRECTIONAL   1U   /*!< 1.65 V at 0 A (CC6920BSO-50A)  */
+#define IM_SENSOR_UNIDIRECTIONAL  2U   /*!< below 0.3 V at 0 A (one-way)   */
 
 /*============================================================================
  * Global state (declared; defined in opa2000.c)
@@ -394,14 +582,20 @@ extern volatile AdcDataType    g_adc_data;
  *               meaningful while g_hv_on is true.
  *
  * Anything that means "no RF may be produced" is expressed by
- * g_allow_rf (CC6920 zero-offset not finished) or g_alert_flag
- * (protection latched), not by clearing g_hv_on. */
+ * g_allow_rf (no fault latched) or g_alert_flag (protection latched),
+ * not by clearing g_hv_on. */
 extern volatile bool           g_psu_on;
 extern volatile bool           g_hv_on;
 extern volatile bool           g_tx_active;
 
 extern volatile BandType       g_current_band;
-extern volatile bool           g_allow_rf;        /*!< CC6920 zero-offset done */
+/*!< RF permission.  Set true once the ADC power-on silence is over, so
+ *   the amplifier may be keyed; cleared by protection.c on a P0 fault
+ *   and restored when the operator dismisses it.  Deliberately NOT tied
+ *   to the main-current zero-offset calibration any more - that is a
+ *   measurement step, and a sensor that will not settle must not be
+ *   able to brick the amplifier. */
+extern volatile bool           g_allow_rf;
 extern volatile AlertType      g_alert_active;
 extern volatile AlertSeverity  g_alert_severity;
 extern volatile bool           g_alert_flag;
@@ -439,10 +633,13 @@ extern volatile bool g_touch_calibrated;
  *  g_gui_ready  = true once the GUI has rendered a few frames, so the
  *      main screen's power numbers are actually on the glass.  The
  *      backlight is turned on at the same moment.
- *  g_ptt_ready  = true once BOTH g_gui_ready AND the IM zero-offset
- *      calibration (g_allow_rf) have completed.  Until then every PTT
- *      path is refused, because the ADC / COMP / protection chain is
- *      not trustworthy yet.
+ *  g_ptt_ready  = true once the ADC power-on silence is over AND
+ *      g_allow_rf is set (no fault latched) AND g_gui_ready.  Until
+ *      then every PTT path is refused, because the ADC / COMP /
+ *      protection chain is not live yet.
+ *      Note what is NOT in this list: the IM zero-offset calibration.
+ *      That is a measurement step, and it no longer holds the amplifier
+ *      hostage - see g_allow_rf above.
  *  Both are volatile bool, single writer each, read by the monitor
  *  task and the PTT ISR path - the 1-writer-N-readers rule applies.
  *============================================================================*/

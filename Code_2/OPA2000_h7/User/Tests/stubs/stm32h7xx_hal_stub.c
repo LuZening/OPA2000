@@ -85,6 +85,11 @@ GPIO_TypeDef *const GPIOD = &s_gpioD;
 GPIO_TypeDef *const GPIOE = &s_gpioE;
 GPIO_TypeDef *const GPIOF = &s_gpioF;
 GPIO_TypeDef *const GPIOG = &s_gpioG;
+
+/* EXTI controller: the firmware masks the digital fault lines per line
+ * through IMR1, and the test needs to see that mask. */
+static EXTI_TypeDef s_exti = { 0 };
+EXTI_TypeDef *const EXTI = &s_exti;
 GPIO_TypeDef *const GPIOH = &s_gpioH;
 
 /*============================================================================
@@ -342,13 +347,43 @@ HAL_StatusTypeDef HAL_ADC_Stop_DMA(ADC_HandleTypeDef *hadc)
     return HAL_OK;
 }
 
+/* Track which variant the firmware called.  Reset by the test, observed
+ * by the test - the property being guarded is exactly which one
+ * adc_injected_tick() reaches for, because the polling variant
+ * silently disables the NTC over-temperature protection. */
+static uint32_t s_inj_start_it_calls     = 0U;
+static uint32_t s_inj_start_poll_calls   = 0U;
+
+uint32_t test_injected_start_it_calls(void)   { return s_inj_start_it_calls; }
+uint32_t test_injected_start_poll_calls(void) { return s_inj_start_poll_calls; }
+void     test_injected_reset_counters(void)   { s_inj_start_it_calls = 0U; s_inj_start_poll_calls = 0U; }
+
 HAL_StatusTypeDef HAL_ADCEx_InjectedStart(ADC_HandleTypeDef *hadc)
+{
+    (void)hadc;
+    s_inj_start_poll_calls++;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef HAL_ADCEx_InjectedStart_IT(ADC_HandleTypeDef *hadc)
+{
+    /* _IT variant exists to enable the JEOS interrupt; on the host we
+     * only need the linkage.  The host tests that care about the
+     * interrupt path stub a counter here rather than rely on the
+     * callback firing, because the callback target lives in main.c
+     * which is not part of the host build. */
+    (void)hadc;
+    s_inj_start_it_calls++;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef HAL_ADCEx_InjectedStop(ADC_HandleTypeDef *hadc)
 {
     (void)hadc;
     return HAL_OK;
 }
 
-HAL_StatusTypeDef HAL_ADCEx_InjectedStop(ADC_HandleTypeDef *hadc)
+HAL_StatusTypeDef HAL_ADCEx_InjectedStop_IT(ADC_HandleTypeDef *hadc)
 {
     (void)hadc;
     return HAL_OK;

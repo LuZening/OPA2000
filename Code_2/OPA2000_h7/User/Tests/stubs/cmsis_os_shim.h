@@ -55,7 +55,7 @@ typedef void *osMutexId_t;
  *  Optional attributes (we ignore the body, but the typedef is referenced
  *  by osMutexNew's signature so the firmware source can be compiled
  *  against the shim without modification).
- *============================================================================*/
+ *==========================================================================*/
 typedef struct {
     const char *name;
     uint32_t    attr_bits;
@@ -64,8 +64,26 @@ typedef struct {
 } osMutexAttr_t;
 
 /*============================================================================
+ *  Thread flags (subset)
+ *
+ *  The config save task blocks on a thread flag instead of polling, and
+ *  config.c posts that flag to wake it.  The host build needs
+ *  osThreadFlagsSet() so config.c compiles unchanged, and the shim records
+ *  what was posted so a test can assert that an edit really did wake the
+ *  save task.
+ *
+ *  The shim is single-threaded: one pending-flag word, plus a record of
+ *  who it was posted to.
+ *==========================================================================*/
+
+/** @brief Opaque thread handle.  Matches osThreadId_t, which is a void*. */
+typedef void *osThreadId_t;
+
+uint32_t osThreadFlagsSet (osThreadId_t thread_id, uint32_t flags);
+
+/*============================================================================
  *  API
- *============================================================================*/
+ *==========================================================================*/
 osMutexId_t osMutexNew (const osMutexAttr_t *attr);
 osStatus_t  osMutexAcquire(osMutexId_t mutex_id, uint32_t timeout);
 osStatus_t  osMutexRelease(osMutexId_t mutex_id);
@@ -75,9 +93,22 @@ osStatus_t  osMutexDelete (osMutexId_t mutex_id);
  *  Test-only diagnostics (not part of CMSIS).  The shim counts the active
  *  acquisitions so test cases can assert that Release was actually called
  *  the right number of times.
- *============================================================================*/
+ *==========================================================================*/
 uint32_t cmsis_os_shim_active_acquires(void);
 void     cmsis_os_shim_reset_counters(void);
+
+/*============================================================================
+ *  Test-only diagnostics for the thread-flag subset.
+ *
+ *  cmsis_os_shim_flag_set_count()   - how many times osThreadFlagsSet() was
+ *                                    called since the last reset.
+ *  cmsis_os_shim_last_flag_set()    - the flags of the last post.
+ *  cmsis_os_shim_last_flag_target() - the thread the last post went to.
+ *==========================================================================*/
+uint32_t    cmsis_os_shim_flag_set_count(void);
+uint32_t    cmsis_os_shim_last_flag_set(void);
+osThreadId_t cmsis_os_shim_last_flag_target(void);
+void        cmsis_os_shim_reset_flag_counters(void);
 
 #ifdef __cplusplus
 }

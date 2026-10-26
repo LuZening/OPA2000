@@ -16,7 +16,12 @@
  * The IM zero-offset state machine (CC6920BSO-50A calibration) lives
  * in this file: on startup it averages ~500 ms of IM samples while
  * RF_BIAS / PWR_ON are off, validates the result, and writes
- * g_config.im_zero_offset_adc + sets g_allow_rf = true.
+ * g_config.im_zero_offset_adc.
+ *
+ * It is a MEASUREMENT step, not a safety interlock: the amplifier may be
+ * keyed as soon as the 100 ms power-on silence is over, whether or not
+ * this calibration ever succeeds.  A current sensor that will not settle
+ * costs the operator the current reading, not the amplifier.
  */
 
 #ifndef USER_ADC_H
@@ -38,10 +43,59 @@ extern DMA_HandleTypeDef hdma_adc2;
 /* DMA buffer size = 1-sample rolling average. */
 #define ADC_DMA_BUFFER_SIZE    16U
 
+/*!< Power-on silence, in milliseconds.
+ *
+ * From MX_ADC*_Init() until the DMA starts, adc_presettle() has powered
+ * the converters but adc_start() has not been called, so no sample is
+ * taken at all.  The first conversions of a cold ADC are not merely noisy,
+ * they are wrong in a structured way: the internal regulator, the reference
+ * buffer and the CC6920 bias all need to charge, and the coupler detectors'
+ * DC rest point has not settled.  Sampling immediately would put that
+ * transient into the peak holds (tau = PEAK_TAU_MS) and the GUI would show
+ * a spike that decays over that time, which reads as a real transmission
+ * that never happened.
+ *
+ * 100 ms is comfortably longer than the worst-case settling of the
+ * reference buffer on this part, and still well inside the operator's
+ * patience - the backlight comes up about as fast. */
+#define ADC_PRESETTLE_MS       100U
+
+/*============================================================================
+ *  Coupler-2 peak hold (the GUI's TX power / reflected / SWR readout)
+ *
+ *  out[n] = max(sample[n], out[n-1] * exp(-dt / tau))
+ *
+ *  Attack is instantaneous; release is exponential.  tau is PEAK_TAU_MS:
+ *  the hold falls to 1/e (36.8 %) of its amplitude one tau after the input
+ *  drops below it, and to 5 % after three tau.  Slower than a plain
+ *  averaging filter on purpose - the operator reads a peak value, not an
+ *  instantaneous one, so a key-down has to stay on screen long enough to be
+ *  read.  The cost is that the reflected / SWR readouts linger for a few
+ *  tau after unkeying; nothing in the protection path reads these - those
+ *  compare the instantaneous values.
+ *
+ *  The two constants live here rather than in user_adc.c so the host tests
+ *  can derive their one-tau step from them instead of hard-coding the
+ *  numbers.
+ *==========================================================================*/
+
+/*!< Release time constant of the peak hold, in milliseconds. */
+#define PEAK_TAU_MS        2000U
+
+/*!< Upper bound on one decay step, in milliseconds (2 tau).  A debugger
+ *   pause or an interrupt storm then cannot turn into one giant jump, and
+ *   the hold still cannot collapse in a single task tick. */
+#define PEAK_MAX_STEP_MS   10000U
+
 /*============================================================================
  *  Public API
  *============================================================================*/
 
+/* Power the converters without sampling.  Call once after MX_ADC*_Init(),
+ * then wait ADC_PRESETTLE_MS, then call adc_start().  Split from
+ * adc_start() so the silence can be spent in a task rather than HAL_Delay(),
+ * which would block every other task at boot. */
+void adc_presettle(void);
 /* Start ADC1 + ADC2 circular DMA + injected conversion. */
 void adc_start(void);
 /* Stop ADC1 + ADC2 circular DMA. */
@@ -58,7 +112,7 @@ void adc_init(void);
 
 /* Advance the coupler-2 peak holds by one step, using the time elapsed
  * since the previous call.  Attack is instantaneous, release is
- * exponential with tau = 500 ms.
+ * exponential with tau = PEAK_TAU_MS.
  *
  * Call from task context only (the ADC task): the release uses expf(), and
  * this must not run in the priority-0 DMA interrupt.  It is deliberately
@@ -91,25 +145,38 @@ void adc_injected_tick(void);
  * needs: it owns the whole power-up sequence, so a caller cannot forget a
  * step or run two of them concurrently.
  *
- *   1. SETTLING    1 s.  Nothing is believed yet, CLEAR_FAULTX_OC is held
- *                  low and every watchdog is still parked at full scale by
- *                  boot_hold_thresholds_open().
- *   2. CALIBRATING the IM zero-offset calibration runs.
- *   3. ARMED       calibration passed: boot_apply_thresholds() pushes the
- *                  real AWD/COMP limits out and CLEAR_FAULTX_OC is released.
+ *   1. The 100 ms power-on silence happens BEFORE this function is ever
+ *      called (adc_presettle() + vTaskDelay in the task).  During it the
+ *      converters are powered but no conversion is taken, and every
+ *      watchdog is parked at full scale by boot_hold_thresholds_open().
+ *   2. ARMING -> ARMED, on the first call: boot_arm_thresholds() pushes
+ *      the real AWD/COMP limits out, CLEAR_FAULTX_OC is released, the
+ *      comparators are started and g_allow_rf goes true.  From that
+ *      moment the amplifier may be keyed.
+ *   3. The IM zero-offset calibration runs in the BACKGROUND from then
+ *      on, as a MEASUREMENT step.  It does not gate the transmit path:
+ *      a current sensor that will not settle costs the operator the
+ *      current reading, not the amplifier.
  *
- * Call from the ADC task at the task tick rate (50 ms); the return value
- * tells you the tick where the transition happened, so the task can raise
- * g_ptt_ready on that tick and not before.  Returns true once (and after)
- * ARMED. */
+ * Call from the ADC task at the task tick rate (50 ms).  Returns true
+ * once (and after) ARMED. */
 bool adc_stabilisation_tick(void);
 
-/* True once the settling + calibration sequence has completed and the real
- * protection limits are armed.  PTT must stay disabled until this is true. */
+/* True once the power-on silence is over, the real protection limits are
+ * armed and the amplifier may be keyed.  PTT must stay disabled until
+ * this is true.
+ *
+ * This is NOT "the zero-offset calibration finished" - that is an
+ * independent measurement step. */
 bool adc_stabilisation_done(void);
 
 /* IM zero-offset state machine.  Run from a task at >= 10 ms tick.
- * Returns true once calibration has succeeded (g_allow_rf set).
+ * Returns true once calibration has succeeded.
+ *
+ * This is a MEASUREMENT step: it produces g_config.im_zero_offset_adc so
+ * the current reading can be expressed in amps, and (via the caller) the
+ * AWD2 threshold can be re-fitted to it.  It does NOT set g_allow_rf and
+ * does NOT gate the transmit path.
  *
  * NOTE: adc_stabilisation_tick() calls this for you.  Call it directly
  * only from a test. */

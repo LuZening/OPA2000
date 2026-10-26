@@ -73,6 +73,14 @@ TEST_CASE(boot_comp_thresholds_reach_the_dac_registers)
 {
     g_config.comp1_ref_mV = 1500U;
     g_config.comp2_ref_mV = 2442U;
+    /* COMP2's reference is derived from the CC6920's zero offset, so it
+     * only becomes meaningful once the zero-offset calibration has run.
+     * Without that it is parked at the rail. */
+    g_config.im_calibrated      = 1U;
+    g_config.im_zero_offset_adc = 43254U;
+    /* A recognised sensor model: without one the current protection is
+     * parked, because the zero point would be meaningless. */
+    g_config.im_sensor_type     = IM_SENSOR_BIDIRECTIONAL;
 
     boot_apply_comp_thresholds();
 
@@ -88,30 +96,92 @@ TEST_CASE(boot_comp_thresholds_reach_the_dac_registers)
     ASSERT_TRUE((hdac1.Instance->CR & 0x03U) == 0x03U);
 }
 
+TEST_CASE(boot_comp2_parks_at_the_rail_without_a_valid_calibration)
+{
+    /* COMP2 watches the main-current node and its reference is derived
+     * from the CC6920's zero offset.  Until that offset has actually
+     * been measured the reference would sit at the wrong voltage, so
+     * COMP2 is parked at the rail where it cannot trip.
+     *
+     * COMP1 (RF input overdrive) does not depend on the current
+     * measurement and stays armed. */
+    g_config.comp1_ref_mV = 1500U;
+    g_config.comp2_ref_mV = 2442U;
+
+    /* No calibration at all. */
+    g_config.im_calibrated      = 0U;
+    g_config.im_zero_offset_adc = 43254U;
+    boot_apply_comp_thresholds();
+    ASSERT_EQ(hdac1.Instance->DHR12R1, expected_dac_code(1500U));
+    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(DAC_VDDA_MV));
+    ASSERT_EQ(hdac1.Instance->DHR12R2, DAC_FULL_SCALE);
+
+    /* Calibrated, but the offset is implausible: still parked. */
+    g_config.im_calibrated      = 1U;
+    g_config.im_zero_offset_adc = 100U;
+    boot_apply_comp_thresholds();
+    ASSERT_EQ(hdac1.Instance->DHR12R2, DAC_FULL_SCALE);
+
+    /* A valid calibration brings it live again.  With the sensor on its
+     * nominal 1.65 V zero the derived reference lands exactly on the
+     * 2442 mV the stored default carries. */
+    g_config.im_zero_offset_adc = 43254U;
+    g_config.im_sensor_type     = IM_SENSOR_BIDIRECTIONAL;
+    boot_apply_comp_thresholds();
+    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(DEFAULT_COMP2_REF_MV));
+}
+
 TEST_CASE(boot_comp_thresholds_clamp_to_the_configured_ceiling)
 {
     /* A corrupted or hand-edited config must not be able to pin a
      * comparator output at its rail. */
     g_config.comp1_ref_mV = 60000U;   /* way past COMP1_REF_MV_MAX */
     g_config.comp2_ref_mV = 60000U;
+    g_config.im_calibrated      = 1U;
+    g_config.im_zero_offset_adc = 43254U;
+    g_config.im_sensor_type     = IM_SENSOR_BIDIRECTIONAL;
 
     boot_apply_comp_thresholds();
 
     ASSERT_EQ(hdac1.Instance->DHR12R1, expected_dac_code(COMP1_REF_MV_MAX));
-    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(COMP2_REF_MV_MAX));
+
+    /* COMP2 is different now: the stored value is only a fallback for an
+     * unrecognised sensor, and this one IS recognised, so the garbage
+     * never gets the chance to reach the DAC at all.  The applied
+     * reference is derived from the measured zero point and the limit. */
+    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(DEFAULT_COMP2_REF_MV));
+
+    /* With the sensor unrecognised there is no measured zero to derive
+     * from, so the channel is parked at the VDDA rail instead - the
+     * comparator cannot trip at all until a calibration has run.  That,
+     * rather than the ceiling, is what keeps garbage out of the DAC on
+     * that path. */
+    g_config.im_sensor_type = IM_SENSOR_UNKNOWN;
+    boot_apply_comp_thresholds();
+    ASSERT_EQ(hdac1.Instance->DHR12R2, DAC_FULL_SCALE);
 }
 
 TEST_CASE(boot_dac_code_conversion_boundaries)
 {
-    /* 0 mV -> code 0. */
+    /* 0 mV -> code 0.  Asserted through COMP1, which is taken from the
+     * stored value verbatim; COMP2 is derived and can no longer be given
+     * a 0 mV reference through the config. */
     g_config.comp1_ref_mV = 0U;
     g_config.comp2_ref_mV = 0U;
+    g_config.im_calibrated      = 1U;
+    g_config.im_zero_offset_adc = 43254U;
+    g_config.im_sensor_type     = IM_SENSOR_BIDIRECTIONAL;
     boot_apply_comp_thresholds();
     ASSERT_EQ(hdac1.Instance->DHR12R1, 0U);
-    ASSERT_EQ(hdac1.Instance->DHR12R2, 0U);
+
+    /* And COMP2 with that same config is the derived 30 A reference, not
+     * the 0 mV that was stored - which is the point of the change. */
+    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(DEFAULT_COMP2_REF_MV));
+
+    /* 0 mV -> code 0 straight through the converter. */
+    ASSERT_EQ(expected_dac_code(0U), 0U);
 
     /* Exactly full scale -> 4095. */
-    g_config.comp1_ref_mV = DEFAULT_COMP1_REF_MV;   /* keep the clamp in play */
     ASSERT_EQ(expected_dac_code(DAC_VDDA_MV), DAC_FULL_SCALE);
 
     /* Over-range clamps instead of wrapping; a wrapped code would land
@@ -131,11 +201,17 @@ TEST_CASE(comp2_reference_matches_the_current_sensor_law)
      * 1650 mV is the floor of the COMP2 slider. */
     ASSERT_EQ(expected_dac_code(1650U), 2047U);
 
-    /* The 30 A design limit is the shipped default and, by definition,
-     * the slider maximum. */
-    ASSERT_EQ(expected_dac_code(DEFAULT_COMP2_REF_MV),
-              expected_dac_code(COMP2_REF_MV_MAX));
+    /* The 30 A design limit through the sensor law is 1650 + 30*26.4 =
+     * 2442 mV, and that is the value the stored default carries. */
     ASSERT_EQ(expected_dac_code(DEFAULT_COMP2_REF_MV), 3030U);
+
+    /* It is NOT the ceiling any more: the ceiling is the ADC full scale
+     * (2500 mV), because the applied reference is derived from the
+     * MEASURED resting point and a sensor sitting above 1.65 V needs a
+     * reference above 2442 mV to trip at 30 A.  Clamping it to 2442
+     * would reintroduce the early trip this derivation removes. */
+    ASSERT_GT(COMP2_REF_MV_MAX, DEFAULT_COMP2_REF_MV);
+    ASSERT_EQ(COMP2_REF_MV_MAX, ADC_VREF_MV);
 }
 
 /*============================================================================
@@ -286,6 +362,11 @@ TEST_CASE(boot_arm_thresholds_opens_the_gate)
 {
     config_reset_default();
     g_config.im_zero_offset_adc = 43254U;
+    /* The current protection is expressed relative to the measured zero
+     * offset, so it only comes live once the calibration has produced
+     * one.  AWD2 and COMP2 are the two that depend on it. */
+    g_config.im_calibrated      = 1U;
+    g_config.im_sensor_type     = IM_SENSOR_BIDIRECTIONAL;
     g_config.band_im_max_mA    = 10000U;
     g_config.comp1_ref_mV      = 1650U;
     g_config.comp2_ref_mV      = 2442U;
@@ -295,13 +376,40 @@ TEST_CASE(boot_arm_thresholds_opens_the_gate)
 
     boot_arm_thresholds((int)BAND_15M_10M);
 
-    /* Both references came down off the rail to the configured values, so
-     * the comparators are live again. */
+    /* Both references came down off the rail to live values, so the
+     * comparators are running again.  COMP1 is stored as-is; COMP2 is
+     * derived from the measured zero point and the configured limit
+     * (1650 + 10 A * 26.4 = 1914 mV), which is what the applied
+     * reference now always is. */
     ASSERT_EQ(hdac1.Instance->DHR12R1, expected_dac_code(1650U));
-    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(2442U));
+    ASSERT_EQ(hdac1.Instance->DHR12R2, expected_dac_code(1650U + 264U));
     /* AWD2 now holds a real limit: 10000 mA is 6920 codes above the
      * 43254-code zero point of the CC6920 law. */
     ASSERT_EQ(ADC1->HTR2, 43254U + 6920U);
+}
+
+TEST_CASE(boot_arm_thresholds_leaves_the_current_protection_parked)
+{
+    /* The same thing, but with no valid zero-offset calibration: the
+     * current protection must stay parked even though the gate is open,
+     * because a threshold computed from an unmeasured offset would sit
+     * at the wrong current. */
+    config_reset_default();
+    g_config.im_calibrated      = 0U;
+    g_config.im_zero_offset_adc = 43254U;
+    g_config.band_im_max_mA    = 10000U;
+    g_config.comp1_ref_mV      = 1650U;
+    g_config.comp2_ref_mV      = 2442U;
+
+    boot_hold_thresholds_open();
+    boot_arm_thresholds((int)BAND_15M_10M);
+
+    /* AWD2 parked, COMP2 parked at the rail ... */
+    ASSERT_EQ(ADC1->HTR2, ADC_FULL_SCALE);
+    ASSERT_EQ(hdac1.Instance->DHR12R2, DAC_FULL_SCALE);
+    /* ... but COMP1, which does not depend on the current measurement, is
+     * armed as usual. */
+    ASSERT_EQ(hdac1.Instance->DHR12R1, expected_dac_code(1650U));
 }
 
 /*============================================================================
@@ -309,6 +417,7 @@ TEST_CASE(boot_arm_thresholds_opens_the_gate)
  *============================================================================*/
 const test_entry_t g_suite_boot[] = {
     TEST_ENTRY(boot_comp_thresholds_reach_the_dac_registers),
+    TEST_ENTRY(boot_comp2_parks_at_the_rail_without_a_valid_calibration),
     TEST_ENTRY(boot_comp_thresholds_clamp_to_the_configured_ceiling),
     TEST_ENTRY(boot_dac_code_conversion_boundaries),
     TEST_ENTRY(comp2_reference_matches_the_current_sensor_law),
@@ -316,6 +425,7 @@ const test_entry_t g_suite_boot[] = {
     TEST_ENTRY(boot_rf_limit_array_size),
     TEST_ENTRY(boot_hold_thresholds_open_parks_every_limit),
     TEST_ENTRY(boot_arm_thresholds_opens_the_gate),
+    TEST_ENTRY(boot_arm_thresholds_leaves_the_current_protection_parked),
     TEST_ENTRY(boot_fresh_config_needs_touch_cal),
     TEST_ENTRY(boot_calibrated_config_skips_touch_cal),
     TEST_ENTRY(boot_non_identity_gain_skips_prompt),

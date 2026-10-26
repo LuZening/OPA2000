@@ -834,6 +834,19 @@ bool touch_calibrate_add_point(uint16_t screen_x, uint16_t screen_y)
 
 /**
  * @brief Complete calibration
+ *
+ * NOTE: this path is currently unused - gui.c's cal_build_results_ui()
+ * does its own fit via cal_calculate() and writes g_config.touch there.
+ * Kept in step with that path: both compute into locals first and publish
+ * to g_config only once the whole fit has passed, so a failed calibration
+ * cannot leave half a transform live.
+ *
+ * That ordering is not cosmetic.  Writing x_gain as soon as it is known
+ * means the two early "return false" paths below would leave the new gain
+ * in g_config next to the old offset - and the pair is applied together as
+ * `raw * gain + offset`, so that is not a slightly-off reading, it is a
+ * wrong one, sitting in the live struct while `calibrated` is still 0 so
+ * the firmware ignores it and the calibration silently does not take.
  */
 bool touch_calibrate_complete(void)
 {
@@ -863,13 +876,12 @@ bool touch_calibrate_complete(void)
         return false;
     }
 
-    g_config.touch.x_gain = (CAL_POINT_COUNT * sum_raw_x_screen_x - sum_raw_x * sum_screen_x) / x1;
-    g_config.touch.x_offset = (sum_screen_x - g_config.touch.x_gain * sum_raw_x) / CAL_POINT_COUNT;
+    float x_gain = (CAL_POINT_COUNT * sum_raw_x_screen_x - sum_raw_x * sum_screen_x) / x1;
+    float x_offset = (sum_screen_x - x_gain * sum_raw_x) / CAL_POINT_COUNT;
 
     /* Linear regression for Y */
     float sum_raw_y = 0, sum_screen_y = 0;
-    float sum_raw_y2 = 0;
-    float sum_raw_y_screen_y = 0;
+    float sum_raw_y2 = 0, sum_raw_y_screen_y = 0;
 
     for (int i = 0; i < CAL_POINT_COUNT; i++) {
         sum_raw_y += cal_data[i].raw_y;
@@ -884,13 +896,13 @@ bool touch_calibrate_complete(void)
         return false;
     }
 
-    g_config.touch.y_gain = (CAL_POINT_COUNT * sum_raw_y_screen_y - sum_raw_y * sum_screen_y) / y1;
-    g_config.touch.y_offset = (sum_screen_y - g_config.touch.y_gain * sum_raw_y) / CAL_POINT_COUNT;
+    float y_gain = (CAL_POINT_COUNT * sum_raw_y_screen_y - sum_raw_y * sum_screen_y) / y1;
+    float y_offset = (sum_screen_y - y_gain * sum_raw_y) / CAL_POINT_COUNT;
 
     /* Check center point residual */
     /* Center point is at index 4 */
-    float predicted_x = cal_data[4].raw_x * g_config.touch.x_gain + g_config.touch.x_offset;
-    float predicted_y = cal_data[4].raw_y * g_config.touch.y_gain + g_config.touch.y_offset;
+    float predicted_x = cal_data[4].raw_x * x_gain + x_offset;
+    float predicted_y = cal_data[4].raw_y * y_gain + y_offset;
 
     float residual_x = fabsf(predicted_x - cal_data[4].screen_x) / cal_data[4].screen_x;
     float residual_y = fabsf(predicted_y - cal_data[4].screen_y) / cal_data[4].screen_y;
@@ -901,12 +913,27 @@ bool touch_calibrate_complete(void)
         return false;
     }
 
-    /* Calibration successful */
+    /* Calibration successful.  All four coefficients plus the flag are
+     * published in one locked block, so a concurrent config_save()
+     * snapshot sees either the old transform or the new one - never a
+     * mixture, and never a new transform still flagged uncalibrated. */
+    config_lock();
+    g_config.touch.x_gain     = x_gain;
+    g_config.touch.x_offset   = x_offset;
+    g_config.touch.y_gain     = y_gain;
+    g_config.touch.y_offset   = y_offset;
     g_config.touch.calibrated = 1U;
+    config_unlock();
+
     calibrating = false;
 
-    /* Save to config */
-    config_save();
+    /* Persist through the deferred-save machinery rather than writing the
+     * flash here.  A direct config_save() would race the save task's own
+     * write (two eeprom_save() calls can pick the same target slot, and one
+     * of the records would be silently lost), and it would program the
+     * flash from a context that has no business doing so.  The wake-up is
+     * immediate, so the transform still reaches the flash at once. */
+    config_mark_dirty();
 
     return true;
 }

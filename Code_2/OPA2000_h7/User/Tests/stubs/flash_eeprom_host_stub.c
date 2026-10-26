@@ -42,11 +42,44 @@ uint32_t eeprom_current_id(void)
     return 0U;
 }
 
+/*!< How many times eeprom_save() has been called since the last reset.
+ *   The deferred-save tests use this to assert that a batch of edits
+ *   produces ONE write, not one per edit. */
+static uint32_t s_save_count = 0U;
+
+/*!< When non-zero, eeprom_save() reports failure and clears this on the
+ *   call, so a test can make exactly one write fail and then watch the
+ *   retry succeed.  The deferred-save tests use it to prove that a failed
+ *   write is not silently dropped - with a thread-flag wake-up there is no
+ *   timer left to retry on, so a dropped flag IS a permanently lost
+ *   setting. */
+static uint32_t s_fail_next_saves = 0U;
+
+uint32_t eeprom_host_save_count(void)
+{
+    return s_save_count;
+}
+
+void eeprom_host_reset_save_count(void)
+{
+    s_save_count = 0U;
+}
+
+void eeprom_host_fail_next_save(uint32_t count)
+{
+    s_fail_next_saves = count;
+}
+
 bool eeprom_save(const void *src, uint32_t len)
 {
     /* Pretend it stuck.  Nothing reads it back, so the contents do not
      * matter - only that config_reset_default() does not report failure. */
     (void)src;
     (void)len;
+    s_save_count++;
+    if (s_fail_next_saves > 0U) {
+        s_fail_next_saves--;
+        return false;
+    }
     return true;
 }

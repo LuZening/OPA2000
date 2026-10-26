@@ -100,10 +100,10 @@ E:\Projects\RADIO\Projects\OPA2000\Code_2\
 | ADC1_2_IRQn | **0** | AWD1/2/3 保护 + ADC1/2 全局 |
 | COMP_IRQn | **0** | COMP1/2 过流/过驱 |
 | EXTI15_10_IRQn | **0** | HARDPWR_ERR (PB12) |
+| EXTI9_5_IRQn | **0** | PTT_INX (PF5) — 操作员直接意图，抢占必须最优先 |
 | TIM2_IRQn | 1 | PTT 继电器延时（**也用于 ALC 输出但靠 DMA 不靠中断**） |
 | TIM5_IRQn | 1 | PTT 继电器延时 |
 | TIM7_IRQn | 1 | 风扇/泵转速 0.5ms 轮询 |
-| EXTI9_5_IRQn | 1 | PTT_INX (PF5) |
 | TIM1_UP_IRQn | 5 | 频率计（默认） |
 | EXTI2_IRQn (PF2) | 默认 | GT911 中断 |
 | 其他 | ioc 默认 | — |
@@ -211,11 +211,25 @@ Settings → 保护 页调整，改完立即生效（`prot_save_cb()` →
 |---|---|---|
 | 正输入（被测） | PB2 = ADC1_INP4 同节点，RF1 经 D5/R40 峰值检波 | PE9 = ADC1_INP5 同节点，主电流 IM（CC6920BSO-50A → U20-B 缓冲） |
 | 负输入（参考） | DAC1_OUT1 | DAC1_OUT2 |
-| config 字段 | `comp1_ref_mV` | `comp2_ref_mV` |
-| 出厂默认 | 1500 mV（**未标定**，兜底用） | 2442 mV（= 30 A 设计门限，上限即此值） |
-| 上限 | `COMP1_REF_MV_MAX` 3000 mV | `COMP2_REF_MV_MAX` 2442 mV |
+| config 字段 | `comp1_ref_mV`（直接进 DAC） | `comp2_ref_mV`（**仅未识别传感器时的兜底**） |
+| 出厂默认 | 1500 mV（**未标定**，兜底用） | 2442 mV（= 30 A × 标称 1.65 V 基点） |
+| 上限 | `COMP1_REF_MV_MAX` 3000 mV | `COMP2_REF_MV_MAX` 2500 mV（= ADC 满量程，非 30 A 门限） |
 
-COMP2 可按 `V = 1650 + I*26.4` 换算显示电流（20A→2178mV，25A→2310mV，30A→2442mV）。
+**COMP2 的实际参考电压是派生的，不用存储值**：
+`ref = 实测零点 mV + 限流 mA × 26.4 / 1000`（`adc_im_comp2_ref_mV()`）。
+单向型和双向型都走这条路径，AWD2 也用同一个实测零点 + 同一条 26.4 mV/A，
+所以看门狗与硬件比较器在**同一个电流**上动作。存储值写在标称 1.65 V 基点上，
+而零点标定允许 ±IM_ZERO_TOLERANCE（数百 mV ≈ 数安培）偏差——传感器静态点偏高时，
+沿用 2442 mV 会让比较器提前触发（这正是 CURRENT_HIGH 频繁误报的根因）。
+上限因此改成 ADC 满量程 2500 mV：零点偏高时 30 A 需要 >2442 mV 的参考，
+钳在 2442 会把刚修掉的提前触发又请回来。
+
+传感器未识别（`IM_SENSOR_UNKNOWN`）时 `adc_im_protection_valid()` 为假，
+调用方直接把 COMP2 停在 VDDA 轨（`boot_apply_comp_thresholds()`），
+存储的 2442 mV 不会真正生效。
+
+COMP2 的安培显示（`prot_fields[].derived_from_mv`）同样以**实测零点**为基点，
+与实际生效的参考电压同源，屏上读数与硬件门限不会差几安培。
 **COMP1 的 mV↔W 换算未标定**，D5/R40 增益未知，禁止在代码里臆造；详见
 `User/TODO-COMP1标定待办.txt`。标定前 COMP1 只作兜底，精确的 RF 输入门限
 由 AWD1 在软件里承担。

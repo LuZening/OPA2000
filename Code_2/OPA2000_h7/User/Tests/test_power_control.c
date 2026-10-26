@@ -381,28 +381,70 @@ TEST_CASE(ptt_never_touches_the_supply_flag)
     ASSERT_FALSE(g_tx_active);
 }
 
-TEST_CASE(ptt_while_hv_off_only_moves_the_relays)
+TEST_CASE(ptt_is_ignored_while_the_hv_rail_is_down)
 {
     ptt_establish_idle_outputs();
-    /* Drop the HV rail (PWR_ON + RF_BIAS).  The pedal path must still run its
-     * relay sequence - the RF switch is a separate subsystem from the rail -
-     * but no RF can be produced because power_tx_enable() sees g_hv_on false.
-     * This is the deliberate consequence of keeping the three rails apart. */
+
+    /* Drop the HV rail (PWR_ON + RF_BIAS).  The amplifier is now IDLE as far
+     * as the operator is concerned, so the pedal must be ignored completely:
+     * both the press edge and the release edge.
+     *
+     * This replaces the older "run the relay sequence anyway, it is a
+     * separate subsystem" rule.  With the PA unpowered the relays produce no
+     * RF, but switching them made the banner say Transmit and drove PTT_OUT
+     * high back to the radio, which then transmitted into nothing. */
     power_hv_off();
     (void)power_rail_step();
     ASSERT_FALSE(g_hv_on);
+    ASSERT_EQ(g_power_state, POWER_STATE_OFF);
+
+    stub_gpio_reset_counters();
 
     ptt_set_pressed(true);
     power_control_ptt_isr();
     power_relay_timer_callback();
-    ASSERT_TRUE(g_tx_active);              /* relay sequence still ran */
-    ASSERT_FALSE(g_hv_on);                  /* but the HV rail stays down */
 
+    /* Press edge ignored: no relay sequence, no TX state, no PTT_OUT. */
+    ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
+    ASSERT_FALSE(g_tx_active);
+    ASSERT_EQ(g_power_state, POWER_STATE_OFF);
+    ASSERT_EQ(stub_gpio_get_last(RELAY1_GPIO_Port, RELAY1_Pin), GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(RELAY2_GPIO_Port, RELAY2_Pin), GPIO_PIN_RESET_E);
+    ASSERT_EQ(stub_gpio_get_last(PTT_OUT_GPIO_Port, PTT_OUT_Pin), GPIO_PIN_RESET_E);
+
+    /* Release edge ignored too. */
     ptt_set_pressed(false);
     power_control_ptt_isr();
     power_relay_timer_callback();
+    ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
     ASSERT_FALSE(g_tx_active);
-    ASSERT_FALSE(g_hv_on);
+    ASSERT_EQ(g_power_state, POWER_STATE_OFF);
+}
+
+TEST_CASE(ptt_starts_working_again_once_the_hv_rail_comes_up)
+{
+    ptt_establish_idle_outputs();
+
+    /* Down, then back up: the gate must not latch, otherwise the pedal would
+     * be dead for the rest of the session after the first HV-off. */
+    power_hv_off();
+    (void)power_rail_step();
+    ptt_set_pressed(true);
+    power_control_ptt_isr();
+    ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
+
+    ptt_set_pressed(false);
+    power_control_ptt_isr();
+
+    power_hv_on();
+    (void)power_rail_step();
+    ASSERT_EQ(g_power_state, POWER_STATE_STANDBY);
+
+    ptt_set_pressed(true);
+    power_control_ptt_isr();
+    ASSERT_EQ(ptt_state, PTT_STATE_TX_STARTING);
+    ASSERT_TRUE(g_tx_active);
+    ASSERT_EQ(g_power_state, POWER_STATE_TX);
 }
 
 TEST_CASE(ptt_blocked_by_alert_clears_tx_active)
@@ -775,19 +817,34 @@ TEST_CASE(power_tx_enable_is_refused_until_the_boot_gate_opens)
     ASSERT_FALSE(g_tx_active);
 }
 
-TEST_CASE(power_tx_enable_ignores_the_psu_and_hv_rail_state)
+TEST_CASE(power_tx_enable_is_refused_while_the_hv_rail_is_down)
 {
-    /* The operator deliberately removed the power-state interlocks: whether
-     * the PA is energised is not the firmware's call at request time.  This
-     * test pins that down - with the PSU off AND the HV rail down, a valid
-     * request must still key.  Keep it this way unless the interlock is
-     * explicitly reinstated. */
-    power_init();
-    ASSERT_FALSE(g_psu_on);                   /* external PSU off */
-    ASSERT_FALSE(g_hv_on);                    /* HV rail off     */
-    g_allow_rf   = true;
-    g_alert_flag = false;
-    g_ptt_ready  = true;
+    /* IDLE refuses every transmit request, the CAT link included.
+     *
+     * This is the deliberate replacement for the older "the firmware does
+     * not second-guess whether the PA is energised" rule.  Keying with the
+     * rail down produced no RF but did announce Transmit and, on the pedal
+     * path, drove PTT_OUT high back to the radio. */
+    ptt_establish_idle_outputs();
+    power_hv_off();
+    (void)power_rail_step();
+    ASSERT_EQ(g_power_state, POWER_STATE_OFF);
+
+    power_tx_enable();
+    ASSERT_EQ(ptt_state, PTT_STATE_IDLE);
+    ASSERT_FALSE(g_tx_active);
+    ASSERT_EQ(g_power_state, POWER_STATE_OFF);
+}
+
+TEST_CASE(power_tx_enable_still_ignores_the_psu_latch)
+{
+    /* g_psu_on stays out of the interlock: the external PSU's latch is not
+     * this board's rail.  With the HV rail up, a CAT request keys normally
+     * even though PG5 was never asserted by the firmware. */
+    ptt_establish_idle_outputs();
+    power_psu_off();
+    ASSERT_FALSE(g_psu_on);
+    ASSERT_EQ(g_power_state, POWER_STATE_STANDBY);   /* HV rail still up */
 
     power_tx_enable();
     ASSERT_EQ(ptt_state, PTT_STATE_TX_STARTING);
@@ -1318,20 +1375,20 @@ TEST_CASE(fan_pwm_duty_matches_speed_percent)
 {
     power_init_fan_pwm();
 
-    /* ARR = 999 -> 1000 ticks; pulse = (pct * 1000 + 50) / 100 */
+    /* ARR = 1249 -> 1250 ticks; pulse = (pct * 1250 + 50) / 100 */
     power_set_fan_speed(0);
     ASSERT_EQ(htim3.Instance->CCR3, 0);
     power_set_fan_speed(50);
-    ASSERT_EQ(htim3.Instance->CCR3, 500);
+    ASSERT_EQ(htim3.Instance->CCR3, 625);
     power_set_fan_speed(100);
-    ASSERT_EQ(htim3.Instance->CCR3, 1000);
+    ASSERT_EQ(htim3.Instance->CCR3, 1250);
 }
 
 TEST_CASE(fan_speed_percent_is_clamped_to_100)
 {
     power_init_fan_pwm();
     power_set_fan_speed(200);
-    ASSERT_EQ(htim3.Instance->CCR3, 1000);
+    ASSERT_EQ(htim3.Instance->CCR3, 1250);
     ASSERT_EQ(g_fan_speed, FAN_SPEED_HIGH);
 }
 
@@ -1339,9 +1396,9 @@ TEST_CASE(pump_pwm_duty_matches_speed_percent)
 {
     power_init_fan_pwm();
     power_set_pump_speed(25);
-    ASSERT_EQ(htim4.Instance->CCR4, 250);
+    ASSERT_EQ(htim4.Instance->CCR4, 313);
     power_set_pump_speed(100);
-    ASSERT_EQ(htim4.Instance->CCR4, 1000);
+    ASSERT_EQ(htim4.Instance->CCR4, 1250);
 }
 
 TEST_CASE(the_pump_follows_the_fan_duty)
@@ -1357,10 +1414,31 @@ TEST_CASE(the_pump_follows_the_fan_duty)
     ASSERT_EQ(htim4.Instance->CCR4, 0);
 
     power_set_fan_speed(50);
-    ASSERT_EQ(htim4.Instance->CCR4, 500);
+    ASSERT_EQ(htim4.Instance->CCR4, 625);
 
     power_set_fan_speed(100);
-    ASSERT_EQ(htim4.Instance->CCR4, 1000);
+    ASSERT_EQ(htim4.Instance->CCR4, 1250);
+}
+
+/* The PWM base frequency is the one number every duty calculation above
+ * divides by, so it gets pinned directly.  A 200 MHz clock assumption
+ * with ARR 999 also produces "about 10 kHz" on paper while actually
+ * emitting 12.5 kHz - nothing above would notice, because the CCR values
+ * are consistent with whatever ARR happens to be programmed. */
+TEST_CASE(the_fan_and_pump_pwm_base_is_10kHz)
+{
+    power_init_fan_pwm();
+
+    /* 250 MHz / (PSC+1) / (ARR+1) = 250e6 / 20 / 1250 = 10 000 Hz */
+    ASSERT_EQ(htim3.Instance->PSC, 19);
+    ASSERT_EQ(htim3.Instance->ARR, 1249);
+    ASSERT_EQ(250000000UL / ((htim3.Instance->PSC + 1U) *
+                             (htim3.Instance->ARR + 1U)), 10000UL);
+
+    ASSERT_EQ(htim4.Instance->PSC, 19);
+    ASSERT_EQ(htim4.Instance->ARR, 1249);
+    ASSERT_EQ(250000000UL / ((htim4.Instance->PSC + 1U) *
+                             (htim4.Instance->ARR + 1U)), 10000UL);
 }
 
 /*============================================================================
@@ -1389,7 +1467,8 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(ptt_press_raises_tx_active),
     TEST_ENTRY(ptt_release_clears_tx_active),
     TEST_ENTRY(ptt_never_touches_the_supply_flag),
-    TEST_ENTRY(ptt_while_hv_off_only_moves_the_relays),
+    TEST_ENTRY(ptt_is_ignored_while_the_hv_rail_is_down),
+    TEST_ENTRY(ptt_starts_working_again_once_the_hv_rail_comes_up),
     TEST_ENTRY(ptt_blocked_by_alert_clears_tx_active),
     TEST_ENTRY(ptt_blocked_during_stop_sequence_also_clears_tx_active),
     TEST_ENTRY(ptt_repress_during_stop_keeps_tx_active),
@@ -1409,7 +1488,8 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(ptt_is_refused_while_the_hv_rail_is_still_sequencing),
     TEST_ENTRY(power_tx_enable_keys_the_amplifier),
     TEST_ENTRY(power_tx_enable_is_refused_until_the_boot_gate_opens),
-    TEST_ENTRY(power_tx_enable_ignores_the_psu_and_hv_rail_state),
+    TEST_ENTRY(power_tx_enable_is_refused_while_the_hv_rail_is_down),
+    TEST_ENTRY(power_tx_enable_still_ignores_the_psu_latch),
     TEST_ENTRY(power_tx_enable_is_refused_while_calibrating),
     TEST_ENTRY(power_tx_enable_is_refused_while_alert_latched),
     TEST_ENTRY(power_get_ptt_state_reads_the_active_low_input),
@@ -1442,5 +1522,6 @@ const test_entry_t g_suite_power_control[] = {
     TEST_ENTRY(fan_speed_percent_is_clamped_to_100),
     TEST_ENTRY(pump_pwm_duty_matches_speed_percent),
     TEST_ENTRY(the_pump_follows_the_fan_duty),
+    TEST_ENTRY(the_fan_and_pump_pwm_base_is_10kHz),
     TEST_SUITE_END
 };

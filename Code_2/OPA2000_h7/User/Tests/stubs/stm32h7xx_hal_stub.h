@@ -87,6 +87,28 @@ GPIO_PinState HAL_GPIO_ReadPin  (GPIO_TypeDef *port, uint16_t pin);
 void         HAL_GPIO_TogglePin(GPIO_TypeDef *port, uint16_t pin);
 
 /*============================================================================
+ *  EXTI stub
+ *
+ *  Only the registers the firmware actually touches on the host are
+ *  modelled: the per-line interrupt mask (IMR1) and the pending register
+ *  (PR1).  The line numbers are the real EXTI line numbers, so a bit that
+ *  is wrong in the firmware shows up as a wrong bit here rather than
+ *  silently passing.
+ *==========================================================================*/
+
+typedef struct {
+    uint32_t RTSR1, FTSR1, SWIER1, D3PMR1, D3PCR1L, D3PCR1H;
+    uint32_t RTSR2, FTSR2, SWIER2, D3PMR2, D3PCR2L, D3PCR2H;
+    uint32_t RESERVED3[10];
+    uint32_t IMR1, EMR1, PR1;
+} EXTI_TypeDef;
+
+extern EXTI_TypeDef *const EXTI;
+
+/*!< Per-line interrupt mask bit for an EXTI line (lines 0..31). */
+#define EXTI_LINE_BIT(line)  ((uint32_t)1U << (line))
+
+/*============================================================================
  *  TIM stub
  *============================================================================*/
 
@@ -247,11 +269,19 @@ typedef struct {
 extern ADC_TypeDef *const ADC1;
 extern ADC_TypeDef *const ADC2;
 
+/*!< ADC_CR bits adc_presettle() sets: power the internal regulator, power
+ *   the converter.  Both are plain read-modify-write on the CR word, so the
+ *   host build just needs the values, not any behaviour. */
+#define ADC_CR_ADVREGEN   (1UL << 28)
+#define ADC_CR_ADEN       (1UL << 0)
+
 HAL_StatusTypeDef HAL_ADC_Start_DMA(ADC_HandleTypeDef *hadc,
                                     uint32_t *pData, uint32_t Length);
 HAL_StatusTypeDef HAL_ADC_Stop_DMA (ADC_HandleTypeDef *hadc);
-HAL_StatusTypeDef HAL_ADCEx_InjectedStart(ADC_HandleTypeDef *hadc);
-HAL_StatusTypeDef HAL_ADCEx_InjectedStop (ADC_HandleTypeDef *hadc);
+HAL_StatusTypeDef HAL_ADCEx_InjectedStart   (ADC_HandleTypeDef *hadc);
+HAL_StatusTypeDef HAL_ADCEx_InjectedStart_IT(ADC_HandleTypeDef *hadc);
+HAL_StatusTypeDef HAL_ADCEx_InjectedStop    (ADC_HandleTypeDef *hadc);
+HAL_StatusTypeDef HAL_ADCEx_InjectedStop_IT (ADC_HandleTypeDef *hadc);
 
 /*============================================================================
  *  Misc stubs
@@ -277,6 +307,14 @@ void     Error_Handler(void);
 void     test_wall_clock_reset(void);
 void     test_wall_clock_advance(uint32_t ms);
 uint32_t test_wall_clock_call_count(void);
+
+/*!< Number of times the firmware called the _IT variant since the last
+ *   test_injected_reset_counters().  The firmware MUST call _IT for the
+ *   JEOS interrupt to fire, which is what publishes the JDRs and runs
+ *   protection_check_ntc().  Reset by the test, observed by the test. */
+uint32_t test_injected_start_it_calls(void);
+uint32_t test_injected_start_poll_calls(void);
+void     test_injected_reset_counters(void);
 
 /*!< Times __WFI() was called, i.e. how far power_soft_off() got.  Reset by
  *   test_wall_clock_reset(). */

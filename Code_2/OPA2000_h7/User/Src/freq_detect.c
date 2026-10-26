@@ -20,8 +20,8 @@
  *            1. The ETR line carries a 1.8..30 MHz RF signal divided
  *               down by a /32 prescaler in the LO board.  The TIM1
  *               counter sees events at F_RF / 32; the 100 us sampling
- *               window therefore has a +/- 1 LSB quantisation of
- *               F_RF / 32 * 100e-6 = 1 part in 10000 = 10 kHz per
+ *               window (see FREQDET_TIM7_PERIOD) therefore has a
+ *               +/- 1 LSB quantisation of 1 part in 10000 = 10 kHz per
  *               LSB.  Worst-case quantisation error on the displayed
  *               frequency is +/- 1 LSB (a single 10 kHz step), and
  *               since the loop can be off by half a step in either
@@ -92,6 +92,21 @@ static volatile uint8_t  s_window_fill = 0U;  /*!< samples in window */
  * a debug reader can see what made it through the filter). */
 static volatile uint16_t s_accepted_lsb = 0U;
 
+/* Consecutive ticks the sliding window REJECTED (spread > SPREAD_MAX).
+ * Reset to 0 by every accept.  This is what tells a reader that
+ * s_measured_freq is still a real measurement rather than a leftover:
+ * once the input is unplugged every delta collapses to 0, and three
+ * zeros have a spread of 0 - which the spread test happily ACCEPTS as
+ * "0 Hz is perfectly consistent".  That accept would overwrite the last
+ * good reading, so the reject counter alone would not catch it either.
+ * What does catch it is the published value itself falling outside
+ * [FREQDET_MIN_VALID_FREQ_HZ, FREQDET_MAX_VALID_FREQ_HZ); see
+ * freq_detect_get_validity().  This counter covers the other half of
+ * the problem - a reading that is in range but no longer being refreshed
+ * because the input went noisy (spark, relay bounce, a partial
+ * disconnect) and every window since has been discarded. */
+static volatile uint16_t s_reject_run = 0U;
+
 /* Band-mismatch latched flag (ISR sets, task reads+clears). */
 static volatile bool     s_mismatch_latched = false;
 static volatile bool     s_mismatch_alerted = false;
@@ -100,10 +115,36 @@ static volatile bool     s_mismatch_alerted = false;
  *  TIM7 / TIM1 configuration
  *============================================================================*/
 
-/* TIM7: APB1 timer clock = 200 MHz, prescaler = 19 -> 10 MHz, period 999
- * = 100 us. */
+/* TIM7 tick = the sampling window of the frequency measurement.
+ *
+ * Clock: SYSCLK 250 MHz (HSE 25 / PLLM 2 * PLLN 40 / PLLP 2).  APB1 is
+ * 125 MHz and TIM7 sits on APB1 with a prescaler, so the timer clock is
+ * 2 x APB1 = 250 MHz.  Prescaler 19 -> /20 = 12.5 MHz.
+ *
+ * ARR 1249 gives 1250 ticks = 100 us.  This is the number the whole
+ * conversion rests on: 1 TIM1 count in 100 us is 1 part in 10000 of the
+ * divided-down ETR signal, i.e. 10 kHz per LSB, which is what
+ * FREQDET_LSB_HZ below and every tolerance in this file are written
+ * against.
+ *
+ * ARR 999 (which is what CubeMX put here) would be 1000 ticks = 80 us at
+ * the real clock, and the published frequency would then come out 20% LOW
+ * - 14.000 MHz would read as 11.2 MHz and every band decision would be
+ * made on the wrong number. */
 #define FREQDET_TIM7_PRESCALER    19U
-#define FREQDET_TIM7_PERIOD       999U
+#define FREQDET_TIM7_PERIOD       1249U
+
+/*!< Hz represented by one TIM1 count in one sampling window.
+ *
+ *   window_hz = 250 MHz / ((ARR+1) * (PSC+1)) = 250e6 / (1250 * 20) = 10000
+ *   One count inside that window is one whole window's worth of ETR
+ *   cycles, i.e. exactly window_hz Hz.  With the ARR above this is
+ *   10 kHz, which is what SPREAD_MAX_LSB and BAND_EPS_HZ are written
+ *   against.  Deriving it (instead of writing 10000) means changing the
+ *   window length cannot leave the conversion quietly stale - the test
+ *   the_sampling_window_is_100us exists to keep this honest. */
+#define FREQDET_LSB_HZ  (250000000UL                                   \
+                       / ((FREQDET_TIM7_PERIOD + 1U) * (FREQDET_TIM7_PRESCALER + 1U)))
 
 /* Sliding-window parameters.  The window holds 3 samples; we accept
  * the result when the *spread* (max - min across the filled slots) is
@@ -111,6 +152,20 @@ static volatile bool     s_mismatch_alerted = false;
  * accepted frequency agrees with the true value within +/- 1 LSB. */
 #define FREQDET_WINDOW_SIZE       3U
 #define FREQDET_SPREAD_MAX_LSB    2U
+
+/* Consecutive rejected windows that make the published frequency stale.
+ *
+ * With a 3-deep window and a spread tolerance of 2 LSB, one glitch (a
+ * single sample landing 3+ LSB away) only shifts the window contents; the
+ * next tick usually re-accepts.  Requiring a short run rather than a
+ * single rejection keeps an ordinary transient from flickering the
+ * display grey.
+ *
+ * At 100 us per tick, 5 consecutive rejects is 500 us of continuous
+ * disagreement - far longer than any relay bounce or spark, and short
+ * enough that a genuine signal re-validates almost immediately once it
+ * comes back. */
+#define FREQDET_STALE_REJECTS     5U
 
 /* Band-edge guard band for the mismatch check.  See the file comment
  * for the rationale; raw frequency_to_band() does NOT use this. */
@@ -178,6 +233,7 @@ void freq_detect_init(void)
     s_window[2]          = 0U;
     s_window_fill        = 0U;
     s_accepted_lsb       = 0U;
+    s_reject_run         = 0U;
     s_mismatch_latched   = false;
     s_mismatch_alerted   = false;
 
@@ -203,6 +259,7 @@ void freq_detect_start(void)
     s_last_counter = 0U;
     s_window_fill  = 0U;
     s_accepted_lsb = 0U;
+    s_reject_run   = 0U;
     s_measured_freq = 0U;
 }
 
@@ -230,8 +287,12 @@ void freq_detect_isr(void)
 
     /* Always publish the raw sample for debug / tests, even before the
      * window accepts it - the host test fixture injects a delta
-     * directly and wants to read it back. */
-    s_raw_sample = (uint32_t)delta * 10000U;
+     * directly and wants to read it back.
+     *
+     * The multiplier is derived from FREQDET_TIM7_PERIOD, so the two can
+     * never drift apart: change the sampling window and the Hz-per-LSB
+     * follows, instead of the frequency silently reading low. */
+    s_raw_sample = (uint32_t)delta * FREQDET_LSB_HZ;
 
     /* ----------------------------------------------------------------
      * Sliding window:  push delta into s_window (FIFO).  Once we have
@@ -266,9 +327,10 @@ void freq_detect_isr(void)
             uint16_t median = (n == 2U) ? sorted[0U]
                                         : sorted[1U];
             s_accepted_lsb = median;
-            uint32_t freq  = (uint32_t)median * 10000U;
+            uint32_t freq  = (uint32_t)median * FREQDET_LSB_HZ;
             s_measured_freq = freq;
             g_radio_freq_hz = freq;
+            s_reject_run = 0U;
         }
         /* else: spread too big, keep the previous s_measured_freq.
          * The LSB delta is +/- 1; a spread of 3+ LSB is a real glitch
@@ -279,8 +341,15 @@ void freq_detect_isr(void)
          * state, and does NOT participate in band-mismatch
          * detection.  The mismatch check below is gated on a
          * successful accept by tracking whether s_measured_freq
-         * changed this tick (see s_freq_published_this_tick). */
+         * changed this tick (see s_freq_published_this_tick).
+         *
+         * The run counter saturates rather than wrapping: a reader only
+         * ever asks "has it been stale for a while", and wrapping back to
+         * 0 would briefly make a long-dead input look fresh again. */
         else {
+            if (s_reject_run < 0xFFFFU) {
+                s_reject_run++;
+            }
             return;
         }
     }
@@ -300,17 +369,29 @@ void freq_detect_isr(void)
      *     out-of-band spur; we do not want to alert on those either
      *     because frequency_to_band() returns BAND_FAULT for them
      *     and the only action would be a false-positive shutdown.
-     *  2. The amp is actually keying.  At idle any RFI looks like a
-     *     mismatch and would alert spuriously.
-     *  3. The latch is not already set, so we do not pile up
+     *     This is what keeps idle RFI out: the counter has to see a
+     *     real, stable carrier in a real ham band before it can
+     *     disagree with the selected band.
+     *  2. The latch is not already set, so we do not pile up
      *     protection_trigger_locked() calls while the operator has
      *     not yet dismissed.
+     *
+     * NOT gated on the keying state.  A frequency that is measurably
+     * wrong for the selected band means the LPF will not pass what
+     * the radio is actually transmitting, and that is equally wrong
+     * whether the operator has keyed or not: a receiver keyed into
+     * the wrong passband, a mis-wired LPF, or an RF source feeding
+     * the counter that is not the radio at all are all faults the
+     * operator needs told about.  The valid-frequency window above
+     * is what distinguishes "a real signal on a real band" from
+     * "noise on the counter input", and that check does not depend
+     * on the amplifier's state.
      *
      * The band classification uses the wide-edge version
      * (frequency_to_band_wide) so a measurement sitting in the
      * quantisation band right on top of a boundary does not bounce.
      * ---------------------------------------------------------------- */
-    if (g_tx_active && !s_mismatch_latched &&
+    if (!s_mismatch_latched &&
         s_measured_freq >= FREQDET_MIN_VALID_FREQ_HZ &&
         s_measured_freq <  FREQDET_MAX_VALID_FREQ_HZ) {
         BandType measured = frequency_to_band_wide(s_measured_freq);
@@ -318,6 +399,7 @@ void freq_detect_isr(void)
             measured != BAND_FAULT &&
             measured != g_current_band) {
             s_mismatch_latched = true;
+            protection_note_source(PROT_SRC_FREQ);
             protection_trigger_locked(ALERT_FREQ_MISMATCH);
         }
     }
@@ -334,14 +416,22 @@ void freq_detect_check(void)
         switch_band(measured);
     }
 
-    /* Clear the latch once the conditions that set it are gone.
-     * Either the radio dropped the carrier (g_tx_active false) or the
-     * measured frequency fell out of the valid window (signal lost /
-     * LO dropped).  In both cases the mismatch is moot. */
+    /* Clear the latch once the conditions that set it are gone: the
+     * measured frequency fell out of the valid window (carrier
+     * dropped / LO lost / counter back to noise), or the radio moved
+     * back onto the selected band.
+     *
+     * The keying state deliberately plays no part here.  It used to
+     * ("carrier dropped -> clear"), which was correct when the
+     * mismatch check only ran while keyed; now that the check runs
+     * unconditionally, keying is not what set the latch and so it
+     * cannot be what clears it either.  Releasing the latch also
+     * requires the operator to dismiss the alert - this only re-arms
+     * the detector, it does not clear a standing alert. */
     if (s_mismatch_latched) {
-        if (!g_tx_active ||
-            s_measured_freq < FREQDET_MIN_VALID_FREQ_HZ ||
-            s_measured_freq >= FREQDET_MAX_VALID_FREQ_HZ) {
+        if (s_measured_freq < FREQDET_MIN_VALID_FREQ_HZ ||
+            s_measured_freq >= FREQDET_MAX_VALID_FREQ_HZ ||
+            frequency_to_band_wide(s_measured_freq) == g_current_band) {
             s_mismatch_latched = false;
             s_mismatch_alerted = false;
         }
@@ -349,6 +439,40 @@ void freq_detect_check(void)
 }
 
 uint32_t freq_detect_get_frequency(void) { return s_measured_freq; }
+
+/* Is s_measured_freq a live measurement right now?
+ *
+ * Three conditions, all of which a plain range check would miss:
+ *
+ *  1. In range.  Outside [FREQDET_MIN_VALID_FREQ_HZ,
+ *     FREQDET_MAX_VALID_FREQ_HZ) it is not a ham-band frequency at all -
+ *     the input is floating, or the counter is seeing its own noise.
+ *
+ *  2. The window has not been rejecting.  s_measured_freq deliberately
+ *     holds its last value when the sliding window discards a sample, so
+ *     a reading can be arbitrarily old and still look perfect to a range
+ *     check.  A run of rejections means the input went noisy - spark,
+ *     relay bounce, a half-open cable - and the number on screen is a
+ *     leftover, not a measurement.
+ *
+ *  3. Enough samples have ever landed.  Right after start() the window
+ *     holds fewer than FREQDET_WINDOW_SIZE entries and nothing has been
+ *     accepted yet.
+ *
+ * Lives here rather than in the GUI because the thresholds and the window
+ * parameters are both private to this file: a caller re-deriving the rule
+ * would silently disagree the moment either changed. */
+bool freq_detect_is_measurement_valid(void)
+{
+    if (s_measured_freq < FREQDET_MIN_VALID_FREQ_HZ ||
+        s_measured_freq >= FREQDET_MAX_VALID_FREQ_HZ) {
+        return false;
+    }
+    if (s_reject_run >= FREQDET_STALE_REJECTS) {
+        return false;
+    }
+    return s_window_fill >= 2U;
+}
 
 /* HOST_TEST_NATIVE hook: read the raw last sample even when the sliding
  * window has not accepted it yet.  Useful for the unit tests that

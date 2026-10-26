@@ -13,6 +13,7 @@
 #include "freq_detect.h"
 #include "buzzer.h"
 #include "fan_tach.h"
+#include "overdrive.h"
 #include "radio_uart.h"
 #include "config.h"
 /* g_freertos_fault, latched by app_task_create_failed() and the FreeRTOS
@@ -52,6 +53,14 @@ static TaskHandle_t config_task_handle = NULL;
 void app_tasks_create(void)
 {
     BaseType_t result;
+
+    /* The config mutex has to exist before any task can take it.  Created
+     * here rather than lazily inside config_lock(), because two tasks
+     * calling config_lock() for the first time at the same moment would
+     * otherwise each create their own mutex and end up with two
+     * different locks - which is exactly the bug the lock was meant to
+     * prevent. */
+    config_mutex_init();
 
     /* A task that failed to create never runs, and the symptom appears
      * somewhere else entirely: a missing Protect task looks exactly like a
@@ -220,10 +229,42 @@ void app_adc_task(void *argument)
 
     last_wake_time = xTaskGetTickCount();
 
-    /* Initialize ADC */
+    /* Initialize ADC.  This resets the peak holds, the injected re-arm
+     * timer and the stabilisation state machine - all of which must be zero
+     * before the first sample arrives, or the GUI would show whatever the
+     * DMA buffer happened to contain. */
     adc_init();
-    adc_start();
 
+    /* Overdrive indicator: clear the 200 ms peak window and the beep latch
+     * before the first sample, otherwise the first pass would judge a window
+     * full of stale zeros.  While the DMA is stopped below, adc1_raw stays
+     * zeroed, so the LED simply stays dark through the silence. */
+    overdrive_init();
+
+    /* Power-on silence.  adc_presettle() brings the regulators and the
+     * reference buffers up but deliberately takes no sample; the DMA stays
+     * stopped for ADC_PRESETTLE_MS so the cold-conversion transient never
+     * reaches g_adc_data.  A cold ADC's first conversions are wrong in a
+     * structured way - regulator charge, reference settling, the CC6920
+     * bias and the coupler detectors' DC rest point all still moving - and
+     * the peak holds (tau = 5 s) would stretch that into a visible spike
+     * that reads like a real transmission.
+     *
+     * vTaskDelay, not HAL_Delay: the GUI task has to come up in parallel to
+     * raise g_gui_ready, and g_ptt_ready cannot be satisfied until both that
+     * and the IMAIN calibration are done. */
+    adc_presettle();
+    vTaskDelay(pdMS_TO_TICKS(ADC_PRESETTLE_MS));
+
+    /* Sampling from here on.  last_wake_time is re-seeded because the
+     * silence above consumed the original reference point, and
+     * vTaskDelayUntil() would otherwise try to catch up in a burst. */
+    adc_start();
+    CLEAR_FAULTX_OC_LOW();
+    RF_BIAS_DISABLE();
+    osDelay(10);
+    CLEAR_FAULTX_OC_HIGH();
+    last_wake_time = xTaskGetTickCount();
     while (1) {
         /* Publish the instantaneous engineering values.  Note this also
            runs from the ADC1 DMA interrupt, so the task-side call is only
@@ -231,24 +272,24 @@ void app_adc_task(void *argument)
            path. */
 //        adc_process();
 
-        /* 上电稳定等待 + CC6920 主电流零点校准（user_adc.c 里的状态机）。
+        /* 上电流程 + CC6920 主电流零点校准（user_adc.c 里的状态机）。
            它一次性包办了整段上电流程，所以这里不可能漏掉某一步，也不
            可能有两个地方同时在跑：
 
-             1. SETTLING     前 1 s，什么都不信。CLEAR_FAULTX_OC 持续
-                             拉低，外部故障锁存器被按住不放；同时
-                             boot_hold_thresholds_open() 在进入 RTOS 之前
-                             就已把 AWD1/2/3 和两路 COMP 的 DAC 全部推到
-                             满量程，所以这 1 s 里不会误报。
-             2. CALIBRATING  跑 IM 零点校准（50 次采样 + 校验）。
-             3. ARMED        校准通过，此刻才认为 ADC 值有效：
-                             boot_apply_thresholds() 把真正的 AWD/COMP
-                             门槛下发下去，CLEAR_FAULTX_OC 释放，GUI 才开始
-                             显示这些读数。
-
-           这是 g_allow_rf = true 的唯一写者，而 adc_init() 每次上电都会
-           清掉 im_calibrated 和 g_allow_rf，所以没有这次调用放大器永远
-           无法起振——ptt_apply_level() 在 g_allow_rf 为假时拒绝一切请求。
+             1. 静默期 100 ms（adc_presettle + 上面的 vTaskDelay）。
+                这段时间不取样：转换器已上电但 DMA 未启动，所以冷启动
+                的瞬态不会进入 g_adc_data。同时
+                boot_hold_thresholds_open() 在进入 RTOS 之前就已把
+                AWD1/2/3 和两路 COMP 的 DAC 全部推到满量程，所以这
+                100 ms 里不会误报。
+             2. ARMING       静默期结束后的第一拍：真正的 AWD/COMP 门槛
+                             下发，CLEAR_FAULTX_OC 释放，比较器启动，
+                             g_allow_rf 置位 —— 从这一刻起操作员可以按键。
+             3. 后台校准     IM 零点校准在后台跑（50 次采样 + 校验），
+                             成功即写入 im_zero_offset_adc 并重新拟合
+                             AWD2 门槛。它是一个"测量"步骤，不再是
+                             "发射许可"的前提：传感器不收敛只是电流读数
+                             不可信，不该让功放变成砖。
 
            校准窗口在 50 ms 的任务节拍上跑（状态机按 10 ms 设计），所以
            50 次采样从 ~500 ms 拉长到 ~2.5 s。无妨：它只要在 PA 不取流
@@ -257,14 +298,26 @@ void app_adc_task(void *argument)
            自限：g_config.im_calibrated 一旦置位状态机立刻返回，所以成功
            之后每拍只剩一次取值+分支。失败则一直重试下去、不再告警——
            零点偏移不收敛多半是冷机/热机漂移而不是硬件坏了，对它报警只会
-           训练操作员忽略告警。代价是失败时放大器一直无法起振
-           （g_allow_rf 保持为假），但不会有误动作。 */
+           训练操作员忽略告警。代价是电流读数一直是 0（未标定），但功放
+           照样能正常发射，保护链也照样工作。 */
         (void)adc_stabilisation_tick();
 
         /* Advance the coupler-2 peak holds for the GUI bar graphs.  Task
            context on purpose: the release step uses expf(), which must not
            run in the priority-0 DMA interrupt. */
         adc_peak_hold_tick();
+
+        /* Overdrive indicator: 200 ms peak of the RF-input detector (INP4,
+         * the same node COMP1 watches).  One P0 buzzer cycle is started per
+         * excursion - overdrive_take_beep() only hands out one request until
+         * the level has fallen back below the trip point, so a complete
+         * buzzer cycle always plays out before the next one can begin. */
+//         NOTE: implement software overdrive protection later
+//        overdrive_tick(HAL_GetTick(),
+//                       (uint16_t)g_adc_data.adc1_raw[ADC1_RANK_RF_IN]);
+//        if (overdrive_take_beep()) {
+//            buzzer_start();
+//        }
 
         /* Re-arm the ADC2 injected conversions (NTC core, NTC aux, die
            temp).  They are configured software-start with no trigger, so
@@ -274,11 +327,13 @@ void app_adc_task(void *argument)
 
         /* Transmit gate (design spec step 6): the amplifier may only be
            keyed once ALL THREE halves are true -
-             adc_stabilisation_done()  上电稳定等待期结束：模拟量稳定，
-                           零点校准完成，真正的 AWD/COMP 门槛已下发，
-                           CLEAR_FAULTX_OC 已释放。
-             g_allow_rf    the IM zero-offset calibration finished, so the
-                           main-current reading is trustworthy, and
+             adc_stabilisation_done()  静默期已过、真正的 AWD/COMP 门槛
+                           已下发、CLEAR_FAULTX_OC 已释放、比较器已启动。
+                           注意这不再包含"零点校准完成"——校准是测量
+                           步骤，不是发射许可的前提。
+             g_allow_rf    no fault is latched.  上电路径在静默期结束时
+                           置位，protection.c 在 P0 故障时清零、解除
+                           故障时恢复。
              g_gui_ready   the GUI painted a frame, so the operator can
                            actually see what the amp is doing.
            Until then power_control's ptt_apply_level() refuses every
@@ -320,6 +375,8 @@ void app_comm_task(void *argument)
     last_applied_radio_baud = g_config.radio_baud_rate;
 
     while (1) {
+        // Note: suppress Comm task at this moment.
+#if 0
         /* 0) GUI 改 radio_baud 后，g_config 已经被写但 UART4 还在用
          *    旧值。comm 任务拿到机会把它落实——这是用户要求"GUI 改
          *    立即生效"的具体实现。最多每轮执行一次。 */
@@ -340,7 +397,7 @@ void app_comm_task(void *argument)
         /* 2a) 事件推送：comm_alert_pump() 把 alert=ON/OFF 事件 ring
          *     里的内容写到 s_tx_ring。每次 comm 任务循环都做（10ms），
          *     让保护事件在 < 10ms 内送达 PC，不必等 100ms status 周期。 */
-        comm_alert_pump();
+        comm_alert_pump(); // Note: Hard fault right after dismiss
 
         /* 3) TX pump：把 s_tx_ring 里的数据搬到 s_tx_dma_buf 并
          *    启动 DMA，DMA 完成后由 HAL_UART_TxCpltCallback 拉
@@ -367,6 +424,7 @@ void app_comm_task(void *argument)
          *    blocks for an unpredictable time, so the "absolute deadline"
          *    anchor no longer matches.  10 ms keeps the loop responsive. */
         vTaskDelay(pdMS_TO_TICKS(20));
+#endif
     }
 }
 
@@ -377,9 +435,9 @@ void app_monitor_task(void *argument)
 {
     TickType_t last_wake_time;
     static bool ptt_last_handled = false;  /* Track last handled PTT state */
-    /* Divider for the slow housekeeping below.  The loop itself must run at
-     * 10 ms so power_rail_step() can honour the HV sequencing gap, but the
-     * PTT edge check, fan curve and tach only need 100 ms. */
+    /* Divider for the slow housekeeping below.  The loop itself runs at
+     * 100 ms so power_rail_step() services the HV sequencing, and the PTT
+     * edge check, fan curve and tach run every 10th pass of it. */
     static uint32_t slow_div = 0U;
 
     (void)argument;
@@ -399,12 +457,26 @@ void app_monitor_task(void *argument)
     ptt_last_handled = power_get_ptt_state();
 
     while (1) {
-        /* HV rail sequencing first, on every tick.  This is why the loop
-         * runs at 10 ms: power_psu_on() / power_psu_off() only throw one of
-         * the two switches, and power_rail_step() performs the second
-         * HV_STAGE_DELAY_MS later.  It must be serviced even while keyed
-         * or a fault is latched - dropping the bias late is worse than
-         * dropping it early. */
+        /* Release the IM (main current) mute once its HV-inrush window has
+         * elapsed.  power_hv_on() raises it; this task is the only place
+         * that clears it, and the two handlers only test the flag. */
+        protection_im_mask_tick();
+
+        /* Timed clear of the external fault latch.  This task is the
+         * heartbeat that drives the pin: protection_clear_fault_safe() only
+         * raises a flag, and the service below pulls CLEAR_FAULTX_OC low
+         * and puts it back when the requested time is up.  The callers are
+         * interrupt handlers and command handlers, so neither of them can
+         * afford to hold a pin down itself. */
+        protection_fault_clear_service();
+
+        /* HV rail sequencing first, on every tick.  power_hv_on() /
+         * power_hv_off() only throw one of the two switches, and
+         * power_rail_step() performs the second one tick later - i.e. the
+         * bias-before-rail gap is one monitor tick here, not the nominal
+         * HV_STAGE_DELAY_MS.  It must be serviced even while keyed or a
+         * fault is latched - dropping the bias late is worse than dropping
+         * it early. */
         power_rail_step();
 
         if (++slow_div >= 10U) {
@@ -466,7 +538,10 @@ void app_monitor_task(void *argument)
         fan_tach_calculate_rpm();
         }   /* slow_div */
 
-        /* 10ms tick: sets the HV rail sequencing resolution. */
+        /* 100 ms tick: sets the HV rail sequencing resolution AND the
+         * granularity of the IM inrush-mute release, which is why
+         * IM_MASK_HOLD_MS is 100 ms.  The PTT edge check, fan curve and
+         * tach are divided further by slow_div. */
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
     }
 }
@@ -491,7 +566,7 @@ void app_monitor_task(void *argument)
  *  still meant to hold.
  *
  *  Why this task does the delay: app_monitor_task (priority 5) runs
- *  power_rail_step() on a 10 ms tick, and power_rail_step() calls
+ *  power_rail_step() on a 100 ms tick, and power_rail_step() calls
  *  RF_BIAS_ENABLE().  The protection task sits at priority 6, so osDelay()
  *  here keeps the monitor out for the whole window and the level we restore
  *  is genuinely the level we sampled.  Nothing of consequence runs below
@@ -503,12 +578,15 @@ static void protect_task_latch_clear_pulse(void)
      * course just return the level we ourselves wrote. */
     GPIO_PinState bias_was = HAL_GPIO_ReadPin(RF_BIAS_GPIO_Port, RF_BIAS_Pin);
 
-    CLEAR_FAULTX_OC_LOW();
+    /* The clear line goes through protection.c's holder mask, so a timed
+     * clear service running at the same time cannot have its pulse cut
+     * short by this one (or the other way round). */
+    protection_fault_clear_hold();
     RF_BIAS_DISABLE();
 
     osDelay(pdMS_TO_TICKS(PROTECT_LATCH_CLEAR_MS));
 
-    CLEAR_FAULTX_OC_HIGH();
+    protection_fault_clear_release();
     if (bias_was == GPIO_PIN_SET) {
         RF_BIAS_ENABLE();
     }
@@ -546,15 +624,21 @@ void app_protect_task(void *argument)
         }
 
         /* Backstop for the conditions that have no hardware watchdog.  Runs
-         * unconditionally: NTC over-temperature applies while idle too, and
-         * the coupler limits inside protection_check() gate on g_tx_active
-         * themselves. */
+         * unconditionally: NTC over-temperature, the coupler limits and
+         * the PA bias all apply whether or not the amplifier is keyed,
+         * because an idle PA can be struck by a stray carrier or have a
+         * failing LPF - and with no legitimate signal in flight those
+         * readings mean even more, not less. */
         protection_check();
 
-        /* Check frequency if transmitting */
-        if (g_tx_active) {
-            freq_detect_check();
-        }
+        /* Frequency check: unconditional.  It drives the LPF band follow, and
+         * a frequency that disagrees with the selected band is just as
+         * wrong when the amplifier is idle as when it is keyed - so the
+         * keying state must not decide whether this runs.  The
+         * measurement itself is validated inside freq_detect.c (valid
+         * frequency window, window-accepted, 3-sample agreement), which
+         * is what keeps idle noise from being mistaken for a carrier. */
+        freq_detect_check();
 
         /* NOTE: the alert popup and the buzzer are NOT driven from here.
          * protection_trigger_locked() already latches g_alert_flag and
@@ -579,30 +663,66 @@ void app_protect_task(void *argument)
  * happens here at the lowest priority in the system: every other task,
  * including the protection task, preempts it freely.
  *
- * The 1 s period is a coalescing window.  Dragging a protection-threshold
- * slider raises the dirty flag on every LVGL value-changed event; without
- * this delay a single gesture would append dozens of records and burn
- * through the ring for nothing.  One write per second is fast enough that
- * a power cut loses at most one second of tuning.
+ * The task does NOT poll.  It blocks on a thread flag (CONFIG_SAVE_FLAG),
+ * and whoever changes a config field calls config_mark_dirty(), which sets
+ * the dirty flag and posts the flag.  That replaced a 1 s poll.
+ *
+ * The poll existed only to coalesce a burst of edits into a single write:
+ * dragging a protection-threshold slider raises the dirty flag on every
+ * LVGL value-changed event, and without a window one gesture would append
+ * dozens of records and burn through the ring for nothing.  The GUI's own
+ * staging does that job better - s_menu_dirty is raised by the sub-page
+ * callbacks and committed when the session ends, so the write lands on a
+ * boundary the operator perceives as "I finished editing" rather than on an
+ * arbitrary timer edge.  A power cut mid-session now restores the previous
+ * settings instead of a half-applied set.
+ *
+ * A lost wake-up cannot lose an edit: the thread flag is sticky, and the
+ * task re-reads config_is_dirty() after every wake.
  */
 void app_config_task(void *argument)
 {
-    TickType_t last_wake_time;
-
     (void)argument;
 
-    last_wake_time = xTaskGetTickCount();
+    /* Publish the task id so config_mark_dirty() can wake this task.  Done
+     * before the first wait, so an edit made between here and the wait is
+     * not lost - the flag is sticky and the dirty flag is checked first
+     * thing below anyway.  config_set_save_task() also posts the flag if
+     * an edit was already pending, which covers the boot window before
+     * this task existed. */
+    config_set_save_task((void *)osThreadGetId());
 
     while (1) {
-        if (config_is_dirty()) {
-            /* Clear first, then write.  If an edit lands between the clear
-             * and the write, config_save() stores the newer values and the
-             * flag is still set for the next pass - the edit is not lost.
-             * Clearing afterwards instead would swallow it. */
-            config_clear_dirty();
-            (void)config_save();
-        }
+        /* Block until someone changes something.  A thread flag rather than
+         * a 1 s poll: the poll existed only to coalesce a burst of edits
+         * into one write, and the GUI's staging (s_menu_dirty, committed
+         * when the session ends) does that job better - the save now lands
+         * on a boundary the operator perceives as "I finished editing",
+         * not on an arbitrary timer edge.
+         *
+         * The wait returns immediately when the flag is already set, so a
+         * wake-up that arrives while the previous write is still running is
+         * simply remembered rather than lost. */
+        (void)osThreadFlagsWait(CONFIG_SAVE_FLAG, osFlagsWaitAll, osWaitForever);
 
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(1000));
+        /* config_flush_pending() does the clear-then-write under the
+         * config lock, so an edit that lands while the write is running is
+         * kept for the next pass rather than swallowed.
+         *
+         * It returns true only when a write actually happened AND
+         * succeeded, so the toast is raised for real saves and not for
+         * the no-op wake-ups or the retry case (where it re-raises the
+         * dirty flag and comes straight back).
+         *
+         * The toast takes the GUI mutex itself and releases it as soon as
+         * the widget exists, so the only thing this lowest-priority task
+         * does to the GUI is a few microseconds of object creation.  The
+         * three seconds it then stays on screen cost nothing here - LVGL
+         * drives its fade from lv_task_handler() in the GUI handler task,
+         * not from here. */
+        if (config_flush_pending()) {
+            gui_toast_config_saved();
+        }
+        osDelay(pdMS_TO_TICKS(2000)); // at most write once each 2seconds
     }
 }

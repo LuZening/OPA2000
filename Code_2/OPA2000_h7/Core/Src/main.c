@@ -212,6 +212,20 @@ int main(void)
    * false alarm can never be latched in the first place. */
   boot_hold_thresholds_open();
 
+  /* --- Step 4b: hold the digital fault lines off until the supply settles -- */
+  /* The power board's fault line (PB12) comes up with the supply, so during
+     the ADC's power-on settling window it can still be asserting, or can
+     pulse once as the rail comes up.  A P0 fault is expensive - HV rail
+     cut, relays dropped, 3-tone buzzer for 10 s, a popup to dismiss - and
+     all of that at every cold boot for a supply that is about to come up
+     healthy.  So the digital lines are masked here and armed again when
+     the settling window ends (adc_stabilisation_tick()).
+
+     The mask is per EXTI LINE, so PF15 (the backup-rail monitor) is masked
+     with it rather than the whole EXTI15_10_IRQn - they share that IRQ,
+     and the backup monitor has to keep working throughout. */
+  protection_hold_digital_faults();
+
 
 
   /* --- Step 5: USB device bring-up (moved out of the deleted defaultTask) - */
@@ -468,24 +482,40 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
 }
 
 /* Analog watchdog interrupts.  These fire from ADC1_2_IRQHandler at main
-   priority 0, so the shutdown happens before anything else can run. */
+   priority 0, so the shutdown happens before anything else can run.
+ *
+   USE_AWD (see opa2000.h) takes the three watchdogs out of the build.  The
+   handler still exists - the HAL's __weak default would otherwise be
+   linked in, which is harmless - but it does nothing, so a watchdog trip
+   no longer reaches protection_trigger_locked().
+
+   Note that this alone is not enough to stop the hardware: the ADC would
+   still raise the interrupt on every conversion above the threshold.
+   adc_awd_set_*() parks the thresholds at full scale when USE_AWD is off,
+   so the interrupt never fires in the first place. */
 
 void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef* hadc)
 {
   (void)hadc;
+#ifdef USE_AWD
   protection_awd1_cb();     /* AWD1 -> CH4 RF input power  */
+#endif
 }
 
 void HAL_ADCEx_LevelOutOfWindow2Callback(ADC_HandleTypeDef* hadc)
 {
   (void)hadc;
+#ifdef USE_AWD
   protection_awd2_cb();     /* AWD2 -> CH5 main current     */
+#endif
 }
 
 void HAL_ADCEx_LevelOutOfWindow3Callback(ADC_HandleTypeDef* hadc)
 {
   (void)hadc;
+#ifdef USE_AWD
   protection_awd3_cb();     /* AWD3 -> CH6 coupler 1 reverse */
+#endif
 }
 
 /**

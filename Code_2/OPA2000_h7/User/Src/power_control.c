@@ -18,6 +18,7 @@
 
 #include "power_control.h"
 #include "boot.h"
+#include "protection.h"   /* protection_mask_im_high() - HV inrush mute */
 #include "stm32h7xx_hal.h"
 #include <stddef.h>
 
@@ -25,20 +26,38 @@
  *  Private defines
  *============================================================================*/
 
-/* TIM3 = APB1 timer clock = 200 MHz (assuming CubeMX clock tree). */
-#define PWM_TIM3_CLOCK_HZ      200000000U
-#define PWM_TIM3_PRESCALER     19U            /*!< /20 -> 10 MHz tick */
-#define PWM_TIM3_PERIOD        999U           /*!< period = 1000 ticks = 10 kHz */
+/* TIM3 = APB1 timer clock.
+ *
+ * Clock tree: SYSCLK 250 MHz (HSE 25 / PLLM 2 * PLLN 40 / PLLP 2).
+ * APB1 is 125 MHz and TIM3 sits on APB1 with a prescaler, so the timer
+ * clock is 2 x APB1 = 250 MHz.  PSC 19 -> /20 = 12.5 MHz, and ARR 1249
+ * gives 1250 ticks -> exactly 10 kHz, the base frequency the fan and
+ * pump spec asks for. */
+#define PWM_TIM3_CLOCK_HZ      250000000U
+#define PWM_TIM3_PRESCALER     19U            /*!< /20 -> 12.5 MHz tick */
+#define PWM_TIM3_PERIOD        1249U          /*!< period = 1250 ticks = 10 kHz */
 
 /* TIM4 same clock domain, used for PUMP PWM (CH4) and BL_PWM (CH3). */
 #define PWM_TIM4_PRESCALER     19U
-#define PWM_TIM4_PERIOD        999U
+#define PWM_TIM4_PERIOD        1249U
 
-/* TIM5 one-shot 15 ms for RELAY delay.  Clock = 200 MHz / (39+1) = 5 MHz
- * (psc=39), period = 75000 ticks = 15 ms. */
+/* TIM5 one-shot 10 ms for the RELAY break-before-make delay.
+ *
+ * Clock: same 250 MHz APB1 timer clock.  Divided by (39+1) = 40 that is
+ * 6.25 MHz, i.e. 6250 ticks per millisecond, so 10 ms is 62500 ticks.
+ *
+ * The two relays are never switched together - see the sequencing note
+ * below - so this is the dead time between them, not the contact
+ * settling time of one relay.  10 ms is comfortably longer than a
+ * relay's own bounce (a few ms), which is what the dead time has to
+ * cover.
+ *
+ * 62500 fits in 16 bits, which is what the & 0xFFFF0000 mask in
+ * relay_timer_arm() can hold without truncating the count.  A 15 ms
+ * dead time would need 93750 ticks and would NOT survive that mask. */
 #define RELAY_TIM5_PRESCALER   39U
-#define RELAY_TIM5_PERIOD      74999U
-#define RELAY_DELAY_MS         15U
+#define RELAY_TIM5_PERIOD      62499U    /*!< 62500 ticks = 10 ms */
+#define RELAY_DELAY_MS         10U
 
 /* Fan / pump speed levels (uint8_t 0..100) */
 #define FAN_SPEED_DEFAULT      50U
@@ -131,9 +150,9 @@ static void ptt_leave_tx(void)
  *  PTT_OUT (PC15, active high)
  *
  *  The feedback to the radio follows the RF path, not the key request:
- *  it is asserted only once the 15 ms break-before-make has closed RELAY1
- *  and the PA is genuinely passing RF.  Asserting it earlier would tell
- *  the radio to key into an amplifier that is not connected yet.
+ *  it is asserted only once the break-before-make dead time has closed
+ *  RELAY1 and the PA is genuinely passing RF.  Asserting it earlier would
+ *  tell the radio to key into an amplifier that is not connected yet.
  *==========================================================================*/
 
 void power_ptt_out_set(bool asserted)
@@ -158,7 +177,7 @@ extern TIM_HandleTypeDef htim5;   /* RELAY delay one-shot */
  *  Private helpers
  *============================================================================*/
 
-/* Arm the TIM5 one-shot that provides the 15 ms break-before-make delay.
+/* Arm the TIM5 one-shot that provides the break-before-make delay.
  * The request is re-programmed and the counter restarted on every call:
  * a new intent must always win, otherwise a PSU-off landing inside the
  * start-up delay would leave the old "close RELAY1" request pending. */
@@ -480,6 +499,13 @@ void power_hv_on(void)
     if (g_hv_on && s_hv_stage == HV_STAGE_IDLE) {
         return;                     /* already settled on */
     }
+    /* Mute the main-current protection across the inrush.  Closing PWR_ON
+     * charges the supply's bulk capacitors, and that surge looks like a
+     * short circuit on the node AWD2 and COMP2 both watch - neither trip is
+     * meaningful for an amplifier that has not even been keyed.  Raised
+     * BEFORE the switch, because the surge starts on the first millisecond.
+     * The monitor ("pump") task releases it IM_MASK_HOLD_MS later. */
+    protection_mask_im_high();
     /* Main HV enable via PG7.  PSU_ON (PG5) is NOT part of this rail. */
     PWR_ON_ENABLE();
     /* PA bias is deliberately NOT enabled here - it waits one task tick so
@@ -625,6 +651,27 @@ void power_rail_abort(void)
 
 void power_relays_tx_on(void)
 {
+    /* IDLE refuses every keying request, whatever the source.
+     *
+     * This is the chokepoint for the task-side paths (CAT over UART4, the
+     * front-panel key via power_tx_enable(), and anything that calls this
+     * helper directly); the pedal path has its own copy of the same gate in
+     * ptt_apply_level(), because it does not come through here.
+     *
+     * Why refuse rather than key the relays anyway: with PWR_ON down and the
+     * bias off the amplifier cannot produce RF, so closing the RF path buys
+     * nothing - but it does make the panel announce "Transmit" and, on the
+     * pedal path, drive PTT_OUT high back to the radio.  The radio then
+     * transmits into an amplifier that is not connected to anything.
+     *
+     * g_power_state == POWER_STATE_OFF is exactly "PWR_ON low, bias off";
+     * power_hv_on() publishes STANDBY and power_hv_off() publishes OFF.  A
+     * request that arrives here is simply dropped, exactly like one that
+     * arrives during the HV sequencing gap a few lines further up. */
+    if (g_power_state == POWER_STATE_OFF) {
+        return;
+    }
+
     /* Direct GPIO writes - no HAL_Delay, no FreeRTOS API. */
     RELAY2_ON();   /* connect PA to LPF immediately */
     RELAY1_OFF();  /* hold off RELAY1 for RELAY_DELAY_MS */
@@ -724,7 +771,7 @@ void power_set_lcd_backlight(bool enable)
  *  PTT_INX is ACTIVE LOW: a low level means "transmit requested".
  *==========================================================================*/
 
-/* Close RELAY2 now, RELAY1 after the 15 ms break-before-make delay. */
+/* Close RELAY2 now, RELAY1 after the break-before-make delay. */
 static void ptt_begin_transmit(void)
 {
     if (ptt_state != PTT_STATE_IDLE) {
@@ -778,20 +825,71 @@ static void ptt_force_release(void)
     ptt_out_sync();
 }
 
+/* Emergency release driven by the protection chain.
+ *
+ * Differs from ptt_force_release() in one way that matters: it publishes the
+ * power state even when ptt_state is already IDLE.  The early-return above is
+ * correct for the PTT paths (a repeated release is a genuine no-op), but it
+ * is wrong for a fault: g_power_state is written only by ptt_leave_tx(), so
+ * a fault that arrives while the state machine already thinks it is idle
+ * would leave the banner saying "Transmit" forever.  That is exactly what
+ * used to happen - protection.c assigned ptt_state directly, so the relay
+ * state and the published power state could disagree with nothing to
+ * reconcile them.
+ *
+ * ISR-safe: GPIO writes, register writes and volatile stores only. */
+void power_ptt_force_release_isr(void)
+{
+    RELAY1_OFF();
+    RELAY2_OFF();
+    relay_timer_stop();
+    ptt_state = PTT_STATE_IDLE;
+    ptt_out_sync();                 /* no longer TX_RUNNING -> PTT_OUT low */
+
+    /* Only publish when there is something to publish.  Guarding on the two
+     * flags keeps an idle, powered-down amplifier from being re-labelled
+     * STANDBY just because g_hv_on happens to still read true. */
+    if (g_tx_active || g_power_state == POWER_STATE_TX) {
+        ptt_leave_tx();
+    }
+}
+
 /* Reconcile the state machine against the live PTT_INX level.
  *
  * This is the single chokepoint every PTT path funnels through: the
  * EXTI5 ISR (power_control_ptt_isr), the TIM7 poll fallback
  * (power_ptt_poll) and the CAT/serial request (power_tx_enable ->
  * power_relays_tx_on).  The boot gate therefore lives HERE, so a pedal
- * press during the ~1 s while the ADC calibration is still running
- * cannot key the amplifier no matter which path noticed it.
+ * press during the 100 ms power-on silence cannot key the amplifier no
+ * matter which path noticed it.
  */
 static void ptt_apply_level(bool ptt_pressed)
 {
-    /* g_ptt_ready = (IM zero-offset done) && (GUI painted a frame).
-     * Until both hold, the protection chain is not trustworthy. */
+    /* g_ptt_ready = (the ADC power-on silence is over and the protection
+     * chain is live) && (the GUI painted a frame).  g_allow_rf is the
+     * "no fault is latched" flag on top of that.  Until these hold, the
+     * protection chain is not trustworthy. */
     if (!g_ptt_ready || !g_allow_rf || g_alert_flag) {
+        ptt_force_release();
+        return;
+    }
+    /* IDLE: the HV rail is not engaged, so the amplifier is not in service.
+     * Ignore the pedal completely - the press edge and the release edge
+     * alike.
+     *
+     * This is a policy decision and it deliberately overrides the older
+     * "the relay sequence is its own subsystem, run it anyway" rule.  With
+     * the PA unpowered the relays produce no RF, but switching them still
+     * makes the front panel lie: the banner goes to Transmit and PTT_OUT is
+     * driven high back to the radio, which then starts transmitting into an
+     * amplifier that is not connected to anything.
+     *
+     * g_power_state == POWER_STATE_OFF is exactly "PWR_ON is down and the
+     * bias is off": power_hv_on() publishes STANDBY, power_hv_off() OFF.
+     * Releasing is never blocked - ptt_force_release() runs here and from
+     * power_ptt_poll()'s own gate, so a stale keyed state is always
+     * cleared even if the rail drops mid-transmission. */
+    if (g_power_state == POWER_STATE_OFF) {
         ptt_force_release();
         return;
     }
@@ -803,9 +901,8 @@ static void ptt_apply_level(bool ptt_pressed)
      * front-panel key alike.  The operator simply presses again a few
      * milliseconds later, exactly as before the rail was sequenced.
      *
-     * Note this is a *sequencing* interlock, not a power-policy one: it
-     * never checks g_psu_on / g_hv_on, because whether the PA is energised
-     * is not the firmware's call to make at request time. */
+     * Note this is a *sequencing* interlock: it refuses because the two
+     * switches are not settled, not because of which way they are going. */
     if (s_hv_stage != HV_STAGE_IDLE) {
         ptt_force_release();
         return;
@@ -850,14 +947,13 @@ void power_control_ptt_isr(void)
  */
 void power_ptt_poll(void)
 {
-    /* Hard gate: until the ADC zero-offset calibration has finished AND
-     * the GUI has painted its first frame, the protection chain is not
-     * trustworthy yet and we must not key the amplifier.  g_ptt_ready is
-     * set by the ADC/GUI tasks once both conditions hold (see
-     * app_tasks.c).  This is the single place that decides "the
-     * operator may transmit"; every other entry point (power_tx_enable,
-     * the EXTI5 handler) goes through ptt_apply_level() which the gate
-     * below also covers. */
+    /* Hard gate: until the ADC power-on silence is over AND the GUI has
+     * painted its first frame, the protection chain is not live yet and
+     * we must not key the amplifier.  g_ptt_ready is set by the ADC/GUI
+     * tasks once both conditions hold (see app_tasks.c).  This is the
+     * single place that decides "the operator may transmit"; every other
+     * entry point (power_tx_enable, the EXTI5 handler) goes through
+     * ptt_apply_level() which the gate below also covers. */
     if (!g_ptt_ready) {
         /* Make sure we are not stuck in a keyed state if the flag was
          * cleared while transmitting (e.g. a protection event). */
@@ -879,7 +975,7 @@ int  power_get_ptt_flag(void)        { return ptt_event_flag; }
 void power_clear_ptt_flag(void)     { ptt_event_flag = -1; }
 
 /*============================================================================
- *  TIM5 relay-delay callback (one-shot 15 ms)
+ *  TIM5 relay-delay callback (one-shot, RELAY_DELAY_MS)
  *============================================================================*/
 
 void power_relay_timer_callback(void)
@@ -1052,14 +1148,17 @@ void power_soft_off(void)
 void power_tx_enable(void)
 {
     /* Same interlocks the PTT EXTI path applies, plus the boot gate:
-     * g_ptt_ready stays false until the ADC zero-offset calibration has
-     * finished and the GUI has painted a frame.
+     * g_ptt_ready stays false until the ADC power-on silence is over
+     * (so the protection chain is live) and the GUI has painted a frame.
      *
-     * NOTE: neither g_psu_on nor g_hv_on is checked here.  Whether the PA has
-     * power is not the firmware's business to second-guess at request time -
-     * the operator (or the PSU itself) may bring the rail up at any moment,
-     * and refusing to key would just be a nuisance.  The two remaining power
-     * related interlocks are kept:
+     * The power-state interlock is NOT repeated here: it lives in
+     * power_relays_tx_on(), the chokepoint every task-side keying request
+     * funnels through, so CAT and the front-panel key are refused in IDLE
+     * by exactly the same rule as the pedal.  g_psu_on is deliberately
+     * still not an interlock - the external PSU's latch is not the
+     * amplifier's rail.
+     *
+     * The two remaining interlocks kept here:
      *   - power_rail_busy() below, because keying into a bias that is still
      *     settling is a real hardware transient, not a policy question;
      *   - g_allow_rf / g_alert_flag, which block for safety reasons. */

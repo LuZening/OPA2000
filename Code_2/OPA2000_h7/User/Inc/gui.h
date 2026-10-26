@@ -99,6 +99,32 @@ void gui_dismiss_alert(void);
  */
 bool gui_is_alert_active(void);
 
+/*============================================================================
+ *  Transient toast
+ *
+ *  A short-lived message that fades in, holds, fades out and deletes
+ *  itself.  The house pattern comes from the LLMC_DAC project's
+ *  show_toast(); see the implementation in gui.c for the v7-specific
+ *  details.
+ *
+ *  THREADING
+ *  LVGL is not thread-safe, but the GUI mutex - not "whatever task is
+ *  running" - is what makes a call safe.  gui_toast_config_saved()
+ *  therefore takes gui_lock() itself and may be called from any task;
+ *  the config save task does exactly that.
+ *  gui_show_toast() is the bare version and REQUIRES the caller to hold
+ *  the lock, so an LVGL callback that is already inside a locked section
+ *  does not deadlock against it.
+ *==========================================================================*/
+
+/** @brief Show \p message in a toast.  CALLER MUST HOLD gui_lock(). */
+void gui_show_toast(const char *message);
+
+/** @brief Show the "config saved" toast.  Takes gui_lock() itself, so
+ *   any task may call it - this is the entry point the config save task
+ *   uses once a flash write has succeeded. */
+void gui_toast_config_saved(void);
+
 /**
  * @brief Get translated string
  * @param str_id String ID

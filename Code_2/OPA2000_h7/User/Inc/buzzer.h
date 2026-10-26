@@ -68,6 +68,13 @@ uint32_t buzzer_test_get_deadline(void);
 void     buzzer_test_set_deadline(uint32_t deadline_ms);
 /*!< Push the deadline one millisecond into the past. */
 void     buzzer_test_expire_deadline(void);
+
+/* The TIM15 timer clock, mirrored from buzzer.c.  Exposed so a test can
+ * assert ARR from the clock rather than from a literal: the note pitch is
+ * clock/frequency, and hardcoding the expected ARR in the test means the
+ * test keeps passing after the clock tree changes - just measuring a
+ * different note than the one the firmware now plays. */
+#define BUZZER_TEST_TIM_CLOCK_HZ   15625000U   /* 250 MHz / 16 */
 #endif
 
 #ifdef __cplusplus

@@ -113,6 +113,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     User/Src/sdcard_storage.c
     User/Src/touch.c
     User/Src/ns2009.c
+    User/Src/overdrive.c
     User/Src/user_adc.c
     User/Src/usb_dma.c
     User/fonts/MyCJK_12.c

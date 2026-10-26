@@ -561,4 +561,4 @@ const test_entry_t g_suite_flash_eeprom[] = {
     TEST_ENTRY(intact_and_decode_never_disagree),
     TEST_ENTRY(four_sectors_hold_far_more_records_than_we_need),
     TEST_SUITE_END,
-};
+};   

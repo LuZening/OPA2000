@@ -10,8 +10,8 @@
  *   back to 0
  *
  * Notes are produced by writing TIM15_ARR to give the desired output
- * frequency (Timer clock = APB1 = 200 MHz / 16 prescaler = 12.5 MHz;
- * ARR = 12.5e6 / freq_hz; 50 % duty via CCR = ARR/2).
+ * frequency (Timer clock = 2 x APB1 = 250 MHz / 16 prescaler =
+ * 15.625 MHz; ARR = 15.625e6 / freq_hz; 50 % duty via CCR = ARR/2).
  *
  * The state machine is fully integer-only (no floating point) and is
  * safe to call from ISR context (TIM7 update IRQ at main prio 1).
@@ -20,11 +20,14 @@
 #include "buzzer.h"
 #include "stm32h7xx_hal.h"
 
-/* TIM15: APB1 timer clock = 200 MHz.  Prescaler chosen to make ARR
- * 16-bit friendly: 200 MHz / 16 = 12.5 MHz.  ARR=12.5e6/freq gives
- * ~5 kHz max, 200 Hz min. */
-#define BUZZER_TIM_PRESCALER    15U       /*!< /16 -> 12.5 MHz */
-#define BUZZER_TIM_CLOCK_HZ     12500000U
+/* TIM15 sits on APB1 with a prescaler, so its clock is 2 x APB1 =
+ * 250 MHz.  PSC 15 -> /16 = 15.625 MHz.  ARR = 15.625e6 / freq gives
+ * ~8 kHz max, 240 Hz min.  15.625 MHz is not an integer, so the note
+ * comes out a fraction of a percent sharp of the nominal BUZZER_*_HZ -
+ * imperceptible for an alarm tone, and using 12.5 MHz instead would
+ * require a prescaler that is not a power of two. */
+#define BUZZER_TIM_PRESCALER    15U       /*!< /16 -> 15.625 MHz */
+#define BUZZER_TIM_CLOCK_HZ     15625000U
 #define BUZZER_DUTY_50PCT(x)    ((x) >> 1)
 
 /* 3-tone warning timing (100 us tick counts).  300 ms = 3000 ticks,
@@ -49,6 +52,10 @@ static volatile uint32_t s_deadline_ms   = 0U;
  * already in flight is a no-op, while a stricter-severity call always
  * takes over.  ALERT_SEV_NONE = idle. */
 static volatile AlertSeverity s_current_sev = ALERT_SEV_NONE;
+/* Note currently programmed into TIM15.  buzzer_set_freq() compares against
+ * this so the 10 kHz state-machine tick does not re-issue a HAL PWM
+ * Start/Stop every 100 us - see the comment on that function. 0 = silence. */
+static volatile uint32_t s_note_hz = 0U;
 
 /*============================================================================
  *  Private helpers
@@ -56,17 +63,42 @@ static volatile AlertSeverity s_current_sev = ALERT_SEV_NONE;
 
 static void buzzer_set_freq(uint32_t freq_hz)
 {
-    if (freq_hz == 0U) {
-        HAL_TIM_PWM_Stop(&htim15, TIM_CHANNEL_2);
+    /* Re-program only when the note actually changes.
+     *
+     * buzzer_tick() runs from the TIM7 ISR every 100 us and used to call
+     * this unconditionally, i.e. 10 000 HAL_TIM_PWM_Start()/Stop() calls a
+     * second.  Each of those takes __HAL_LOCK(htim15).  A protection
+     * interrupt runs at a higher priority than TIM7 and calls
+     * buzzer_start() -> this function, so it can land inside that lock:
+     * HAL then returns HAL_BUSY and the Start is dropped.  The return value
+     * was ignored, so a fault could latch with the PWM never enabled - and
+     * nothing retried, because the note had not changed.  Caching the
+     * programmed note keeps the HAL calls down to one per note change,
+     * which both removes the contention and makes the intent readable. */
+    if (freq_hz == s_note_hz) {
         return;
     }
-    uint32_t arr = BUZZER_TIM_CLOCK_HZ / freq_hz;
-    if (arr == 0U) arr = 1U;
-    if (arr > 0xFFFFU) arr = 0xFFFFU;
-    htim15.Instance->PSC = BUZZER_TIM_PRESCALER;
-    htim15.Instance->ARR = (uint16_t)arr;
-    htim15.Instance->CCR2 = (uint16_t)BUZZER_DUTY_50PCT(arr);
-    HAL_TIM_PWM_Start(&htim15, TIM_CHANNEL_2);
+
+    if (freq_hz == 0U) {
+        HAL_TIM_PWM_Stop(&htim15, TIM_CHANNEL_2);
+    } else {
+        uint32_t arr = BUZZER_TIM_CLOCK_HZ / freq_hz;
+        if (arr == 0U) arr = 1U;
+        if (arr > 0xFFFFU) arr = 0xFFFFU;
+        htim15.Instance->PSC = BUZZER_TIM_PRESCALER;
+        htim15.Instance->ARR = (uint16_t)arr;
+        htim15.Instance->CCR2 = (uint16_t)BUZZER_DUTY_50PCT(arr);
+        HAL_TIM_PWM_Start(&htim15, TIM_CHANNEL_2);
+    }
+
+    /* Cache LAST, after the registers and the HAL call.  A higher-priority
+     * interrupt can call buzzer_start() in the middle of this function; if
+     * the cache were written first, that interleaving would leave the
+     * register holding one note while the cache claimed another - and the
+     * next tick would skip the reprogramming, freezing the wrong note.
+     * Written last, the worst case is a cache that lags the register by one
+     * tick, which the next tick corrects because the two disagree. */
+    s_note_hz = freq_hz;
 }
 
 /*============================================================================
@@ -79,6 +111,10 @@ void buzzer_init(void)
     s_tick_counter = 0U;
     s_deadline_ms  = 0U;
     s_current_sev  = ALERT_SEV_NONE;
+    /* Reset the note cache together with the register: s_note_hz and ARR
+     * must never disagree, or the next buzzer_start() would think the note
+     * is already programmed and never re-enable the channel. */
+    s_note_hz      = 0U;
     htim15.Instance->PSC = BUZZER_TIM_PRESCALER;
     htim15.Instance->ARR = 0U;
     HAL_TIM_PWM_Stop(&htim15, TIM_CHANNEL_2);

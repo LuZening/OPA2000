@@ -11,15 +11,21 @@
  *   - Median of 3 with one outlier -> outlier ignored
  *   - Band mismatch on different band during TX -> ALERT_FREQ_MISMATCH
  *   - Band mismatch on the *same* band during TX -> no alert
- *   - Below 1 MHz / above 60 MHz during TX -> no alert
+ *   - Band mismatch while IDLE -> also alerts (no keying gate); idle
+ *     and correctly on band -> stays quiet, because the valid-frequency
+ *     window and the 3-sample agreement are what reject noise, not the
+ *     keying state
+ *   - Below 1 MHz / above 60 MHz -> no alert
  *   - Quantisation on a band edge: 14.000 MHz sits between 20m/17m and
  *     15m/10m - the guard band keeps the wide classifier on whichever
  *     band the radio is already on, so no alert
  *   - Rejected samples do NOT participate in band-mismatch detection:
  *     a stray ETR pulse that the window discards must not flip the
  *     latch into ALERT_FREQ_MISMATCH
- *   - Latch clears once the carrier drops or the frequency leaves the
- *     valid window
+ *   - Latch clears once the radio returns to the selected band or the
+ *     frequency leaves the valid window - and NOT merely because the
+ *     carrier dropped, since unkeying says nothing about which band
+ *     the radio is on
  *
  * @note    The tests drive TIM1->CNT directly to simulate the ETR
  *          divider feeding the counter; the 100 us TIM7 tick is fired
@@ -47,7 +53,29 @@ extern volatile AlertSeverity comm_stub_last_severity;
 
 /*============================================================================
  *  Helpers
- *============================================================================*/
+ *==========================================================================*/
+
+/*============================================================================
+ *  The sampling window IS the conversion factor
+ *
+ *  One TIM1 count in the sampling window equals F_RF/32 divided by the
+ *  window length.  Everything published downstream - the Hz readout, the
+ *  2 LSB spread tolerance, the 500 kHz band guard - is expressed against
+ *  that one number.  SYSCLK is 250 MHz, so the ARR that yields 100 us is
+ *  1249, not the 999 that a "200 MHz" assumption produces (80 us).
+ *
+ *  With the wrong window the published frequency is low by exactly the
+ *  same factor: at ARR 999 a 14.000 MHz carrier reads 14.0 * 100/125 =
+ *  11.2 MHz, and every band decision is then made on a number that is not
+ *  the frequency.  The cases at the bottom of this file pin the
+ *  relationship so a future clock-tree change cannot silently reintroduce
+ *  it.
+ *==========================================================================*/
+
+/* True once fd_pump_ticks() has run its priming tick.  Reset by
+ * fd_setup(), because freq_detect_start() re-arms s_first_check and the
+ * next pump needs the priming tick again. */
+static bool s_primed = false;
 
 /* Reset freq_detect.c internals and the alert latch.  Mirrors the
  * boot-time sequence the firmware runs. */
@@ -55,11 +83,21 @@ static void fd_setup(void)
 {
     freq_detect_init();
     freq_detect_start();
+    s_primed = false;
 
-    /* Clear any latch left by an earlier test (the same is done by
-     * protection_clear() in the firmware; here we just exercise the
-     * test's own reset path). */
+    /* Clear any latch left by an earlier test.  protection_init(), not
+     * protection_clear(): a dismiss deliberately holds the same cause off
+     * for PROTECTION_REARM_HOLD_MS so the popup really goes away, and this
+     * helper wants a guaranteed-clean slate so the case under test can
+     * raise the very same fault again immediately. */
+    protection_init();
     protection_clear();
+
+    /* The master protection switch defaults to 0 in a zeroed g_config, and
+     * protection_trigger_locked() returns immediately when it is clear -
+     * so the mismatch alert would never be raised.  Arm it, exactly as
+     * config_init() does on the real firmware. */
+    g_config.allow_protection = 1U;
 
     /* The mismatch check requires the radio to be on a band, so seed
      * the operator-side band selection. */
@@ -84,14 +122,63 @@ static void fd_pump_ticks(uint16_t delta, uint32_t n)
 {
     /* Priming tick: drive CNT to a known place so the next ISR call
      * has a delta to compute.  freq_detect_isr() will set s_last_counter
-     * and return without touching the window. */
-    htim1.Instance->CNT = 0U;
-    freq_detect_isr();
+     * and return without touching the window.
+     *
+     * It is needed ONCE, not once per call.  freq_detect_start() resets
+     * s_first_check, so the very first ISR call after it swallows the
+     * sample and just latches the counter.  On every LATER call the
+     * window is already full, and resetting CNT to 0 makes the delta
+     * wrap around to ~65000 - a garbage sample that the window then
+     * rejects, so the counter under test was measuring the harness
+     * instead of the code.  From the second pump on, the counter is
+     * already where the previous pump left it and no priming is
+     * needed. */
+    if (!s_primed) {
+        htim1.Instance->CNT = 0U;
+        freq_detect_isr();
+        s_primed = true;
+    }
 
     for (uint32_t i = 0U; i < n; i++) {
         htim1.Instance->CNT = (uint16_t)(htim1.Instance->CNT + delta);
         freq_detect_isr();
     }
+}
+
+/*============================================================================
+ *  The sampling window IS the conversion factor
+ *
+ *  These pin the relationship between the TIM7 reload value and the
+ *  Hz-per-LSB factor the whole module rests on, so a future clock-tree
+ *  change (or a CubeMX regeneration putting ARR 999 back) cannot silently
+ *  reintroduce a frequency that is low by the window error.
+ *==========================================================================*/
+
+TEST_CASE(the_sampling_window_is_100us)
+{
+    /* TIM7 counts at 250 MHz / (PSC+1); one window is (ARR+1) of those. */
+    uint32_t ticks_per_window = (uint32_t)(FREQDET_TEST_TIM7_PERIOD + 1U)
+                                * (FREQDET_TEST_TIM7_PRESCALER + 1U);
+    uint32_t window_hz = 250000000UL / ticks_per_window;
+    ASSERT_EQ(window_hz, 10000UL);   /* 100 us */
+}
+
+TEST_CASE(one_count_is_ten_kHz_and_the_readout_agrees)
+{
+    fd_setup();
+    /* 1000 counts per 100 us window -> 1000 * 10 kHz = 10 MHz. */
+    fd_pump_ticks(1000U, 3U);
+    ASSERT_EQ(g_radio_freq_hz, 10000000UL);
+    ASSERT_EQ(freq_detect_test_accepted_lsb(), 1000U);
+}
+
+TEST_CASE(the_published_frequency_is_not_low_by_the_window_error)
+{
+    fd_setup();
+    /* 10000 counts -> 100 MHz.  At the old ARR 999 the window was 80 us,
+     * so this same carrier published as 80 MHz. */
+    fd_pump_ticks(10000U, 3U);
+    ASSERT_EQ(g_radio_freq_hz, 100000000UL);
 }
 
 /*============================================================================
@@ -149,6 +236,114 @@ TEST_CASE(window_recovers_when_signal_stabilises_again)
 }
 
 /*============================================================================
+ *  Validity reporting - what freq_detect_is_measurement_valid() answers
+ *
+ *  The distinction these cover is the one a range check cannot make.
+ *  s_measured_freq is only overwritten on a successful window accept, so
+ *  a dead or noisy input keeps returning the last real value forever.  A
+ *  display that trusted the number alone would paint a stale frequency
+ *  green, telling the operator the radio is still on the air.
+ *==========================================================================*/
+
+TEST_CASE(a_healthy_measurement_reports_valid)
+{
+    fd_setup();
+    fd_pump_ticks(140U, 4U);
+    ASSERT_EQ(freq_detect_get_frequency(), 1400000U);
+    ASSERT_TRUE(freq_detect_is_measurement_valid());
+}
+
+TEST_CASE(nothing_measured_yet_is_not_valid)
+{
+    fd_setup();
+    /* No ticks at all: the window is empty and nothing has been accepted. */
+    ASSERT_EQ(freq_detect_get_frequency(), 0U);
+    ASSERT_FALSE(freq_detect_is_measurement_valid());
+}
+
+TEST_CASE(a_single_sample_is_not_enough_to_be_valid)
+{
+    fd_setup();
+    fd_pump_ticks(140U, 1U);          /* one sample, window holds 1 */
+    /* The frequency is published (two agreeing slots is the accept rule),
+     * but the caller has no confirmation the input is stable, so the
+     * reading must not be presented as live. */
+    ASSERT_FALSE(freq_detect_is_measurement_valid());
+}
+
+TEST_CASE(a_dead_input_stops_being_reported_valid)
+{
+    fd_setup();
+    fd_pump_ticks(140U, 5U);
+    ASSERT_TRUE(freq_detect_is_measurement_valid());
+
+    /* Unplug: no edges at all, so every delta is 0.  Three zeros have a
+     * spread of 0, which the window ACCEPTS - so the published value
+     * collapses to 0 and the range check catches it. */
+    fd_pump_ticks(0U, 5U);
+    ASSERT_EQ(freq_detect_get_frequency(), 0U);
+    ASSERT_FALSE(freq_detect_is_measurement_valid());
+}
+
+TEST_CASE(a_noisy_input_keeps_the_last_value_but_stops_being_valid)
+{
+    fd_setup();
+    fd_pump_ticks(140U, 5U);
+    ASSERT_TRUE(freq_detect_is_measurement_valid());
+    ASSERT_EQ(freq_detect_get_frequency(), 1400000U);
+
+    /* Wildly varying deltas: every window has a spread far above 2 LSB,
+     * so nothing is accepted and s_measured_freq holds the old value.
+     * The number still looks perfect - only the reject run exposes that
+     * it is stale. */
+    fd_pump_ticks(300U, 1U);
+    fd_pump_ticks(100U, 1U);
+    fd_pump_ticks(280U, 1U);
+    fd_pump_ticks(90U,  1U);
+    fd_pump_ticks(310U, 1U);
+    fd_pump_ticks(120U, 1U);
+
+    ASSERT_EQ(freq_detect_get_frequency(), 1400000U);   /* unchanged */
+    ASSERT_FALSE(freq_detect_is_measurement_valid());    /* but stale */
+}
+
+TEST_CASE(one_glitch_does_not_invalidate_a_good_measurement)
+{
+    fd_setup();
+    fd_pump_ticks(140U, 5U);
+    ASSERT_TRUE(freq_detect_is_measurement_valid());
+
+    /* A single out-of-band sample is rejected by the window, but ONE
+     * rejection is not enough to call the reading stale - that needs
+     * FREQDET_STALE_REJECTS in a row.  So the display must stay green
+     * through a single glitch, otherwise it would flicker grey on every
+     * relay click. */
+    fd_pump_ticks(400U, 1U);
+    ASSERT_TRUE(freq_detect_is_measurement_valid());
+
+    /* The window still holds the 400, so it takes three good samples to
+     * push it out; until then every tick is rejected.  The reading is
+     * still reported as live throughout, because the reject run has not
+     * reached the staleness threshold. */
+    fd_pump_ticks(140U, 2U);
+    ASSERT_TRUE(freq_detect_is_measurement_valid());
+
+    /* Third good sample: the window is clean again and the accept
+     * resets the reject run. */
+    fd_pump_ticks(140U, 1U);
+    ASSERT_TRUE(freq_detect_is_measurement_valid());
+}
+
+TEST_CASE(an_out_of_band_signal_is_never_valid)
+{
+    fd_setup();
+    /* 700 kHz - consistent, accepted, but far below the 1 MHz floor. */
+    fd_pump_ticks(70U, 5U);
+    ASSERT_EQ(freq_detect_get_frequency(), 700000U);
+    ASSERT_FALSE(freq_detect_is_measurement_valid());
+}
+
+/*============================================================================
  *  Band-mismatch tests
  *============================================================================*/
 
@@ -195,15 +390,6 @@ TEST_CASE(mismatch_does_not_alert_above_60_mhz)
     g_tx_active = true;
     /* 70 MHz: above the 60 MHz ceiling. */
     fd_pump_ticks(7000U, 3U);
-    ASSERT_NE(g_alert_active, ALERT_FREQ_MISMATCH);
-}
-
-TEST_CASE(mismatch_does_not_alert_when_not_transmitting)
-{
-    fd_setup();
-    /* Without TX, even a wildly off-band signal must not alert. */
-    g_tx_active = false;
-    fd_pump_ticks(700U, 3U);          /* 7 MHz vs. operator-set 20m */
     ASSERT_NE(g_alert_active, ALERT_FREQ_MISMATCH);
 }
 
@@ -350,27 +536,79 @@ TEST_CASE(quantisation_at_exact_band_edge_does_not_bounce)
  *  Latch-clearing tests
  *==========================================================================*/
 
-TEST_CASE(latch_clears_when_carrier_drops)
+TEST_CASE(latch_clears_when_the_radio_returns_to_the_right_band)
 {
     fd_setup();
     g_current_band = BAND_20M_17M;
     g_tx_active    = true;
-    fd_pump_ticks(1400U, 3U);          /* 14 MHz, same band */
-    /* Cross to a different band while keyed. */
-    fd_pump_ticks(7000U, 3U);          /* 70 MHz: above 60 MHz, so no
-                                          alert yet - we need a real
-                                          wrong-band signal. */
-    fd_pump_ticks(700U, 3U);           /* 7 MHz */
+    fd_pump_ticks(700U, 3U);           /* 7 MHz -> wrong band */
     ASSERT_EQ(g_alert_active, ALERT_FREQ_MISMATCH);
 
-    /* Drop the carrier: the next call to freq_detect_check() should
-     * release the latch. */
-    g_tx_active = false;
+    /* Move the radio back onto the selected band.  The latch has to
+     * release on that alone - the keying state is no longer part of
+     * the condition in either direction, because it is not what set
+     * the latch any more. */
+    fd_pump_ticks(1400U, 3U);          /* 14 MHz = 20m/17m, correct */
     freq_detect_check();
-    /* Push another wrong-band sample to prove the latch re-arms. */
-    g_tx_active = true;
+
+    /* Now the radio drifts back to the wrong band: the detector must
+     * be armed again and fire a second time.  Step past the post-dismiss
+     * hold-off first - a dismiss deliberately keeps THIS cause quiet for
+     * PROTECTION_REARM_HOLD_MS so the popup really goes away. */
+    protection_clear();
+    test_wall_clock_advance(1000U);
     fd_pump_ticks(700U, 3U);           /* 7 MHz = 40m/30m vs. 20m/17m */
     ASSERT_EQ(g_alert_active, ALERT_FREQ_MISMATCH);
+}
+
+TEST_CASE(latch_does_not_clear_merely_because_the_carrier_dropped)
+{
+    fd_setup();
+    g_current_band = BAND_20M_17M;
+    g_tx_active    = true;
+    fd_pump_ticks(700U, 3U);           /* 7 MHz -> wrong band */
+    ASSERT_EQ(g_alert_active, ALERT_FREQ_MISMATCH);
+
+    /* Unkeying is not evidence that the radio is on the right band -
+     * the reading simply stops being updated.  Releasing on that would
+     * let a unit that is still on the wrong band re-arm itself every
+     * time the operator lets go of the PTT. */
+    g_tx_active = false;
+    freq_detect_check();
+
+    /* The mismatch is still standing, so a fresh wrong-band sample
+     * must NOT be able to fire a second alert (the latch held). */
+    g_tx_active = true;
+    fd_pump_ticks(700U, 3U);
+    ASSERT_EQ(g_alert_active, ALERT_FREQ_MISMATCH);
+    /* And the latch is still what suppresses the second alert: only
+     * one alert event has ever been published for one dismissal. */
+}
+
+TEST_CASE(mismatch_alerts_while_idle_too)
+{
+    fd_setup();
+    g_current_band = BAND_20M_17M;
+    g_tx_active    = false;            /* idle: and it must not matter */
+
+    fd_pump_ticks(700U, 3U);           /* 7 MHz, a real ham-band carrier */
+
+    ASSERT_EQ(g_alert_active, ALERT_FREQ_MISMATCH);
+}
+
+TEST_CASE(mismatch_stays_quiet_when_idle_on_the_right_band)
+{
+    fd_setup();
+    g_current_band = BAND_20M_17M;
+    g_tx_active    = false;
+
+    /* Idle but correctly on band - the common case, and it must stay
+     * silent.  This is what keeps the unconditional check harmless:
+     * the valid-frequency window plus the 3-sample agreement are what
+     * distinguish a real carrier from noise, not the keying state. */
+    fd_pump_ticks(1400U, 5U);          /* 14 MHz */
+
+    ASSERT_NE(g_alert_active, ALERT_FREQ_MISMATCH);
 }
 
 TEST_CASE(latch_clears_when_freq_leaves_valid_window)
@@ -394,18 +632,30 @@ TEST_CASE(latch_clears_when_freq_leaves_valid_window)
  *============================================================================*/
 
 const test_entry_t g_suite_freq_detect[] = {
+    TEST_ENTRY(the_sampling_window_is_100us),
+    TEST_ENTRY(one_count_is_ten_kHz_and_the_readout_agrees),
+    TEST_ENTRY(the_published_frequency_is_not_low_by_the_window_error),
     TEST_ENTRY(window_publishes_after_two_agreeing_samples),
     TEST_ENTRY(window_rejects_when_spread_exceeds_2_lsb),
     TEST_ENTRY(window_recovers_when_signal_stabilises_again),
+    TEST_ENTRY(a_healthy_measurement_reports_valid),
+    TEST_ENTRY(nothing_measured_yet_is_not_valid),
+    TEST_ENTRY(a_single_sample_is_not_enough_to_be_valid),
+    TEST_ENTRY(a_dead_input_stops_being_reported_valid),
+    TEST_ENTRY(a_noisy_input_keeps_the_last_value_but_stops_being_valid),
+    TEST_ENTRY(one_glitch_does_not_invalidate_a_good_measurement),
+    TEST_ENTRY(an_out_of_band_signal_is_never_valid),
     TEST_ENTRY(mismatch_alerts_when_band_differs_during_tx),
     TEST_ENTRY(mismatch_does_not_alert_on_same_band),
     TEST_ENTRY(mismatch_does_not_alert_below_1_mhz),
     TEST_ENTRY(mismatch_does_not_alert_above_60_mhz),
-    TEST_ENTRY(mismatch_does_not_alert_when_not_transmitting),
     TEST_ENTRY(reject_does_not_trigger_band_mismatch_check),
     TEST_ENTRY(quantisation_near_band_edge_does_not_trigger_mismatch),
     TEST_ENTRY(quantisation_at_exact_band_edge_does_not_bounce),
-    TEST_ENTRY(latch_clears_when_carrier_drops),
+    TEST_ENTRY(latch_clears_when_the_radio_returns_to_the_right_band),
+    TEST_ENTRY(latch_does_not_clear_merely_because_the_carrier_dropped),
+    TEST_ENTRY(mismatch_alerts_while_idle_too),
+    TEST_ENTRY(mismatch_stays_quiet_when_idle_on_the_right_band),
     TEST_ENTRY(latch_clears_when_freq_leaves_valid_window),
     TEST_SUITE_END,
 };

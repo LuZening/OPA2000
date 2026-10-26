@@ -154,11 +154,26 @@ extern const test_entry_t g_suite_radio_band[];
 extern const test_entry_t g_suite_freq_detect[];
 extern const test_entry_t g_suite_cmsis_os_shim[];
 extern const test_entry_t g_suite_config_mutex[];
+extern const test_entry_t g_suite_config_deferred_save[];
 extern const test_entry_t g_suite_boot[];
 extern const test_entry_t g_suite_flash_eeprom[];
 extern const test_entry_t g_suite_config_layout[];
 extern const test_entry_t g_suite_fan_tach[];
 
+/* The USE_AWD switch is a COMPILE-TIME one, so the behaviour it produces
+ * only exists in a build configured differently from the default.  The
+ * host_tests_noawd target compiles this same harness with
+ * OPA2000_NO_AWD and links only the sources that make sense in that
+ * configuration, so it gets its own suite table instead of the full one
+ * - the other suites test code that does not depend on the switch and
+ * would simply duplicate the default binary's results. */
+#ifdef OPA2000_NO_AWD
+extern const test_entry_t g_suite_awd_switch[];
+
+static const test_entry_t *const s_suites[] = {
+    g_suite_awd_switch,
+};
+#else
 static const test_entry_t *const s_suites[] = {
     g_suite_opa2000,
     g_suite_user_adc,
@@ -169,11 +184,13 @@ static const test_entry_t *const s_suites[] = {
     g_suite_freq_detect,
     g_suite_cmsis_os_shim,
     g_suite_config_mutex,
+    g_suite_config_deferred_save,
     g_suite_boot,
     g_suite_flash_eeprom,
     g_suite_config_layout,
     g_suite_fan_tach,
 };
+#endif
 
 #define SUITE_COUNT (sizeof s_suites / sizeof s_suites[0])
 

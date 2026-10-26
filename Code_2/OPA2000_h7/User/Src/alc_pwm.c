@@ -8,10 +8,11 @@
  *
  * Combined output:
  *   - PWM frequency f_out = f_TCLK / (ARR + 1)
- *     where f_TCLK = APB1 timer clock = 200 MHz (after CubeMX)
+ *     where f_TCLK = APB1 timer clock = 250 MHz (SYSCLK 250 MHz, APB1
+ *     125 MHz, prescaler != 1 so the timers see 2 x APB1)
  *   - Duty cycle = (CCR2 - CCR1) / (ARR + 1)
  *
- * For ~200 kHz: ARR = 200 MHz / 200 kHz - 1 = 999
+ * For ~200 kHz: ARR = 250 MHz / 200 kHz - 1 = 1249
  *
  * GPIOG base address on STM32H7B0: GPIOA=0x58020000, port stride 0x400.
  *   GPIOA + 6 * 0x400 = 0x58020000 + 0x1800 = 0x58021800 -> GPIOG base
@@ -54,12 +55,12 @@ void alc_pwm_init(void)
     alc_bsrr_set   = 0x00000001U;   /*!< PG0 = HIGH */
     alc_bsrr_reset = 0x00010000U;   /*!< PG0 = LOW  */
 
-    /* TIM2 clock = 200 MHz.  Prescaler = 0 -> counter runs at 200 MHz.
-     * Default ARR = 999 -> 200 kHz PWM. */
+    /* TIM2 clock = 250 MHz.  Prescaler = 0 -> counter runs at 250 MHz.
+     * ARR 1249 -> 1250 ticks -> 200 kHz PWM. */
     htim2.Instance->PSC = 0U;
-    htim2.Instance->ARR = 999U;
+    htim2.Instance->ARR = 1249U;
     htim2.Instance->CCR1 = 0U;       /*!< rising edge */
-    htim2.Instance->CCR2 = 500U;     /*!< falling edge -> 50% duty start */
+    htim2.Instance->CCR2 = 625U;     /*!< falling edge -> 50% duty start */
 }
 
 void alc_pwm_start(void)

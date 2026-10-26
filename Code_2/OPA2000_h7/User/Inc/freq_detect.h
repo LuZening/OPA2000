@@ -53,11 +53,29 @@ void freq_detect_check(void);
 /* Latest measured frequency in Hz.  May be 0 if no signal. */
 uint32_t freq_detect_get_frequency(void);
 
+/* Whether that frequency is a live measurement right now, as opposed to a
+ * value the counter is still holding from before the input went quiet or
+ * noisy.  Checks the ham-band range AND that the sliding window has not
+ * been rejecting for a while AND that enough samples have arrived since
+ * start().  A plain range test is not enough: s_measured_freq is only
+ * overwritten on a successful accept, so a dead input keeps reporting the
+ * last real value indefinitely.  Callers displaying the number should use
+ * this and show it as stale rather than live. */
+bool freq_detect_is_measurement_valid(void);
+
 #ifdef HOST_TEST_NATIVE
 /* Test hooks for the sliding window.  idx in 0..2. */
 uint16_t freq_detect_test_window(uint8_t idx);
 uint8_t  freq_detect_test_window_fill(void);
 uint16_t freq_detect_test_accepted_lsb(void);
+
+/* The sampling window the frequency conversion rests on, mirrored from
+ * freq_detect.c.  Exposed so a test can assert the relationship between
+ * the window and the Hz-per-LSB factor instead of taking it on trust -
+ * getting this wrong makes every published frequency low by the same
+ * ratio, with nothing else to notice it. */
+#define FREQDET_TEST_TIM7_PRESCALER    19U
+#define FREQDET_TEST_TIM7_PERIOD       1249U   /* 1250 ticks = 100 us */
 #endif
 
 #ifdef __cplusplus

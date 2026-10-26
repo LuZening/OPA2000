@@ -78,6 +78,7 @@ add_executable(host_tests
     ${USER_SRC}/power_control.c
     ${USER_SRC}/protection.c
     ${USER_SRC}/buzzer.c
+    ${USER_SRC}/overdrive.c
     ${USER_SRC}/fan_tach.c
     ${USER_SRC}/radio_band.c
     ${USER_SRC}/freq_detect.c
@@ -103,7 +104,9 @@ add_executable(host_tests
     ${CMAKE_CURRENT_SOURCE_DIR}/test_flash_eeprom.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_cmsis_os_shim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_config_mutex.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_config_deferred_save.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_boot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_overdrive.c
 
     # Windows-backed CMSIS-RTOS2 mutex shim (host test only; firmware
     # uses the real FreeRTOS implementation in Middlewares/...).
@@ -140,7 +143,35 @@ if(MSVC)
 endif()
 
 # -----------------------------------------------------------------------------
+# Second binary: the same tree built with the ADC analog watchdogs OUT
+#
+# The USE_AWD switch (User/Inc/opa2000.h) is a compile-time one, so the
+# behaviour it produces only exists in a build configured differently from
+# the default.  This target is that build: OPA2000_NO_AWD removes USE_AWD,
+# and the ADC watchdog setters then park every threshold at full scale.
+#
+# It links only the sources the awd_switch suite needs.  The other suites
+# test code that does not depend on the switch, and running them here too
+# would only duplicate the default binary's results.
+# -----------------------------------------------------------------------------
+add_executable(host_tests_noawd
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_harness.c
+    ${STUB_DIR}/stm32h7xx_hal_stub.c
+
+    ${USER_SRC}/opa2000.c
+    ${USER_SRC}/adc_calibration.c
+
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_awd_switch.c
+)
+target_compile_definitions(host_tests_noawd PRIVATE OPA2000_NO_AWD)
+if(MSVC)
+    target_link_libraries(host_tests_noawd PRIVATE kernel32)
+    target_compile_definitions(host_tests_noawd PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# -----------------------------------------------------------------------------
 # CTest registration
 # -----------------------------------------------------------------------------
 enable_testing()
 add_test(NAME host_tests COMMAND host_tests)
+add_test(NAME host_tests_noawd COMMAND host_tests_noawd)

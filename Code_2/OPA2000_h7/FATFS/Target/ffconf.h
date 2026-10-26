@@ -27,6 +27,24 @@
 #include "bsp_driver_sd.h"
 #include "cmsis_os.h" /* _FS_REENTRANT set to 1 and CMSIS API chosen */
 
+/* FreeRTOS prototypes for the ff_malloc / ff_free macros below.
+ *
+ * ff_malloc / ff_free are defined further down this file as pvPortMalloc /
+ * vPortFree, so the FreeRTOS declarations have to be visible BEFORE those
+ * macros are used.  cmsis_os.h is not enough: it resolves to the generic
+ * Drivers/CMSIS/RTOS2/Include/cmsis_os2.h, which does NOT include
+ * FreeRTOS.h - so without this the macros expand to undeclared functions
+ * and option/syscall.c fails to compile.
+ *
+ * It belongs HERE rather than in ff.h: ff.h is a CubeMX-managed library
+ * file with no USER CODE section, so a change there is lost the next time
+ * the project is regenerated.  This file lives in the user tree and the
+ * include sits inside the "Additional user header" block, which is the
+ * include point FatFs' own configuration comment asks for ("A header file
+ * for O/S definitions needs to be included somewhere in the scope of
+ * ff.h"). */
+#include "FreeRTOS.h"
+
 /*-----------------------------------------------------------------------------/
 / Function Configurations
 /-----------------------------------------------------------------------------*/

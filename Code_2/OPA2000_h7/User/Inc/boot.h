@@ -28,8 +28,8 @@
  *  cannot be crossed.
  *
  *  The operator's REAL limits are pushed much later - from the ADC task's
- *  adc_stabilisation_tick(), after a 1 s settling window plus a successful
- *  IM zero-offset calibration.  See user_adc.c.
+ *  adc_stabilisation_tick(), once the 100 ms power-on silence is over and
+ *  the DMA is running. See user_adc.c.
  */
 #ifndef BOOT_H
 #define BOOT_H
@@ -55,11 +55,11 @@ extern "C" {
  *  comparator referenced to the rail cannot trip, so nothing latches while
  *  the rail charges and the detector outputs settle.
  *
- *  The real limits replace these in boot_apply_thresholds(), which the ADC
- *  task calls once the IM zero-offset calibration has passed - see
- *  app_adc_task() and adc_stabilisation_tick().
+ * The real limits replace these in boot_apply_thresholds(), which the ADC
+ * task calls once the power-on silence is over - see app_adc_task() and
+ * adc_stabilisation_tick().
  *
- *  Idempotent; safe to call more than once.
+ * Idempotent; safe to call more than once.
  */
 void boot_hold_thresholds_open(void);
 
@@ -104,12 +104,15 @@ void boot_apply_thresholds(int band);
 /**
  * @brief Close the settling gate and push the real limits in one step.
  *
- *  Called exactly once, by adc_stabilisation_tick() on the tick where the
- *  IM zero-offset calibration passes.  From here on boot_apply_thresholds()
- *  behaves normally, so later band changes and Settings edits take effect
- *  immediately again.
+ *  Called once, by adc_stabilisation_tick() on the tick where the
+ *  power-on silence ends and the DMA starts running.  From here on
+ *  boot_apply_thresholds() behaves normally, so later band changes and
+ *  Settings edits take effect immediately again.  It is called a second
+ *  time when the IM zero-offset calibration produces a measured offset,
+ *  because AWD2's trip point is the zero offset plus the current limit
+ *  and therefore has to be re-fitted to the measured zero.
  *
- *  @param band  the current band, as for boot_apply_thresholds().
+ * @param band  the current band, as for boot_apply_thresholds().
  */
 void boot_arm_thresholds(int band);
 

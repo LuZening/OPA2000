@@ -36,12 +36,26 @@ extern "C" {
 
 /*============================================================================
  *  PTT state machine - written from EXTI5 ISR, read from task
- *============================================================================*/
+ *
+ *  Normal path today:
+ *      IDLE -> TX_STARTING -> TX_RUNNING -> TX_STOPPING -> IDLE
+ *
+ *  PTT_STATE_START_CHECK_OK / _FAILED are reserved for the start-up
+ *  self-check that runs between closing RELAY1 and declaring the amp
+ *  live (verify the PA actually starts oscillating before telling the
+ *  radio it is keyed).  They are declared but NOT YET REACHED: no code
+ *  assigns them, so the machine still steps straight from TX_STARTING
+ *  to TX_RUNNING.  When the check lands it slots in between those two,
+ *  and every guard that currently tests `state == TX_STARTING` as a
+ *  proxy for "keying in progress" will need to widen to include them.
+ *==========================================================================*/
 typedef enum {
     PTT_STATE_IDLE = 0,
-    PTT_STATE_TX_STARTING,    /* RELAY2 closed, waiting to close RELAY1 */
-    PTT_STATE_TX_RUNNING,     /* both RELAY1+2 closed, transmitting */
-    PTT_STATE_TX_STOPPING,    /* RELAY1 open, waiting to open RELAY2 */
+    PTT_STATE_TX_STARTING,        /* RELAY2 closed, waiting to close RELAY1 */
+    PTT_STATE_START_CHECK_OK,     /*!< 起振自检通过 - 跳转暂未实现 */
+    PTT_STATE_START_CHECK_FAILED, /*!< 起振自检失败 - 跳转暂未实现 */
+    PTT_STATE_TX_RUNNING,         /* both RELAY1+2 closed, transmitting */
+    PTT_STATE_TX_STOPPING,        /* RELAY1 open, waiting to open RELAY2 */
 } PTTStateType;
 
 extern volatile PTTStateType ptt_state;
@@ -106,6 +120,20 @@ bool power_fan_ntc_fault(void);
  *  【RELAY1 + RELAY2】  射频通路
  *      power_relays_tx_on() / _off()           只管继电器，不碰任何电源
  *
+ *      两个继电器**从不同时切换**，中间有 RELAY_DELAY_MS = 10 ms 的
+ *      死区（TIM5 单次定时器，5 MHz / 50 tick 每毫秒）。顺序是相反的：
+ *
+ *          合上： RELAY2(PG3) → [10ms] → RELAY1(PG4)
+ *          断开： RELAY1(PG4) → [10ms] → RELAY2(PG3)
+ *
+ *      即：合上时先接 PA→LPF（RELAY2）再给主电源（RELAY1），断开时先断
+ *      主电源（RELAY1）再断 PA→LPF（RELAY2）。这个不对称是必须的：合上
+ *      时如果主电源先到而射频通路还没接好，PA 会在一个开路的天线上起振；
+ *      断开时如果射频通路先断，PA 还在发射却被突然卸载。
+ *
+ *      紧急释放（ptt_force_release，保护跳闸或未就绪时用）**不等这个延时**，
+ *      两个继电器同时断开 —— 那时再讲顺序没有意义，先把射频掐掉。
+ *
  *  三条轨**互不联动**：高压按钮不会断开继电器，也不会动主电源；继电器动作
  *  不会碰高压。这样"断开高压"和"断开射频"才能独立控制。
  *
@@ -129,8 +157,11 @@ bool power_fan_ntc_fault(void);
  *                 是否已到终态）
  *      g_tx_active 继电器已吸合
  *
- *  注意：发射请求**不**检查前两个标志，见 power_tx_enable() 的说明。
- *  这三个标志只用于状态显示与诊断。
+ *  注意：**IDLE（g_power_state == POWER_STATE_OFF，即高压轨未投入）下拒绝
+ *  一切发射请求**——踏板、前面板按键、CAT 串口全部一样。拒绝点有两处，
+ *  因为两条路径不共用：power_relays_tx_on()（任务侧）与 ptt_apply_level()
+ *  （PTT_INX 边沿与轮询）。g_psu_on 不是联锁：外部 PSU 的锁存不等于本机
+ *  高压轨。这三个标志其余用途只是状态显示与诊断。
  *=======================================================================*/
 
 /*! 强制所有输出到关机/默认态，并取消任何在途的高压时序。
@@ -308,7 +339,7 @@ void power_hv_disable(void);
  *==========================================================================*/
 
 /*! 请求发射。满足全部条件才会吸合继电器，否则**静默拒绝**：
- *      - g_ptt_ready  （IM 零点校准完成 且 GUI 已出帧）
+ *      - g_ptt_ready  （ADC 静默期已过、保护链已生效 且 GUI 已出帧）
  *      - g_allow_rf   （未因故障被封锁）
  *      - !g_alert_flag（无保护告警锁存）
  *      - !power_rail_busy()  （偏置已稳定，不在上下电时序中途）
@@ -329,6 +360,18 @@ void power_tx_enable(void);
  *  加"是否允许停机"的判断。
  */
 void power_tx_disable(void);
+
+/*! 保护链专用的紧急释放（ISR 安全）。
+ *
+ *  与 power_tx_disable() 的区别：**无论 ptt_state 当前是什么，都会发布新的
+ *  g_power_state**。故障可能落在状态机已经是 IDLE 的时刻，而 g_power_state
+ *  只由 ptt_leave_tx() 写；只改 ptt_state 会让顶部横幅一直停在
+ *  "Transmit"，而功放其实已经断了。protection_trigger_locked() 的 P0 分支
+ *  调用这里，而不是自己去写 ptt_state。
+ *
+ *  只做 GPIO 写、寄存器写和 volatile 赋值，可以在最高优先级中断里调用。
+ */
+void power_ptt_force_release_isr(void);
 
 /* Live level of PTT_INX, for task-side polling when an EXTI edge may have
  * been missed.  True means "transmit requested" (pin low, active low). */

@@ -13,6 +13,7 @@
  * so it is safe in the simulator build too. */
 #include "protection.h"
 #ifndef LVGL_SIM
+#include "adc_calibration.h"
 #include "comm.h"
 #include "config.h"
 #include "radio_band.h"
@@ -21,6 +22,8 @@
 #include "boot.h"
 #include "user_adc.h"
 #include "fan_tach.h"
+#include "freq_detect.h"
+#include "overdrive.h"
 #endif
 #include "string.h"
 #include "stdio.h"
@@ -186,12 +189,19 @@ static void gui_label_cache_invalidate(void)
  *                   field.  Lives only for the duration of the session.
  *    config's flag  raised when the session ends.
  *
- *  Why it matters: the flash write is deferred to app_config_task() one
- *  second later, and the main menu can be closed and reopened inside that
- *  window.  Writing on every edit would mean a power cut mid-session
- *  restores a half-applied set of thresholds.  Staging until the menu
- *  closes makes the save land on a boundary the operator actually perceives
- *  as "I finished editing".
+ *  Why it matters: the flash write is deferred to app_config_task(), and the
+ *  settings menu can be closed and reopened inside that window.  Writing on
+ *  every edit would mean a power cut mid-session restores a half-applied set
+ *  of thresholds.  Staging until the session ends makes the save land on a
+ *  boundary the operator actually perceives as "I finished editing".
+ *
+ *  ONE WRITE PER SESSION, NOT ONE PER EDIT
+ *  Every sub-page callback that changes a field calls gui_menu_mark_dirty(),
+ *  which only raises a flag - it never writes.  The single commit at the end
+ *  of the session turns the whole batch into ONE config_mark_dirty(), and
+ *  app_config_task() then performs ONE flash write.  So five sliders dragged
+ *  in one visit to the Settings menu produce one record in the flash ring,
+ *  not five.
  *
  *  Declared up here because the calibration screens that call
  *  gui_menu_mark_dirty() are textually above the menu code.
@@ -199,13 +209,25 @@ static void gui_label_cache_invalidate(void)
 
 static bool s_menu_dirty = false;
 
-/** @brief Record an in-menu edit. Takes effect when the menu closes. */
+/** @brief Record an in-menu edit. Takes effect when the session ends. */
 static void gui_menu_mark_dirty(void)
 {
     s_menu_dirty = true;
 }
 
-/** @brief Publish a staged session to the deferred-save machinery. */
+/** @brief Publish a staged session to the deferred-save machinery.
+ *
+ *  config_mark_dirty() does two things: it sets the config module's dirty
+ *  flag and wakes app_config_task(), which performs the actual flash write
+ *  at the lowest priority in the system.  The write must not happen here -
+ *  programming flash stalls instruction fetch, and an LVGL callback is the
+ *  worst possible place to stall.
+ *
+ *  Called from every path that ends the editing session: the menu's own
+ *  button handler (which also covers Cancel), gui_toggle_menu() (the
+ *  panel's Settings button closing an open menu), and the sub-pages' own
+ *  Save buttons (a sub-page is a session of its own - see
+ *  gui_menu_session_ended()). */
 static void gui_menu_commit_dirty(void)
 {
     if (!s_menu_dirty) {
@@ -330,8 +352,15 @@ void gui_unlock(void)
 #define MID_ROW_H   44
 #define INFO_H      (VER_RES - STATUS_H - BANNER_H - FWD_PWR_H - MID_ROW_H - 3 * GAP_Y)
 
-/* Progress bar ranges */
-#define BAR_MAX_FWD    1000
+/* Progress bar ranges.
+ *
+ * BAR_MAX_FWD is 1200 W, not the ADC's 1579 W full scale: the bar is a
+ * headroom indicator rather than a precision instrument, and running it
+ * to full scale would pin every normal transmission into the top few
+ * percent where the aqua->orange gradient tells the operator nothing.
+ * 1200 W is also a whole number of watts, which keeps the scale below an
+ * exact integer division - the numerator is milliwatts. */
+#define BAR_MAX_FWD    1200
 #define BAR_MAX_REF    300
 #define BAR_MAX_SWR    1000
 
@@ -387,7 +416,7 @@ enum {
     STR_FORWARD,        /* FWD 发射功率 */
     STR_REFLECTED,      /* REV 反射功率 */
     STR_PROTOCOL,       /* 电台协议 */
-    STR_NO_SIGNAL,      /* 未连接 */
+    STR_NO_SIGNAL,      /* 未连接 - 现已不再显示，见 gui_update_protocol_label() */
     STR_LINKED,         /* 已连接 */
     STR_BAND_LABEL,     /* 波段 */
     STR_TEMP_UNIT,      /* 温度单位 */
@@ -403,12 +432,15 @@ enum {
     STR_NTC_OVERHEAT,   /* 核心温度过高 */
     STR_VBIAS_FAULT,    /* PA 偏置异常 */
     STR_FAN_FAULT,      /* 风扇异常 (占位，未接线) */
+    STR_PROT_ON,        /* 保护: 开 */
+    STR_PROT_OFF,       /* 保护: 关 */
+    STR_CONFIG_SAVED,   /* 配置已保存 */
 };
 
 /* Number of entries in gui_strings[][].  STR_COUNT must stay last - it
  * anchors to the enum's final value, so adding a string above it is
  * enough to grow the table with no second edit here. */
-#define STR_COUNT (STR_FAN_FAULT + 1)
+#define STR_COUNT (STR_CONFIG_SAVED + 1)
 
 /* Multi-language strings.  Row 0 = Chinese, row 1 = English.
  * Index order must match the enum above. */
@@ -428,6 +460,8 @@ static const char* gui_strings[2][STR_COUNT] = {
         "关机", "确认关机？", "保存中…",
         "核心温度过高", "PA 偏置异常",
         "风扇异常",
+        "保护: 开", "保护: 关",
+        "配置已保存",
     },
     /* English */
     {
@@ -444,6 +478,8 @@ static const char* gui_strings[2][STR_COUNT] = {
         "Poweroff", "Power off now?", "Saving...",
         "Core Overheat", "PA Bias Fault",
         "Fan Fault",
+        "Protection: ON", "Protection: OFF",
+        "Config Saved",
     }
 };
 
@@ -452,6 +488,9 @@ static const char* gui_strings[2][STR_COUNT] = {
 #define COLOR_BORDER     LV_COLOR_MAKE(55, 58, 60)
 #define COLOR_BAR_BG     LV_COLOR_MAKE(0x30, 0x30, 0x30)
 #define COLOR_BAR_BAD    LV_COLOR_RED
+/*!< Normal (not overdriven) colour of the overdrive indicator LED.  Its
+ *   brightness carries the level; red is reserved for an actual overdrive. */
+#define COLOR_LED_OK     LV_COLOR_MAKE(0x2e, 0xd5, 0x3a)
 
 static LanguageType current_language = MULTILANG_ENGLISH;
 
@@ -478,6 +517,12 @@ static lv_obj_t *lbl_tx_title;
 static lv_obj_t *lbl_ref_title;
 static lv_obj_t *lbl_swr_title;
 
+/* Overdrive indicator - the virtual LED between the TX-power title and the
+ * numeric power value.  Driven by overdrive.c (200 ms peak of INP4). */
+static lv_obj_t *led_overdrive;
+static bool s_led_overdrive_red = false;
+static bool s_led_overdrive_lit = false;
+
 /* Bottom status bar labels */
 static lv_obj_t *lbl_voltage;
 static lv_obj_t *lbl_voltage_cap;
@@ -498,12 +543,58 @@ static uint8_t current_screen = 0;
 static bool alert_active = false;
 static bool calibrating = false;
 
+/*============================================================================
+ *  The "config saved" toast
+ *
+ *  A transient label that appears when the config save task reports a
+ *  successful flash write, and removes itself a moment later.
+ *
+ *  Style and timing follow the LLMC_DAC project's show_toast(), which is
+ *  the house pattern for this firmware family: fade in, hold, fade out,
+ *  delete.  The mechanics differ because this LVGL is v7 - see the notes
+ *  on the animation callbacks below.
+ *
+ *  WHY IT MATTERS AT ALL
+ *  The save is asynchronous by design: the operator taps Save, the menu
+ *  closes, and the flash write happens a few milliseconds later at the
+ *  lowest priority.  Without a confirmation the screen just sits there,
+ *  and "did it save?" is a question the operator can only answer by
+ *  power-cycling the unit and checking.  On a settings change that decides
+ *  whether the amplifier protects itself, that is not a reasonable answer.
+ *
+ *  WHO OWNS IT
+ *  app_config_task() calls gui_show_toast() directly, holding gui_lock().
+ *  That is the same contract gui.h already sets out: the GUI mutex, not
+ *  "whatever task happens to be running", is what makes an LVGL call safe.
+ *  The mutex is released as soon as the widget exists, so the rest of the
+ *  GUI is blocked only for the microseconds it takes to create a label -
+ *  not for the three seconds it stays on screen.
+ *==========================================================================*/
+
+/*!< The toast container, or NULL when it is not showing. */
+static lv_obj_t *toast_obj = NULL;
+
+/*!< Fade in / out duration, matching LLMC_DAC. */
+#define TOAST_ANIM_MS   500U
+
+/*!< How long the toast is fully visible before it starts to fade.
+ *   Same as LLMC_DAC's 3 s: long enough for an operator who was looking
+ *   away from the screen to catch it on the way back. */
+#define TOAST_HOLD_MS   3000U
+
 /* Temperature unit selectable from the language menu:
  * false = Celsius (\u00B0C), true = Fahrenheit (\u00B0F) */
 static bool temp_fahrenheit = false;
 
 /* Band / radio-link line in the info area */
 static lv_obj_t *lbl_protocol;
+
+/*!< TIM1 ETR 实测频率行，紧跟 lbl_protocol 下方 */
+static lv_obj_t *lbl_freq_det;
+
+/*!< freq_det 上一次有效读数（Hz）。当前测量无效时继续显示它而不是归零，
+ *  否则操作员在松手/停机的瞬间会看到频率跳成 0.0MHz，以为计数器坏了。 */
+static uint32_t s_freq_det_last_valid = 0U;
 
 /* Calibration state */
 #define CAL_POINT_COUNT 5
@@ -526,11 +617,36 @@ static uint32_t s_cal_restart_tick = 0U;  /*!< 失败画面开始展示的时刻
 
 /* Top-of-screen debug line.  On firmware build this shows the detected
  * touch driver + key boot-time flags; on the PC simulator it shows the
- * touch type the SIM was built with.  The line is tiny (Montserrat 12
- * px) and sits above the status banner so it does not eat any main-
- * screen real estate.  Controlled by gui.c internal -DDEBUG_OVERLAY
- * in CMake, default ON. */
+ * touch type the SIM was built with.
+ *
+ * COMPILE-TIME ONLY: the whole overlay - both labels, the per-source
+ * protection history and the refresh in gui_update_display() - exists
+ * only in a build that defines DEBUG.  Nothing defines it by default, so
+ * a release image carries none of it: no widgets, no strings, no 500 ms
+ * re-layout, and nothing drawn over the operator's panel.
+ *
+ * To get it back for a bench session, define DEBUG for the build
+ * (CMake: target_compile_definitions(... PRIVATE DEBUG), or add DEBUG
+ * to the IDE's preprocessor symbols for the Debug configuration). */
+#ifdef DEBUG
+
 static lv_obj_t *debug_label;
+
+/* The per-source protection history.  A SEPARATE label from the status
+ * line above, because the two have very different widths: the status line
+ * needs ~245 px (it carries four "NAME:value" pairs), while the two source
+ * columns need only ~120 px.  One combined label would have to be as wide
+ * as the status line, so the source block would sit inside a 245 px wide
+ * translucent box with ~125 px of empty shading to its right - and that
+ * empty shading is drawn over the TX-power bar and the reflected/SWR
+ * readouts for no reason at all.
+ *
+ * Two labels means the tinted area is only what the text actually needs:
+ * the status line covers one row across the top, and the source block
+ * covers a narrow column on the left. */
+static lv_obj_t *debug_src_label;
+
+#endif /* DEBUG */
 
 /*============================================================================
  *  Touch raw readout - bottom-left corner, red
@@ -579,9 +695,15 @@ static uint32_t s_touch_raw_z;
 #endif /* DEBUG_TOUCH_RAW */
 
 
-/* Throttle: update debug overlay at most once per 500 ms so the
- * label does not flicker.  10 ms LVGL ticks call it constantly. */
+#ifdef DEBUG
+
+/* Throttle: update debug overlay at most once per DEBUG_OVERLAY_PERIOD_MS so
+ * the label does not flicker - and, now that it carries the per-source
+ * protection history, so an operator can actually watch a bit flip. */
+#define DEBUG_OVERLAY_PERIOD_MS  500U
 static uint32_t s_debug_last_tick_ms = 0;
+
+#endif /* DEBUG */
 
 #ifndef LVGL_SIM
 /* This build is running from external OSPI (XIP), the firmware binary
@@ -594,10 +716,52 @@ static uint32_t s_debug_last_tick_ms = 0;
 #define APP_RUNS_FROM_EXTERNAL_FLASH  0
 #endif
 
-/* Render the one-line debug string.  The format is intentionally
- * compact - the line is ~14 px tall and we have 480 px to play with.
- * Format: "TOUCH:NS2009 CFG:OK CAL:ok OSPI:yes"
- *          "TOUCH:none  CFG:ok CAL:ok OSPI:no"  (sim, no NS2009/GT911) */
+#ifdef DEBUG
+
+/* One tag per ProtectionSource, in enum order - the index IS the bit
+ * position, so this table and the enum cannot drift apart silently. */
+static const char *const prot_src_tags[PROT_SRC_COUNT] = {
+    "AWD1", "AWD2", "AWD3", "CMP1", "CMP2",
+    "HARD", "NTC",  "VBIAS", "CPL", "FRQ"
+};
+
+/* How many rows each column holds.  Ten sources over two columns is five
+ * rows, so the block is half as tall as a single column would be - which
+ * is the whole point: the overlay sits ON TOP of the TX-power / reflected /
+ * SWR sections, and every row it does not cover is a row of the panel the
+ * operator can actually use.  Derived rather than hardcoded so a future
+ * eleventh source splits 6/5 instead of silently overrunning a column. */
+#define PROT_SRC_COLS     2U
+#define PROT_SRC_ROWS    ((PROT_SRC_COUNT + PROT_SRC_COLS - 1U) / PROT_SRC_COLS)
+
+/* Room for the status line ("TOUCH:resist CFG:ok CAL:need OSPI:yes" is
+ * about 38 characters).  Sized from the content rather than picked, so a
+ * longer tag cannot silently truncate the text - a truncated status line
+ * would read as a plausible-but-wrong value. */
+#define DEBUG_OVERLAY_BUF  64
+
+/* Room for the two source columns: 5 rows of "XXXX:0  XXXX:0", ~15 chars
+ * each plus separators.  Same reasoning - sized from the content so a
+ * longer tag or an eleventh source cannot silently truncate the last row.
+ * A truncated row reads exactly like a source that never fires, which is
+ * the one thing this display must never imply by accident. */
+#define DEBUG_SRC_BUF      96
+
+/* Render the debug string.  Two columns, because a single column of ten
+ * sources is 11 rows tall and that is most of the panel.
+ *
+ * Row 1: "TOUCH:NS2009 CFG:ok CAL:ok OSPI:yes"
+ *         "TOUCH:none  CFG:ok CAL:ok OSPI:no"  (sim, no NS2009/GT911)
+ * Rows 2-6: the protection sources, column-first so the reading order down
+ *           the left column matches the enum order:
+ *             AWD1:0  HARD:0
+ *             AWD2:0  NTC:0
+ *             AWD3:0  VBIAS:0
+ *             CMP1:0  CPL:0
+ *             CMP2:0  FRQ:0
+ *
+ * "TAG:1" means that source has fired at least once since power-on - see
+ * protection_note_source(). */
 static void gui_update_debug_overlay(void)
 {
     if (debug_label == NULL) {
@@ -632,13 +796,61 @@ static void gui_update_debug_overlay(void)
     /* OSPI / XIP marker. */
     const char *ospi_tag = APP_RUNS_FROM_EXTERNAL_FLASH ? "yes" : "no";
 
-    char buf[96];
-    snprintf(buf, sizeof(buf),
-             "TOUCH:%s CFG:%s CAL:%s OSPI:%s",
-             touch_tag, cfg_tag, cal_tag, ospi_tag);
+    char buf[DEBUG_OVERLAY_BUF];
+    (void)snprintf(buf, sizeof(buf),
+                   "TOUCH:%s CFG:%s CAL:%s OSPI:%s",
+                   touch_tag, cfg_tag, cal_tag, ospi_tag);
     lv_label_set_text(debug_label, buf);
-    lv_label_set_long_mode(debug_label, LV_LABEL_LONG_DOT);
+
+    /* ---- Per-source protection history, two columns -----------------
+     *
+     * Reads the whole mask ONCE.  Every bit is decided by that single
+     * value, so a source that fires between two rows cannot make the
+     * display show a state that never existed - it would just be seen on
+     * the next refresh, which is a whole 500 ms away.
+     *
+     * Column-first fill (row + col * rows), so the reading order down the
+     * left column matches the enum order and the four main-current /
+     * overdrive lines stay vertically adjacent - those are the pair an
+     * operator is usually comparing when a CURRENT_HIGH popup appears.
+     *
+     * Goes into its OWN label, which is narrow: the two columns together
+     * need about 120 px, not the 245 px the status line needs. */
+    char sbuf[DEBUG_SRC_BUF];
+    size_t used = 0U;
+    uint32_t fired = protection_source_fired_mask();
+    for (unsigned row = 0U; row < (unsigned)PROT_SRC_ROWS; row++) {
+        for (unsigned col = 0U; col < (unsigned)PROT_SRC_COLS; col++) {
+            /* The bound matters: with 10 sources over 5 rows both columns
+             * are exactly full, but the day PROT_SRC_COUNT stops dividing
+             * evenly the last slot has no source and must print nothing
+             * rather than read past the end of the tag table. */
+            unsigned idx = row + (col * (unsigned)PROT_SRC_ROWS);
+            if (idx >= (unsigned)PROT_SRC_COUNT) {
+                break;
+            }
+            if (used >= sizeof(sbuf)) {
+                break;              /* cannot happen; keeps the loop honest */
+            }
+            used += (size_t)snprintf(&sbuf[used], sizeof(sbuf) - used,
+                                     "%s%s:%u",
+                                     (used == 0U) ? "" : (col == 0U ? "\n" : "  "),
+                                     prot_src_tags[idx],
+                                     ((fired >> idx) & 1U) ? 1U : 0U);
+        }
+    }
+    if (debug_src_label != NULL) {
+        lv_label_set_text(debug_src_label, sbuf);
+        /* BREAK, not DOT: DOT replaces the overflow with "..." and would
+         * eat every row after the first - the truncation this overlay is
+         * supposed to eliminate.  BREAK is the mode that honours an
+         * explicit width and still grows the height to fit every row -
+         * which is what lets the row count follow the source list. */
+        lv_label_set_long_mode(debug_src_label, LV_LABEL_LONG_BREAK);
+    }
 }
+
+#endif /* DEBUG */
 
 /* Calibration target positions (10% from edges + center) on 800x480 */
 static const lv_point_t cal_targets[CAL_POINT_COUNT] = {
@@ -883,27 +1095,6 @@ static void gui_create_main_screen(void)
      *=============================================*/
     banner = make_cont(main_screen, 0, 0, HOR_RES, BANNER_H, COLOR_BANNER);
 
-    /* Top-of-screen debug overlay.  Sits flush with the top of the
-     * banner so the user never sees a status bar missing - it is
-     * essentially a 14 px row of white-on-blue text.  Updated by
-     * gui_update_debug_overlay() on a slow tick.  Defined as a child
-     * of the banner so it inherits the banner background and so
-     * lv_scr_load(main_screen) keeps it alive. */
-    debug_label = lv_label_create(banner, NULL);
-    /* LONG_DOT shrinks the string with "..." when it does not fit.  Without
-     * an explicit width the label sizes itself from the first text it ever
-     * saw ("TOUCH:...") and then clips every later, longer update - which is
-     * exactly what a status line must never do.  Give it the full banner
-     * width so the whole string is either visible or honestly truncated. */
-    lv_label_set_long_mode(debug_label, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(debug_label, HOR_RES - 8, 14);
-    lv_obj_set_style_local_text_color(debug_label, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
-    lv_obj_set_style_local_text_font(debug_label, LV_LABEL_PART_MAIN,
-                                     LV_STATE_DEFAULT, &lv_font_montserrat_12);
-    lv_obj_align(debug_label, banner, LV_ALIGN_IN_TOP_LEFT, 4, 1);
-    gui_update_debug_overlay();
-
     /* Centered clickable button — transparent bg, visible border */
     pwr_btn = lv_btn_create(banner, NULL);
     lv_obj_set_size(pwr_btn, 150, 24);
@@ -937,6 +1128,27 @@ static void gui_create_main_screen(void)
      * does not overpower the title. */
     val_fwd = make_label(c_fwd, "0W", 0, 1, LV_COLOR_WHITE, &lv_font_montserrat_16);
     lv_obj_align(val_fwd, NULL, LV_ALIGN_IN_TOP_RIGHT, -8, 0);
+
+    /* Overdrive indicator, sitting between the title and the number.  It is
+     * aligned to the RIGHT-MIDDLE of the title rather than to a fixed x, so
+     * it stays between the two when a language switch changes the title's
+     * width - the alignment is recomputed in gui_set_language().
+     *
+     * This project installs no LVGL theme, so a freshly created object has a
+     * transparent background and the LED would be invisible: bg_opa has to be
+     * set explicitly.  LV_LED_BRIGHT_MIN is 120, so "off" is expressed by
+     * making the background transparent instead of asking for brightness 0. */
+    led_overdrive = lv_led_create(c_fwd, NULL);
+    lv_obj_set_size(led_overdrive, 14, 14);
+    lv_obj_set_style_local_radius(led_overdrive, LV_LED_PART_MAIN, LV_STATE_DEFAULT,
+                                   LV_RADIUS_CIRCLE);
+    lv_obj_set_style_local_bg_color(led_overdrive, LV_LED_PART_MAIN, LV_STATE_DEFAULT,
+                                     COLOR_LED_OK);
+    lv_obj_set_style_local_bg_opa(led_overdrive, LV_LED_PART_MAIN, LV_STATE_DEFAULT,
+                                   LV_OPA_TRANSP);
+    lv_obj_set_style_local_border_width(led_overdrive, LV_LED_PART_MAIN, LV_STATE_DEFAULT, 0);
+    lv_obj_set_style_local_shadow_width(led_overdrive, LV_LED_PART_MAIN, LV_STATE_DEFAULT, 0);
+    lv_obj_align(led_overdrive, lbl_tx_title, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
     bar_fwd = make_bar(c_fwd, 6, 30, HOR_RES - 2 * MARGIN_X - 12, 20, BAR_MAX_FWD);
 
@@ -994,8 +1206,15 @@ static void gui_create_main_screen(void)
 
     /* Radio link status — protocol name + connection state.  Kept separate
      * from the band name so a language switch can relabel it independently. */
-    lbl_protocol = make_centered_label(c_info, "", 58, info_w, 16,
+    lbl_protocol = make_centered_label(c_info, "", 56, info_w, 14,
                                         LV_COLOR_GRAY, &lv_font_montserrat_12);
+
+    /* Measured frequency, from the TIM1 ETR counter.  Its own line under the
+     * protocol so the operator can see what the hardware is actually
+     * counting, which is not the same thing as the band the radio reported
+     * and often differs from it while the operator is tuning. */
+    lbl_freq_det = make_centered_label(c_info, "", 72, info_w, 14,
+                                       LV_COLOR_GRAY, &lv_font_montserrat_12);
 
     /* Tap to open band selector */
     lv_obj_set_event_cb(c_info, info_area_event_handle);
@@ -1052,13 +1271,153 @@ static void gui_create_main_screen(void)
      * Created hidden: nothing shows until the first sample arrives, so an
      * idle panel is not carrying a "0 0 0" that reads like a fault. */
     lbl_touch_raw = lv_label_create(main_screen, NULL);
-    lv_obj_set_style_local_text_color(lbl_touch_raw, LV_LABEL_PART_MAIN,
-                                      LV_STATE_DEFAULT, LV_COLOR_RED);
-    lv_obj_set_style_local_text_font(lbl_touch_raw, LV_LABEL_PART_MAIN,
-                                     LV_STATE_DEFAULT, &lv_font_montserrat_12);
-    lv_obj_align(lbl_touch_raw, main_screen, LV_ALIGN_IN_BOTTOM_LEFT, 4, -2);
-    lv_obj_set_hidden(lbl_touch_raw, true);
+        lv_obj_set_style_local_text_color(lbl_touch_raw, LV_LABEL_PART_MAIN,
+                                          LV_STATE_DEFAULT, LV_COLOR_RED);
+        lv_obj_set_style_local_text_font(lbl_touch_raw, LV_LABEL_PART_MAIN,
+                                         LV_STATE_DEFAULT, &lv_font_montserrat_12);
+        lv_obj_align(lbl_touch_raw, main_screen, LV_ALIGN_IN_BOTTOM_LEFT, 4, -2);
+        lv_obj_set_hidden(lbl_touch_raw, true);
 #endif
+
+#ifdef DEBUG
+    /*=============================================
+     * 6 — Debug overlay - LAST, so it paints over everything
+     *=============================================*/
+    /* The status line plus the per-source protection history in two
+     * columns, refreshed by gui_update_debug_overlay() on a slow tick.
+     *
+     * Created LAST on purpose.  Every section above is an opaque
+     * lv_obj_create() with a background, and LVGL draws children in
+     * creation order - a label created before them is painted over by each
+     * one it overlaps.  That is not a hypothetical: with the label in the
+     * middle of this function, the simulator showed the status line and
+     * "AWD1:0" and then nothing but a 4 px sliver down the left edge,
+     * because the TX-power / reflected / SWR / info sections all start at
+     * MARGIN_X = 8 and swallowed every row below them.  A missing row
+     * reads as "this source never fired", which is the one thing this
+     * overlay must never imply by accident.
+     *
+     * So both labels are children of main_screen (the full 480x272 panel,
+     * so no row is clipped), created after every sibling, and given their
+     * own translucent background - see the opacity note below.
+     *
+     * TWO labels, not one: the status line needs ~245 px and the two source
+     * columns need ~120 px.  A single label would have to be 245 px wide,
+     * and the source block would then sit inside a 245 px wide tinted box
+     * with ~125 px of empty shading to its right - drawn over the TX-power
+     * bar and the reflected/SWR readouts for no reason at all.  Separate
+     * labels tint only what the text actually needs. */
+    debug_label = lv_label_create(main_screen, NULL);
+    /* BREAK, not DOT: DOT replaces the overflow with "..." and would eat
+     * every row after the first - the truncation this overlay is supposed
+     * to eliminate.  BREAK keeps the width set below and recomputes the
+     * height from the text on every refresh, so the row count follows the
+     * source list with nothing hidden and nothing left over from the
+     * previous, longer string. */
+    lv_label_set_long_mode(debug_label, LV_LABEL_LONG_BREAK);
+    /* Only as wide as the widest row actually needs.  The status line is
+     * the long one ("TOUCH:resist CFG:ok CAL:need OSPI:yes" needs about
+     * 245 px, measured by the simulator's own font metrics).  Giving it the
+     * full panel width instead would stretch the translucent background
+     * across 480 px for no benefit - it covers the same rows either way,
+     * and a narrower box is a smaller thing to read through. */
+    lv_obj_set_width(debug_label, 270);
+    /* Height left unset on purpose - see the BREAK note above. */
+    lv_obj_set_style_local_bg_color(debug_label, LV_LABEL_PART_MAIN,
+                                    LV_STATE_DEFAULT, lv_color_hex(0x000000));
+    /* TRANSLUCENT, not opaque.  The overlay necessarily sits on top of the
+     * TX-power / reflected / SWR sections, and at LV_OPA_COVER it simply
+     * deleted them from the operator's view - which is not an acceptable
+     * trade for a diagnostic line.  At 60 % black the white 12 px text is
+     * still comfortably legible while the section borders, bar fills and
+     * titles underneath stay readable through it, so the panel keeps
+     * working as a panel.
+     *
+     * Black rather than the dark blue used before: a translucent dark tint
+     * over an already dark background barely changes contrast, whereas
+     * black at the same alpha reliably darkens whatever is behind it. */
+    lv_obj_set_style_local_bg_opa(debug_label, LV_LABEL_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_60);
+    lv_obj_set_style_local_border_width(debug_label, LV_LABEL_PART_MAIN,
+                                        LV_STATE_DEFAULT, 0);
+    /* A 1 px pad all round, written as four calls: lv_obj_set_style_local_
+     * pad_all() does not exist in the LVGL 7 build the firmware compiles
+     * against (lv_obj_style_dec.h declares pad_top / pad_bottom / pad_left
+     * / pad_right only), even though the copy the PC simulator links does
+     * have it.  The padding is what keeps the first row's glyphs off the
+     * background edge. */
+    lv_obj_set_style_local_pad_top(debug_label, LV_LABEL_PART_MAIN,
+                                   LV_STATE_DEFAULT, 1);
+    lv_obj_set_style_local_pad_bottom(debug_label, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, 1);
+    lv_obj_set_style_local_pad_left(debug_label, LV_LABEL_PART_MAIN,
+                                    LV_STATE_DEFAULT, 2);
+    lv_obj_set_style_local_pad_right(debug_label, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, 2);
+    lv_obj_set_style_local_text_color(debug_label, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(debug_label, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &lv_font_montserrat_12);
+    /* Below the banner, not on top of it.  The banner carries the Transmit
+     * button, which is the one control on this screen that must always be
+     * fully visible and unambiguous - a diagnostic overlay has no business
+     * sitting on it.  Starting the overlay at BANNER_H + GAP_Y also puts
+     * its first row exactly where the TX-power section starts, so the two
+     * do not fight for the same pixels. */
+    lv_obj_align(debug_label, main_screen, LV_ALIGN_IN_TOP_LEFT, 2, BANNER_H + GAP_Y);
+    lv_obj_move_foreground(debug_label);
+    /* NOT clickable, and this is what keeps the panel usable.
+     *
+     * lv_indev_search_obj() (lv_indev.c) walks a node's children in order
+     * and returns the first hit, so a clickable object sitting in front of
+     * the sections swallows their touches even when the user aims squarely
+     * at a bar or the Settings button.  A label defaults to clickable, so
+     * the overlay as first built was a dead zone over the whole top-left of
+     * the panel: TX Power, Reflected and SWR all stopped responding.
+     *
+     * Clearing the flag makes hittest still consider the object for
+     * DRAWING but skip it when searching for a click target, so the rows
+     * stay visible and the touch falls straight through to whatever is
+     * underneath.  There is also no partial-cover case to think about:
+     * the flag is per-object. */
+    lv_obj_set_click(debug_label, false);
+
+    /* ---- The source grid: a second, much narrower label ------------
+     *
+     * Same styling rules as the status line, but sized to the two source
+     * columns only (~120 px).  It sits directly under the status line so
+     * the two read as one block. */
+    debug_src_label = lv_label_create(main_screen, NULL);
+    lv_label_set_long_mode(debug_src_label, LV_LABEL_LONG_BREAK);
+    lv_obj_set_width(debug_src_label, 130);
+    lv_obj_set_style_local_bg_color(debug_src_label, LV_LABEL_PART_MAIN,
+                                    LV_STATE_DEFAULT, lv_color_hex(0x000000));
+    lv_obj_set_style_local_bg_opa(debug_src_label, LV_LABEL_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_60);
+    lv_obj_set_style_local_border_width(debug_src_label, LV_LABEL_PART_MAIN,
+                                        LV_STATE_DEFAULT, 0);
+    lv_obj_set_style_local_pad_top(debug_src_label, LV_LABEL_PART_MAIN,
+                                   LV_STATE_DEFAULT, 1);
+    lv_obj_set_style_local_pad_bottom(debug_src_label, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, 1);
+    lv_obj_set_style_local_pad_left(debug_src_label, LV_LABEL_PART_MAIN,
+                                    LV_STATE_DEFAULT, 2);
+    lv_obj_set_style_local_pad_right(debug_src_label, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, 2);
+    lv_obj_set_style_local_text_color(debug_src_label, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(debug_src_label, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &lv_font_montserrat_12);
+    /* One row down from the status line (12 px text + the 2 px padding
+     * above and below), so the two blocks read as one continuous list
+     * instead of two unrelated boxes. */
+    lv_obj_align(debug_src_label, main_screen, LV_ALIGN_IN_TOP_LEFT,
+                 2, BANNER_H + GAP_Y + 17);
+    lv_obj_move_foreground(debug_src_label);
+    lv_obj_set_click(debug_src_label, false);
+
+    gui_update_debug_overlay();
+#endif /* DEBUG */
 }
 
 /* Radio link caption: protocol name plus connect state.  The protocol comes
@@ -1085,17 +1444,150 @@ static void gui_update_protocol_label(void)
      * very first paint.  set_style_local_text_color() invalidates too, but
      * the protocol rarely changes, so the write itself is cheap; the text
      * write is the one that must be guarded. */
+    /* Deliberately empty rather than "Protocol: No link" when nothing has
+     * been detected.  With no CAT link and no radio there is nothing to
+     * report, and a string there reads as "the amplifier cannot find a
+     * radio" - a fault impression the operator has no way to disprove.  An
+     * empty line says "nothing to say yet", and the band name above already
+     * stays at "---" until the radio reports one, so the link state is
+     * still visible. */
     if (proto) {
         snprintf(buf, sizeof(buf), "%s: %s", gui_get_string(STR_PROTOCOL), proto);
         lv_obj_set_style_local_text_color(lbl_protocol, LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_GREEN);
     } else {
-        snprintf(buf, sizeof(buf), "%s: %s", gui_get_string(STR_PROTOCOL),
-                 gui_get_string(STR_NO_SIGNAL));
-        lv_obj_set_style_local_text_color(lbl_protocol, LV_LABEL_PART_MAIN,
-                                           LV_STATE_DEFAULT, LV_COLOR_GRAY);
+        buf[0] = '\0';
     }
     gui_label_set_cached(lbl_protocol, buf);
+}
+
+/* Measured frequency from the TIM1 ETR counter, in MHz to one decimal.
+ *
+ * The validity rule belongs to freq_detect_is_measurement_valid(), not
+ * here.  A range test on its own would be wrong in the direction that
+ * matters: freq_detect only publishes a new number when its sliding window
+ * agrees, and on a rejection it deliberately keeps the last accepted
+ * value.  So an input that has gone dead or noisy keeps returning a
+ * perfectly in-range number forever, and a GUI that only checked the
+ * range would paint it green - telling the operator the radio is still on
+ * air when nothing is being measured.
+ *
+ * An invalid reading does not blank the field: the last good value stays
+ * up and turns grey.  Grey means "held, not refreshing"; green means
+ * "live".  Holding beats blanking because an operator who disconnects the
+ * antenna should not see the number vanish and conclude the counter is
+ * broken - it is the counter working correctly on a signal that stopped. */
+static void gui_update_freq_det_label(void)
+{
+    char buf[32];
+    uint32_t hz;
+    bool valid;
+
+#ifndef LVGL_SIM
+    hz    = freq_detect_get_frequency();
+    valid = freq_detect_is_measurement_valid();
+#else
+    hz    = 14074000U;             /* simulator shows the 20 m band */
+    valid = true;
+#endif
+
+    if (valid) {
+        s_freq_det_last_valid = hz;
+    } else if (s_freq_det_last_valid != 0U) {
+        hz = s_freq_det_last_valid;   /* hold the last good reading */
+    }
+
+    if (hz == 0U) {
+        /* Never had a valid reading yet.  Empty rather than 0.0MHz: there
+         * is no measurement to report, and 0.0 is not a frequency a radio
+         * transmits on. */
+        gui_label_set_cached(lbl_freq_det, "");
+        return;
+    }
+
+    /* Integer MHz tenths, then split - snprintf("%.1f") would drag the FPU
+     * and the rounding mode into a path that runs on every GUI tick. */
+    uint32_t tenth_mhz = (hz + 50000U) / 100000U;   /* round to nearest 100 kHz */
+    snprintf(buf, sizeof(buf), "%lu.%luMHz",
+             (unsigned long)(tenth_mhz / 10U), (unsigned long)(tenth_mhz % 10U));
+
+    lv_obj_set_style_local_text_color(lbl_freq_det, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT,
+                                       valid ? LV_COLOR_GREEN : LV_COLOR_GRAY);
+    gui_label_set_cached(lbl_freq_det, buf);
+}
+
+/* Bar scaling, shared by the normal refresh and the pre-calibration one.
+ *
+ * Both call sites must produce the same numbers or the bars would jump when
+ * the IMAIN calibration finishes: a bar that was drawn one way while the
+ * readout showed "--" and then redraws another way is a visible glitch, and
+ * the fix for that would be for one site to stop using these bars.
+ *
+ * Milliwatts in, bar units out.  FWD and REV use their own watt ratings as
+ * the divisor (so 1200 mW over 1200 W is full scale); SWR is offset to 1:1
+ * and spans 1..4, matching BAR_MAX_SWR. */
+static void gui_set_rf_bars(int32_t fwd_peak_mW, int32_t rev_peak_mW)
+{
+    int32_t swr_x100 = calculate_swr_x100(fwd_peak_mW, rev_peak_mW);
+    int32_t v;
+
+    v = (fwd_peak_mW * BAR_MAX_FWD) / (1000 * 1000);
+    /* The coupler model reads ~1579 W at ADC full scale, above the bar's
+     * range, so an over-range value has to be clamped here rather than
+     * handed to LVGL: lv_bar_set_value() stores the number as given and
+     * the indicator length is computed from it, so anything past the
+     * range would overflow the bar rather than pin it full. */
+    gui_bar_set_cached(bar_fwd,
+                      (int16_t)((v > BAR_MAX_FWD) ? BAR_MAX_FWD : v));
+
+    v = (rev_peak_mW * BAR_MAX_REF) / (300 * 1000);
+    gui_bar_set_cached(bar_ref,
+                      (int16_t)((v > BAR_MAX_REF) ? BAR_MAX_REF : v));
+
+    v = ((swr_x100 - 100) * BAR_MAX_SWR) / 300;
+    /* SWR below 1:1 (impossible from calculate_swr_x100, but a coupling
+     * fault could make the formula return something odd) would go negative
+     * and has to be pinned at zero, not wrapped. */
+    if (v < 0) v = 0;
+    gui_bar_set_cached(bar_swr,
+                      (int16_t)((v > BAR_MAX_SWR) ? BAR_MAX_SWR : v));
+}
+
+/**
+ * @brief Paint the overdrive indicator from overdrive.c's state
+ *
+ * GUI task only - LVGL is not thread safe.  The ADC task feeds
+ * overdrive_tick() and this function is a pure consumer of its getters.
+ * Every write below is change-guarded so an idle screen costs nothing:
+ * the LED's brightness setter already de-duplicates internally, and the
+ * colour/visibility styles are only touched when their state flips.
+ */
+static void gui_update_overdrive_led(void)
+{
+#ifndef LVGL_SIM
+    uint8_t bright = overdrive_led_bright();
+    bool red = overdrive_is_tripped();
+    bool lit = (bright > 0U);
+
+    if (red != s_led_overdrive_red) {
+        s_led_overdrive_red = red;
+        lv_obj_set_style_local_bg_color(led_overdrive, LV_LED_PART_MAIN,
+                                         LV_STATE_DEFAULT,
+                                         red ? LV_COLOR_RED : COLOR_LED_OK);
+    }
+    if (lit != s_led_overdrive_lit) {
+        s_led_overdrive_lit = lit;
+        lv_obj_set_style_local_bg_opa(led_overdrive, LV_LED_PART_MAIN,
+                                       LV_STATE_DEFAULT,
+                                       lit ? LV_OPA_COVER : LV_OPA_TRANSP);
+    }
+    if (lit) {
+        /* lv_led_set_bright() clamps anything below LV_LED_BRIGHT_MIN (120)
+         * by itself, which is the dimmest the widget can draw. */
+        lv_led_set_bright(led_overdrive, bright);
+    }
+#endif
 }
 
 /**
@@ -1129,19 +1621,23 @@ static void gui_update_main_values(void)
     lv_obj_set_style_local_text_color(status_label, LV_LABEL_PART_MAIN,
                                        LV_STATE_DEFAULT, LV_COLOR_WHITE);
 
-    /* 上电稳定等待期：零点校准还没做完之前，ADC 读数是没有意义的
-     * （模拟量还在爬升，读出来会乱跳）。这一段时间里主界面一律显示
-     * "--"，而不是把一屏噪声当成真实功率给操作员看。校准一完成
-     * （adc_stabilisation_tick() 走到 ARMED）下面照常显示。
+    /* 上电静默期：ADC 还没开始取样，转换器只是刚上电。这一小段时间里
+     * 主界面一律显示 "--"，而不是把一屏噪声当成真实功率给操作员看。
+     * 静默期一过（adc_stabilisation_tick() 走到 ARMED）下面照常显示。
      * 这里只替换测量值，状态条/频段/协议等照旧刷新，操作员看得出
-     * 机器活着、只是还没进入可发射状态。 */
+     * 机器活着、只是还没进入可发射状态。
+     *
+     * 只有"静默期"会整体blank。零点校准不再blank任何东西——它是
+     * 一个测量步骤，不再是发射许可的前提（见 user_adc.c）。但电流
+     * 这一路仍然要单独处理：未标定时 adc1_raw_to_im_mA() 返回 0，
+     * 屏幕上是 "0.00A"，看起来像一个真实的零电流读数，而实际上只是
+     * "还不知道"。所以未标定时电流显示 "--"，其余照常。 */
     if (!adc_stabilisation_done()) {
         gui_label_set_cached(val_fwd, "--W");
         gui_label_set_cached(val_ref, "--W");
         gui_label_set_cached(val_swr, "--");
-        gui_bar_set_cached(bar_fwd, 0);
-        gui_bar_set_cached(bar_ref, 0);
-        gui_bar_set_cached(bar_swr, 0);
+        gui_set_rf_bars((int32_t)g_adc_data.fwd2_peak_mW,
+                        (int32_t)g_adc_data.rev2_peak_mW);
         lv_obj_set_style_local_text_color(val_swr, LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_WHITE);
         gui_label_set_cached(lbl_voltage, "--V");
@@ -1165,13 +1661,20 @@ static void gui_update_main_values(void)
             gui_label_set_cached(lbl_radio_mode, "");
         }
         gui_update_protocol_label();
+        gui_update_freq_det_label();
         return;
     }
 
-    /* Peak hold with slow release (tau = 500 ms) is produced by the Control
-     * agent in adc_peak_hold_tick(), driven from the ADC task - deliberately
-     * not from the DMA ISR, because the release needs expf().  The GUI is a
-     * pure consumer: it never writes these two fields. */
+    /* Overdrive indicator: brightness follows the 200 ms peak of the
+     * RF-input detector, and the LED flashes red once that peak reaches the
+     * trip threshold.  Independent of the silence period above - during it
+     * the ADC never samples, so the peak stays 0 and the LED stays dark. */
+    gui_update_overdrive_led();
+
+    /* Peak hold with slow release (tau = PEAK_TAU_MS) is produced by the
+     * Control agent in adc_peak_hold_tick(), driven from the ADC task -
+     * deliberately not from the DMA ISR, because the release needs expf().
+     * The GUI is a pure consumer: it never writes these two fields. */
     int32_t fwd_peak_mW = (int32_t)g_adc_data.fwd2_peak_mW;
     int32_t rev_peak_mW = (int32_t)g_adc_data.rev2_peak_mW;
 /* Forward power, in Watts - round to nearest before dropping the fraction */
@@ -1179,21 +1682,22 @@ static void gui_update_main_values(void)
     gui_fmt_fixed(buf, sizeof(buf), fwd_w, 0U);
     strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
     gui_label_set_cached(val_fwd, buf);
-    gui_bar_set_cached(bar_fwd, (int16_t)((fwd_peak_mW * BAR_MAX_FWD) / (1000 * 1000)));
 
     /* Reflected power, in Watts */
     int32_t ref_w = (rev_peak_mW + 500) / 1000;
     gui_fmt_fixed(buf, sizeof(buf), ref_w, 0U);
     strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
     gui_label_set_cached(val_ref, buf);
-    gui_bar_set_cached(bar_ref, (int16_t)((rev_peak_mW * BAR_MAX_REF) / (300 * 1000)));
+
+    /* All three bars, from the same two held values so they agree with
+     * each other and with the numbers above. */
+    gui_set_rf_bars(fwd_peak_mW, rev_peak_mW);
 
     /* SWR derived from the same peak values so the three bars agree.
      * calculate_swr_x100 returns hundredths; one decimal means /10. */
     int32_t swr_x100 = calculate_swr_x100(fwd_peak_mW, rev_peak_mW);
     gui_fmt_fixed(buf, sizeof(buf), swr_x100 / 10, 1U);
     gui_label_set_cached(val_swr, buf);
-    gui_bar_set_cached(bar_swr, (int16_t)(((swr_x100 - 100) * BAR_MAX_SWR) / 300));
     if (swr_x100 > 200) {
         lv_obj_set_style_local_text_color(val_swr, LV_LABEL_PART_MAIN,
                                            LV_STATE_DEFAULT, LV_COLOR_RED);
@@ -1207,9 +1711,31 @@ static void gui_update_main_values(void)
     strncat(buf, "V", sizeof(buf) - strlen(buf) - 1U);
     gui_label_set_cached(lbl_voltage, buf);
 
-    /* Current - one decimal amp means /100 of the milliamp reading */
-    gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.im_mA, 2U);
-    strncat(buf, "A", sizeof(buf) - strlen(buf) - 1U);
+    /* Current - one decimal amp means /100 of the milliamp reading.
+     *
+     * "Not calibrated" and "zero amps" are different facts, and the
+     * screen has to tell them apart: an uncalibrated channel reports
+     * 0 mA because the firmware has no offset to subtract yet, not
+     * because no current is flowing.  Printing "0.00A" there would be
+     * a confident-looking lie, so it shows "--" until the zero-offset
+     * calibration has produced a number.
+     *
+     * adc_im_protection_valid() is the same predicate the current
+     * protection itself uses, so the screen and the hardware always
+     * agree: if this shows "--", the main-current protection is parked
+     * as well, and the operator is looking at an amplifier whose
+     * over-current watchdog is deliberately not armed. */
+    if (adc_im_protection_valid()) {
+        /* im_mA is MILLI-amps, and gui_fmt_fixed() divides by 10^decimals
+         * itself.  Passing 2 here divided by 100, i.e. treated the value as
+         * centiamps, so a real 0.58 A read as 5.78 A - a 10x exaggeration
+         * that made every reading look far worse than the hardware.
+         * decimals = 3 divides by 1000, which is exactly mA -> A. */
+        gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.im_mA, 3U);
+        strncat(buf, "A", sizeof(buf) - strlen(buf) - 1U);
+    } else {
+        snprintf(buf, sizeof(buf), "--A");
+    }
     gui_label_set_cached(lbl_current, buf);
 
     /* Temperature — unit follows the setting chosen in the language menu.
@@ -1248,6 +1774,7 @@ static void gui_update_main_values(void)
 
     /* Radio protocol link status (from the comm protocol detector) */
     gui_update_protocol_label();
+    gui_update_freq_det_label();
 
 #else /* LVGL_SIM: synthesise plausible readings so the layout can be judged */
     (void)buf;
@@ -1278,8 +1805,10 @@ static void gui_update_main_values(void)
      * triangular sweep straight into the peak fields. */
     static int sim_sweep = 0;
     sim_sweep = (sim_sweep + 4) % 240;
-    float sim_fwd_w = (sim_sweep < 120) ? (sim_sweep * 1000.0f / 120.0f)
-                                        : ((240 - sim_sweep) * 1000.0f / 120.0f);
+    /* Sweep to the bar's full scale so the simulator can show the bar
+     * pinning at the top rather than stopping short of it. */
+    float sim_fwd_w = (sim_sweep < 120) ? (sim_sweep * BAR_MAX_FWD / 120.0f)
+                                        : ((240 - sim_sweep) * BAR_MAX_FWD / 120.0f);
     float sim_rev_w = sim_fwd_w * 0.06f;
     g_adc_data.fwd2_peak_mW = (int32_t)(sim_fwd_w * 1000.0f);
     g_adc_data.rev2_peak_mW = (int32_t)(sim_rev_w * 1000.0f);
@@ -1289,17 +1818,19 @@ static void gui_update_main_values(void)
 
     snprintf(buf, sizeof(buf), "%.0fW", fwd_peak_mW / 1000.0f);
     gui_label_set_cached(val_fwd, buf);
-    gui_bar_set_cached(bar_fwd, (int16_t)(fwd_peak_mW / 1000.0f));
 
     snprintf(buf, sizeof(buf), "%.0fW", rev_peak_mW / 1000.0f);
     gui_label_set_cached(val_ref, buf);
-    gui_bar_set_cached(bar_ref, (int16_t)(rev_peak_mW / 3000.0f));
+
+    /* Same helper the firmware path uses, so the simulator judges the real
+     * bar scaling rather than a second set of hand-written divisions that
+     * drifts the moment BAR_MAX_FWD changes. */
+    gui_set_rf_bars((int32_t)fwd_peak_mW, (int32_t)rev_peak_mW);
 
     float sim_swr = calculate_swr_x100((int32_t)fwd_peak_mW,
                                        (int32_t)rev_peak_mW) / 100.0f;
     snprintf(buf, sizeof(buf), "%.1f", sim_swr);
     gui_label_set_cached(val_swr, buf);
-    gui_bar_set_cached(bar_swr, (int16_t)((sim_swr - 1.0f) * BAR_MAX_SWR / 3.0f));
 
     snprintf(buf, sizeof(buf), "13.8V");
     gui_label_set_cached(lbl_voltage, buf);
@@ -1317,6 +1848,28 @@ static void gui_update_main_values(void)
     gui_label_set_cached(band_label, strFreqRanges[3]);
     gui_label_set_cached(lbl_radio_mode, strBands[3]);
     gui_update_protocol_label();
+    gui_update_freq_det_label();
+
+    /* Overdrive LED preview: a brightness ramp followed by a red flash
+     * window, so both the level indication and the trip colour can be
+     * judged without the target hardware. */
+    static int sim_led = 0;
+    sim_led = (sim_led + 6) % 600;
+    if (sim_led < 400) {
+        lv_obj_set_style_local_bg_color(led_overdrive, LV_LED_PART_MAIN,
+                                         LV_STATE_DEFAULT, COLOR_LED_OK);
+        lv_obj_set_style_local_bg_opa(led_overdrive, LV_LED_PART_MAIN,
+                                       LV_STATE_DEFAULT, LV_OPA_COVER);
+        lv_led_set_bright(led_overdrive, (uint8_t)(sim_led * 255 / 400));
+    } else {
+        lv_obj_set_style_local_bg_color(led_overdrive, LV_LED_PART_MAIN,
+                                         LV_STATE_DEFAULT, LV_COLOR_RED);
+        lv_obj_set_style_local_bg_opa(led_overdrive, LV_LED_PART_MAIN,
+                                       LV_STATE_DEFAULT,
+                                       ((sim_led / 20) & 1) ? LV_OPA_COVER
+                                                            : LV_OPA_TRANSP);
+        lv_led_set_bright(led_overdrive, LV_LED_BRIGHT_MAX);
+    }
 #endif
 }
 
@@ -1372,9 +1925,11 @@ static void cal_finish(void)
     g_calibration_required = false;
     g_touch_calibrated     = true;
 #ifndef LVGL_SIM
-    config_lock();
+    /* No lock needed here: config_mark_dirty() only raises a flag and
+     * posts a thread flag, neither of which reads g_config.  The
+     * coefficients themselves were published under the lock by
+     * cal_build_results_ui() just above. */
     config_mark_dirty();
-    config_unlock();
 #endif
     lv_scr_load(main_screen);
 }
@@ -1606,12 +2161,21 @@ static void cal_build_results_ui(void)
 
     if (passed) {
 #ifndef LVGL_SIM
-        /* Straight float fit: screen = raw * gain + offset */
+        /* Straight float fit: screen = raw * gain + offset.
+         *
+         * Five fields written together, so the config lock is taken here.
+         * It matters more than the count suggests: a save task snapshot
+         * landing between the coefficients and the `calibrated` flag would
+         * write a transform that is flagged uncalibrated - i.e. the fit
+         * would be in the flash but the firmware would still ignore it and
+         * run the touch panel raw, with nothing to say why. */
+        config_lock();
         g_config.touch.x_gain     = x_slope;
         g_config.touch.x_offset   = x_off;
         g_config.touch.y_gain     = y_slope;
         g_config.touch.y_offset   = y_off;
         g_config.touch.calibrated = 1;
+        config_unlock();
 #endif
         /* cal_finish() flags g_config dirty so app_config_task() persists the
          * new coefficients, clears the boot-time "calibration required"
@@ -1956,12 +2520,22 @@ void gui_update_display(void)
     if (!alert_active && !calibrating) {
         gui_update_main_values();
     }
+#ifdef DEBUG
     /* Refresh the top-of-screen debug overlay only once . */
     uint32_t now = lv_tick_get();
     if (s_debug_last_tick_ms == 0) {
         s_debug_last_tick_ms = now;
         gui_update_debug_overlay();
+    } else if ((uint32_t)(now - s_debug_last_tick_ms) >= DEBUG_OVERLAY_PERIOD_MS) {
+        /* Unsigned subtraction, so this stays correct across the 32-bit
+         * tick wrap.  PERIOD rather than "every tick": the overlay carries
+         * the per-source protection history, and an operator watching for
+         * a 1 to flip does not need it faster than a few times a second -
+         * while every update re-lays out 12 rows of text. */
+        s_debug_last_tick_ms = now;
+        gui_update_debug_overlay();
     }
+#endif /* DEBUG */
 
     /* Power-off sequence, if the operator armed it from the Settings
      * menu.  Runs here (task pump) rather than in the LVGL callback so
@@ -2053,6 +2627,19 @@ void gui_show_alert(AlertType alert_type)
     static const char *btn_txts[] = { NULL, "" };   /* filled below */
 
     alert_msgbox = lv_msgbox_create(main_screen, NULL);
+    if (alert_msgbox == NULL) {
+        /* LVGL's heap could not satisfy the allocation.  Bailing out here is
+         * the difference between a retry and a dead board: continuing into
+         * lv_msgbox_set_text(NULL, ...) dereferences NULL, and
+         * HardFault_Handler on this target is a bare while(1) - the panel
+         * simply stops responding, with nothing to say why.
+         *
+         * alert_active stays false and g_alert_flag stays true, so the next
+         * GUI tick (50 ms) retries once memory has been released.  The
+         * buzzer is already sounding by then, so a fault is never silently
+         * swallowed while the popup is missing. */
+        return;
+    }
     lv_msgbox_set_text(alert_msgbox, alert_text);
 
     /* Button label is language-dependent, like the other popups in this
@@ -2064,13 +2651,18 @@ void gui_show_alert(AlertType alert_type)
     lv_obj_align(alert_msgbox, main_screen, LV_ALIGN_CENTER, 0, 0);
 
     /* Style: without an explicit font the CJK glyphs render as boxes, and
-     * the default msgbox background does not match the rest of the UI. */
+     * the default msgbox background does not match the rest of the UI.
+     * Red rather than blue when protection is disarmed, matching the
+     * message: blue elsewhere in this UI means "normal state". */
     lv_obj_set_style_local_text_color(alert_msgbox, LV_MSGBOX_PART_BG,
                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
     lv_obj_set_style_local_text_font(alert_msgbox, LV_MSGBOX_PART_BG,
                                       LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_style_local_bg_color(alert_msgbox, LV_MSGBOX_PART_BG,
-                                     LV_STATE_DEFAULT, LV_COLOR_BLUE);
+                                     LV_STATE_DEFAULT,
+                                     g_config.allow_protection
+                                         ? LV_COLOR_BLUE
+                                         : LV_COLOR_MAKE(0xdf, 0x01, 0x01));
 
     lv_obj_t *btnm = lv_msgbox_get_btnmatrix(alert_msgbox);
     lv_obj_set_style_local_text_color(btnm, LV_BTNMATRIX_PART_BTN,
@@ -2110,6 +2702,180 @@ bool gui_is_alert_active(void)
      * read g_alert_flag (in opa2000.h) instead, which is updated under the
      * protect-task side of the same state machine. */
     return alert_active;
+}
+
+/*============================================================================
+ *  "Config saved" toast
+ *
+ *  Follows LLMC_DAC's show_toast(): fade in, hold, fade out, delete.  Two
+ *  adaptations are forced by this LVGL being v7 rather than v8:
+ *
+ *    1. There is no LV_STYLE_OPA in v7 - opacity is per-property
+ *       (LV_STYLE_BG_OPA / LV_STYLE_BORDER_OPA / LV_STYLE_TEXT_OPA).  So
+ *       the animation below drives all three.  Setting only the
+ *       background would leave the text and the border fully opaque while
+ *       the box faded, i.e. "配置已保存" hanging in mid-air over the power
+ *       bars after the toast had visually gone.
+ *    2. Animations run from lv_task_handler() inside the GUI handler task,
+ *       so they need no lock from here - but the DELETION at the end of
+ *       the fade does, hence the callback below re-takes gui_lock().
+ *==========================================================================*/
+
+/** @brief Fade step.  Applied to background, border and text together.
+ *
+ *  static because the signature is LVGL's exec_cb and it carries no
+ *  state; `obj` is the object lv_anim was started on.
+ *
+ *  The _local variants and LV_OBJ_PART_MAIN are this LVGL 7 spelling; the
+ *  same as every other style call in this file.  (The plain
+ *  lv_obj_set_style_bg_opa() form belongs to LVGL 8.) */
+static void toast_anim_exec(void *obj, lv_anim_value_t value)
+{
+    lv_obj_t *o = (lv_obj_t *)obj;
+    lv_opa_t opa = (lv_opa_t)value;
+
+    lv_obj_set_style_local_bg_opa(o, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, opa);
+    lv_obj_set_style_local_border_opa(o, LV_OBJ_PART_MAIN,
+                                      LV_STATE_DEFAULT, opa);
+    /* The label is a child of the container; fade it on the same curve so
+     * the text does not outlast its box. */
+    lv_obj_t *lbl = lv_obj_get_child(o, NULL);
+    if (lbl != NULL) {
+        lv_obj_set_style_local_text_opa(lbl, LV_LABEL_PART_MAIN,
+                                        LV_STATE_DEFAULT, opa);
+    }
+}
+
+/** @brief End of the fade-out: put the object away.
+ *
+ *  NO LOCK TAKEN HERE, deliberately.  Animations are driven by
+ *  lv_task_handler(), and app_gui_handler_task() calls that INSIDE
+ *  gui_lock()/gui_unlock() - so by the time this callback runs the mutex
+ *  is already held by this very thread.  Taking it again would be a
+ *  double acquire on a non-recursive FreeRTOS mutex, i.e. a self-deadlock
+ *  that would freeze the GUI task with the toast still on screen.
+ *
+ *  That is also why this is safe to touch LVGL here: the one-writer
+ *  property gui.h asks for is provided by the lock the caller already
+ *  holds, not by anything this function does. */
+static void toast_anim_out_ready(lv_anim_t *anim)
+{
+    lv_obj_t *o = (lv_obj_t *)anim->var;
+
+    /* Async delete rather than lv_obj_del(): a synchronous delete would
+     * pull the object out from under the renderer mid-frame.  LLMC_DAC
+     * does the same, and for the same reason.
+     *
+     * toast_obj is cleared now even though the free happens later, on the
+     * async handler.  Leaving it set would make the next save try to
+     * lv_anim_del() and lv_obj_del() an object that is already queued for
+     * deletion - a double free waiting to happen. */
+    lv_obj_del_async(o);
+    if (toast_obj == o) {
+        toast_obj = NULL;
+    }
+}
+
+void gui_show_toast(const char *message)
+{
+    /* Caller holds gui_lock(). */
+    if (message == NULL) {
+        return;
+    }
+
+    /* Re-raise rather than stack: two saves in quick succession should
+     * leave ONE toast with a full read time, not two boxes fighting over
+     * the same spot.
+     *
+     * Dropping the old animations FIRST is not optional.  lv_anim_del
+     * below only clears the list; if the fade-out were left running it
+     * would fire later, find anim->var pointing at freed memory (LVGL
+     * hands the same address back out), and delete whatever object now
+     * lives there - which is very likely the NEW toast, one frame after
+     * it appeared. */
+    if (toast_obj != NULL) {
+        (void)lv_anim_del(toast_obj, NULL);
+        lv_obj_del(toast_obj);
+        toast_obj = NULL;
+    }
+
+    /* Top layer, not main_screen: the save also lands from the coupler and
+     * touch calibration flows, which commit while a calibration screen is
+     * still up.  Parenting to main_screen would hide it there. */
+    toast_obj = lv_obj_create(lv_layer_top(), NULL);
+    lv_obj_set_size(toast_obj, 240, 50);
+    lv_obj_align(toast_obj, lv_layer_top(), LV_ALIGN_IN_TOP_MID, 0, 10);
+
+    /* Style follows LLMC_DAC: the panel background, a 1 px border, plain
+     * white text.  This UI uses blue for buttons and the default alert,
+     * so the border borrows the accent green instead - the toast is the
+     * one element whose job is to say "this worked". */
+    lv_obj_set_style_local_bg_color(toast_obj, LV_OBJ_PART_MAIN,
+                                    LV_STATE_DEFAULT, COLOR_BG);
+    lv_obj_set_style_local_bg_opa(toast_obj, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, LV_OPA_COVER);
+    lv_obj_set_style_local_border_width(toast_obj, LV_OBJ_PART_MAIN,
+                                        LV_STATE_DEFAULT, 1);
+    lv_obj_set_style_local_border_color(toast_obj, LV_OBJ_PART_MAIN,
+                                         LV_STATE_DEFAULT, COLOR_LED_OK);
+    lv_obj_set_style_local_radius(toast_obj, LV_OBJ_PART_MAIN,
+                                  LV_STATE_DEFAULT, 0);
+
+    lv_obj_t *lbl = lv_label_create(toast_obj, NULL);
+    lv_label_set_text(lbl, message);
+    lv_obj_set_style_local_text_color(lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, LV_COLOR_WHITE);
+    lv_obj_set_style_local_text_font(lbl, LV_LABEL_PART_MAIN,
+                                     LV_STATE_DEFAULT, &MyCJK_12);
+
+    /* Start transparent, then fade up - otherwise the toast is at full
+     * opacity for one frame before the animation begins, which reads as a
+     * flicker. */
+    toast_anim_exec(toast_obj, LV_OPA_TRANSP);
+
+    /* In this LVGL the curve is a small descriptor struct, not a bare
+     * function pointer: lv_anim_path_set_cb() then lv_anim_set_path().
+     * (LVGL 8 collapsed this into lv_anim_set_path_cb(); LLMC_DAC's code
+     * is written against that newer API.) */
+    lv_anim_path_t path;
+    lv_anim_path_init(&path);
+    lv_anim_path_set_cb(&path, lv_anim_path_ease_in_out);
+
+    lv_anim_t anim_in;
+    lv_anim_init(&anim_in);
+    lv_anim_set_var(&anim_in, toast_obj);
+    lv_anim_set_exec_cb(&anim_in, toast_anim_exec);
+    lv_anim_set_values(&anim_in, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_path(&anim_in, &path);
+    lv_anim_set_time(&anim_in, TOAST_ANIM_MS);
+    lv_anim_start(&anim_in);
+
+    /* Hold, then fade out, then delete - all in ONE animation whose delay
+     * is the hold time.  An animation plus a timer (LLMC_DAC's shape)
+     * would leave the timer pointing at freed memory if the toast were
+     * replaced early; this way lv_anim_del() above cancels everything at
+     * once. */
+    lv_anim_t anim_out;
+    lv_anim_init(&anim_out);
+    lv_anim_set_var(&anim_out, toast_obj);
+    lv_anim_set_exec_cb(&anim_out, toast_anim_exec);
+    lv_anim_set_values(&anim_out, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_path(&anim_out, &path);
+    lv_anim_set_time(&anim_out, TOAST_ANIM_MS);
+    lv_anim_set_delay(&anim_out, TOAST_HOLD_MS);
+    lv_anim_set_ready_cb(&anim_out, toast_anim_out_ready);
+    lv_anim_start(&anim_out);
+}
+
+void gui_toast_config_saved(void)
+{
+    /* Convenience wrapper so callers do not have to know the string id.
+     * Takes the lock itself: the caller is the save task, which has no
+     * business holding a GUI mutex it did not acquire. */
+    gui_lock();
+    gui_show_toast(gui_get_string(STR_CONFIG_SAVED));
+    gui_unlock();
 }
 
 const char* gui_get_string(uint16_t str_id)
@@ -2155,6 +2921,14 @@ void gui_set_language(LanguageType lang)
             lv_label_set_text(*lang_refresh[i].label,
                               gui_get_string(lang_refresh[i].str_id));
         }
+    }
+
+    /* The overdrive LED is aligned to the right edge of the TX-power title,
+     * and that title just changed width with the language.  Re-run the
+     * alignment so the LED stays between the title and the power number
+     * instead of drifting into one of them. */
+    if (led_overdrive) {
+        lv_obj_align(led_overdrive, lbl_tx_title, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
     }
 
     /* The loop above writes labels directly, bypassing the change-guard
@@ -2395,8 +3169,9 @@ static void gui_process_poweroff(void)
 #ifndef LVGL_SIM
         /* Persist before dropping the rail: after power_soft_off() the
          * MCU is gone and an unsaved edit would be lost.  Done inline
-         * rather than waiting for app_config_task()'s 1 s tick so the
-         * 500 ms delay below starts from a known state. */
+         * rather than waiting for the save task to be woken and to get
+         * around to it, so the 500 ms delay below starts from a known
+         * state.  The lock keeps this write out of the save task's way. */
         if (config_is_dirty()) {
             config_lock();
             config_clear_dirty();
@@ -2431,9 +3206,14 @@ static void settings_menu_cb(lv_obj_t *obj, lv_event_t e)
 
         /* Every button on this screen opens a sub-page, so leaving the menu
          * is the moment a batch of edits is finished.  Publish the staged
-         * flag now; app_config_task() does the actual flash write a second
-         * later, at the lowest priority, because programming flash stalls
-         * instruction fetch and must not run inside an LVGL callback. */
+         * flag now: config_mark_dirty() wakes app_config_task(), which does
+         * the actual flash write at the lowest priority, because programming
+         * flash stalls instruction fetch and must not run inside an LVGL
+         * callback.
+         *
+         * The write is woken, not timed: the save task is blocked on a
+         * thread flag, so this commit starts the write immediately instead
+         * of waiting for the next tick. */
         gui_menu_commit_dirty();
 
         /* The overlay is going away regardless of which button was pressed
@@ -2524,6 +3304,10 @@ static void language_sel_cb(lv_obj_t *obj, lv_event_t e)
 #endif
         }
         lv_obj_del_async(obj);
+        /* The language / temperature-unit choice ends the settings session
+         * that opened this popup, so the staged edits are published now.
+         * One commit, one flash write, whatever was changed. */
+        gui_menu_commit_dirty();
     }
 }
 
@@ -2710,7 +3494,8 @@ static void baud_roller_save_cb(lv_obj_t *obj, lv_event_t e)
 #ifndef LVGL_SIM
     /* Commit the staged value.  The comm task will reprogram the UART
      * within the next 10 ms tick (it compares against last_applied_*_baud)
-     * and the config task flushes g_config to flash on its 1 s window. */
+     * and the config task flushes g_config to flash once the save task is
+     * woken. */
     *baud_spinner_field = s_pending_baud;
     gui_menu_mark_dirty();
 #else
@@ -2722,6 +3507,12 @@ static void baud_roller_save_cb(lv_obj_t *obj, lv_event_t e)
     baud_spinner_roller = NULL;
     baud_spinner_field  = NULL;
     baud_spinner_title  = NULL;
+
+    /* The baud rate is a setting the operator picked and confirmed, so it
+     * has to reach the flash.  Committing here ends the session that
+     * opened the spinner - one commit, one write, however many fields the
+     * session touched. */
+    gui_menu_commit_dirty();
 }
 
 /* Back button - close without persisting.  s_pending_baud is
@@ -3016,6 +3807,11 @@ static void cc_accept_cb(lv_obj_t *obj, lv_event_t e)
         cc_state = 0;
         cc_rebuild_pending = false;
         lv_scr_load(main_screen);
+        /* Leaving the calibration ends the settings session: the fitted
+         * coupler coefficients are in g_config now, so they have to reach
+         * the flash.  Without this commit the fit would be lost on the
+         * next reboot even though the operator was told it was accepted. */
+        gui_menu_commit_dirty();
     }
 }
 
@@ -3212,13 +4008,23 @@ static void cc_build_results(void)
 #ifndef LVGL_SIM
     /* cc_calculate() returns Watts per raw code.  Store the slope as
      * micro-Watt per ADC code so it stays an exact integer, and the
-     * intercept in milli-Watt. */
+     * intercept in milli-Watt.
+     *
+     * Four fields across two structs, written together, so the config lock
+     * is taken.  A save task snapshot landing between the forward and the
+     * reflected fit would put one channel's new curve in the flash beside
+     * the other channel's old one - and since the gain and the offset of
+     * a channel are applied together as `raw * gain + offset`, a gain from
+     * one fit with an offset from another is not a degraded reading, it is
+     * a reading of a coupler that does not exist. */
+    config_lock();
     volatile coupler_t *fwd_c = (cc_coupler_id == 1) ? &g_config.fwd1 : &g_config.fwd2;
     volatile coupler_t *ref_c = (cc_coupler_id == 1) ? &g_config.rev1 : &g_config.rev2;
     fwd_c->gain_uW_per_code = (int32_t)(fwd_slope * 1000000.0f);  /* W -> uW */
     fwd_c->offset_mW        = (int32_t)(fwd_off * 1000.0f);
     ref_c->gain_uW_per_code = (int32_t)(ref_slope * 1000000.0f);
     ref_c->offset_mW        = (int32_t)(ref_off * 1000.0f);
+    config_unlock();
 #endif
 
     if (cc_result_container) lv_obj_del(cc_result_container);
@@ -3363,6 +4169,8 @@ static lv_obj_t *si_overlay = NULL;
  * table stays in sync with user_adc.c without a second enum to maintain. */
 #define SI_ROW_COUNT  ADC1_RANK_COUNT
 static lv_obj_t *si_raw_labels[SI_ROW_COUNT];
+/*!< Shows the detected main-current sensor model (IM sensor). */
+static lv_obj_t *si_sensor_lbl = NULL;
 static lv_obj_t *si_val_labels[SI_ROW_COUNT];
 
 /* ADC2 has 2 regular ranks (IF PA / IF RADIO) plus 3 injected ranks (core
@@ -3589,6 +4397,18 @@ static void show_sensor_inspect(void)
     lv_obj_set_style_local_text_font(title, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, &MyCJK_12);
 
+    /* Which main-current sensor is fitted, as detected at power-on.  This
+     * page is the diagnostic one, so it is the right place to show it:
+     * the current reading, the AWD2 threshold and the COMP2 reference all
+     * depend on the model, and an engineer looking at a strange current
+     * value wants to know which part the firmware thinks is fitted. */
+    si_sensor_lbl = lv_label_create(si_overlay, NULL);
+    lv_obj_align(si_sensor_lbl, si_overlay, LV_ALIGN_IN_TOP_RIGHT, -6, 4);
+    lv_obj_set_style_local_text_font(si_sensor_lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &MyCJK_12);
+    lv_obj_set_style_local_text_color(si_sensor_lbl, LV_LABEL_PART_MAIN,
+                                       LV_STATE_DEFAULT, LV_COLOR_WHITE);
+
     /* Scrollable page that holds both sub-tables.  272 px tall screen
      * cannot fit ADC1 (9 rows) + ADC2 (5 rows) at 16 px/row, so the
      * page grows beyond the overlay and the operator scrolls within
@@ -3647,9 +4467,17 @@ void gui_update_sensor_inspect(void)
                 strncat(buf, "W", sizeof(buf) - strlen(buf) - 1U);
                 break;
             case ADC1_RANK_IM:
-                gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.im_mA, 2U);
+            /* Same rule as the main screen: an uncalibrated channel has
+             * no number to show, and "0.00A" would look like a real
+             * measurement of zero. */
+            if (adc_im_protection_valid()) {
+                /* 3 decimals: im_mA -> A (see the main-screen note). */
+                gui_fmt_fixed(buf, sizeof(buf), (int32_t)g_adc_data.im_mA, 3U);
                 strncat(buf, "A", sizeof(buf) - strlen(buf) - 1U);
-                break;
+            } else {
+                snprintf(buf, sizeof(buf), "--A");
+            }
+            break;
             case ADC1_RANK_REV1:
                 gui_fmt_fixed(buf, sizeof(buf),
                               ((int32_t)g_adc_data.rev1_mW + 500) / 1000, 0U);
@@ -3757,6 +4585,37 @@ void gui_update_sensor_inspect(void)
         if (si_adc2_val_labels[i]) lv_label_set_text(si_adc2_val_labels[i], buf);
     }
 
+    /* Which main-current sensor the firmware detected at power-on.  The
+     * model decides the zero point, the AWD2 threshold and the COMP2
+     * reference, so an engineer chasing a strange current reading wants
+     * to see it here rather than in a debugger.
+     *
+     * The wording is deliberately blunt: a board whose sensor was not
+     * recognised has NO current protection and NO current reading, and
+     * that must not be mistaken for a working one. */
+    if (si_sensor_lbl) {
+        const char *model;
+        switch (g_config.im_sensor_type) {
+        case IM_SENSOR_BIDIRECTIONAL:
+            model = "IM: BIDI";
+            break;
+        case IM_SENSOR_UNIDIRECTIONAL:
+            model = "IM: UNI";
+            break;
+        case IM_SENSOR_UNKNOWN:
+        default:
+            model = "IM: ???";
+            break;
+        }
+        lv_label_set_text(si_sensor_lbl, model);
+        /* Red when unrecognised: that is the one state in which the
+         * main-current protection is deliberately not armed. */
+        lv_obj_set_style_local_text_color(si_sensor_lbl, LV_LABEL_PART_MAIN,
+                                           LV_STATE_DEFAULT,
+                                           (g_config.im_sensor_type
+                                            == IM_SENSOR_UNKNOWN)
+                                           ? LV_COLOR_RED : LV_COLOR_WHITE);
+    }
 }
 
 /*============================================================================
@@ -3907,6 +4766,10 @@ static void band_comm_cb(lv_obj_t *obj, lv_event_t e)
             gui_menu_mark_dirty();
         }
 #endif
+        /* The protocol choice ends the settings session that opened this
+         * popup, so the staged edits are published now.  One commit, one
+         * flash write, whatever the session touched. */
+        gui_menu_commit_dirty();
     }
 }
 
@@ -3978,14 +4841,10 @@ static lv_obj_t *prot_val_labels[PROT_COUNT];
 static int32_t prot_val[PROT_COUNT];
 static int32_t prot_val_backup[PROT_COUNT];
 
-/* CC6920BSO-50A main-current sensor, used only to SHOW what the COMP2
- * reference voltage means in amps.  The sensor law is fixed by the
- * datasheet (V = 1650 mV + I * 26.4), so this is a display convenience
- * and not a calibration: the stored and applied quantity stays the
- * reference voltage in mV.  Both constants are scaled by 10 to match the
- * tenths used by prot_val / prot_format. */
-#define IM_SENSOR_ZERO_MV_TENTH   16500   /* 1650 mV in tenths */
-#define IM_SENSOR_MV_PER_A_TENTH   264    /*  26.4 mV/A in tenths */
+/* The COMP2 row no longer hardcodes 1650 mV or 26.4 mV/A: it reads the
+ * same measured zero point and the same sensitivity the applied
+ * reference is derived from, so the rating on screen cannot disagree
+ * with the hardware by several amps. */
 
 typedef struct {
     const char *name;
@@ -4031,10 +4890,19 @@ static void prot_from_config(void)
 #endif
 }
 
-/* Write the thresholds back into g_config. */
+/* Write the thresholds back into g_config.
+ *
+ * Ten fields in one go, so this counts as a multi-field write and takes
+ * the config lock.  Without it the save task could snapshot g_config half
+ * way through this block - the flash would then hold, say, the new
+ * reflected-power limit next to the old over-current one, with a CRC that
+ * matches that mixture perfectly well, so nothing would ever report it.
+ * The operator would come back after a reboot to a protection set that is
+ * half theirs and half the factory's, which is worse than either. */
 static void prot_to_config(void)
 {
 #ifndef LVGL_SIM
+    config_lock();
     g_config.band_rev2_max_w      = (uint16_t)(prot_val[0] / 10);
     g_config.band_rev2_swr_w       = (uint16_t)(prot_val[1] / 10);
     g_config.band_swr_max_x100    = (uint16_t)(prot_val[2] * 10);
@@ -4045,6 +4913,7 @@ static void prot_to_config(void)
     g_config.band_fwd2_max_w      = (uint16_t)(prot_val[7] / 10);
     g_config.comp1_ref_mV         = (uint16_t)(prot_val[8] / 10);
     g_config.comp2_ref_mV         = (uint16_t)(prot_val[9] / 10);
+    config_unlock();
 #endif
 }
 
@@ -4069,9 +4938,22 @@ static void prot_format(const ProtField *pf, int32_t val_tenth,
         }
         strncat(buf, "F", len - strlen(buf) - 1U);
     } else if (pf->derived_from_mv) {
-        /* A = (mV - 1650) / 26.4, carried in tenths. */
+        /* What the stored millivolts MEAN in amps, i.e. the rating the
+         * operator sees next to the reference they are about to trim.
+         *
+         * The baseline is the MEASURED resting point, not the nominal
+         * 1.65 V, because that is the baseline adc_im_comp2_ref_mV()
+         * derives the applied reference from - showing a rating that
+         * disagrees with the hardware line by several amps is exactly
+         * the confusion this row is meant to remove.
+         *
+         * Shown in tenths: the slider already carries tenths, and
+         * adc_im_mv_per_amp_q1() returns 264 = 26.4 mV/A, i.e. tenths
+         * of a mV per amp.  The two scales therefore cancel with no
+         * rounding of their own. */
+        int32_t zero_tenth = (int32_t)adc_im_zero_mV() * 10;
         int32_t amps_tenth =
-            (val_tenth - IM_SENSOR_ZERO_MV_TENTH) / IM_SENSOR_MV_PER_A_TENTH;
+            (val_tenth - zero_tenth) / (int32_t)adc_im_mv_per_amp_q1();
         gui_fmt_fixed(buf, len, val_tenth, 0U);
         strncat(buf, "mV/", len - strlen(buf) - 1U);
         {
@@ -4137,6 +5019,14 @@ static void prot_save_cb(lv_obj_t *obj, lv_event_t e)
         gui_menu_mark_dirty();
 #endif
         prot_screen = NULL; lv_scr_load(main_screen);
+        /* The Save button ends the protection editing session.  The ten
+         * sliders were staged in prot_val and are now in g_config, so the
+         * batch has to be committed - otherwise the thresholds would live
+         * only in RAM until some later, unrelated edit happened to flush
+         * them, and a power cut in between would lose the operator's work.
+         * One commit, one flash write, regardless of how many sliders
+         * were moved. */
+        gui_menu_commit_dirty();
     }
 }
 
@@ -4180,6 +5070,68 @@ static void prot_slider_create(lv_obj_t *parent, int idx, lv_coord_t x,
     prot_sliders[idx] = slider;
     prot_val_labels[idx] = val_lbl;
     lv_obj_set_event_cb(slider, prot_slider_cb);
+}
+
+/* Master protection switch.  Toggling it writes g_config straight away -
+ * unlike the threshold sliders, which only take effect on Save.  A
+ * protection switch that only bit on "Save" would be one forgotten tap away
+ * from being wrong in the dangerous direction, and the whole point of the
+ * control is that the operator's intent is unambiguous right now.
+ *
+ * With the switch off, protection_trigger_locked() returns immediately, so
+ * no fault produces a popup, a buzzer tone, a shutdown or an alert= on the
+ * CAT link.  The button is therefore the ONLY indication that the unit is
+ * unprotected - which is why it turns red rather than merely changing
+ * label, and why it lives on the settings screen rather than behind a
+ * confirmation dialog nobody reads.
+ *
+ * Deliberately does NOT clear a latched fault: that is protection_clear()'s
+ * job, and dropping an active alert here would leave a popup whose Dismiss
+ * button no longer has anything to dismiss.  Turn the switch back on, then
+ * dismiss. */
+static lv_obj_t *prot_enable_btn;
+static lv_obj_t *prot_enable_lbl;
+
+static void prot_enable_update_label(void)
+{
+    if (!prot_enable_lbl) return;
+    lv_label_set_text(prot_enable_lbl,
+        gui_get_string(g_config.allow_protection ? STR_PROT_ON
+                                                : STR_PROT_OFF));
+    /* Red when disarmed: the one state an operator should never be in
+     * without noticing. */
+    lv_obj_set_style_local_text_color(prot_enable_lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT,
+                                      g_config.allow_protection
+                                          ? LV_COLOR_WHITE
+                                          : LV_COLOR_MAKE(0xdf, 0x01, 0x01));
+}
+
+static void prot_enable_cb(lv_obj_t *obj, lv_event_t e)
+{
+    if (e == LV_EVENT_CLICKED) {
+        g_config.allow_protection = g_config.allow_protection ? 0U : 1U;
+        prot_enable_update_label();
+#ifndef LVGL_SIM
+        /* Persist immediately.  This one flag decides whether the unit
+         * protects itself, so it must not be lost to a power cycle that
+         * the operator did not expect.
+         *
+         * It goes through config_mark_dirty() like every other edit, not
+         * through a direct config_save(): a direct write would race the
+         * config task (two eeprom_save() calls can pick the same target
+         * slot and one record is silently lost), and it would program the
+         * flash from inside an LVGL callback, which is exactly where the
+         * deferred-save machinery exists to avoid.  The wake-up is
+         * immediate, so the write still happens right away - it just
+         * happens in the save task rather than in the callback.
+         *
+         * Note there is no gui_menu_mark_dirty() here: the flag is already
+         * committed, and staging it again would make the session-end
+         * commit write the whole record a second time. */
+        config_mark_dirty();
+#endif
+    }
 }
 
 static void show_protection_settings(void)
@@ -4247,6 +5199,18 @@ static void show_protection_settings(void)
     lv_obj_set_style_local_text_font(cancel_lbl, LV_LABEL_PART_MAIN,
                                       LV_STATE_DEFAULT, &MyCJK_12);
     lv_obj_set_event_cb(cancel_btn, prot_cancel_cb);
+
+    /* Protection master switch, bottom-left where the two text buttons
+     * above leave the row empty.  Wider than they are because the label
+     * is "Protection: OFF" rather than "Save". */
+    prot_enable_btn = lv_btn_create(prot_container, NULL);
+    lv_obj_set_pos(prot_enable_btn, MARGIN_X, VER_RES - 40);
+    lv_obj_set_size(prot_enable_btn, 118, 32);
+    prot_enable_lbl = lv_label_create(prot_enable_btn, NULL);
+    lv_obj_set_style_local_text_font(prot_enable_lbl, LV_LABEL_PART_MAIN,
+                                      LV_STATE_DEFAULT, &MyCJK_12);
+    prot_enable_update_label();
+    lv_obj_set_event_cb(prot_enable_btn, prot_enable_cb);
 }
 
 /* Static so lv_btnmatrix_set_map pointer stays valid after function return */
@@ -4280,6 +5244,13 @@ void gui_toggle_menu(void)
      * stacking another overlay (which would trap the user with multiple
      * stacked layers and is the bug the GUI agent just fixed). */
     if (settings_menu_overlay != NULL) {
+        /* Closing the menu ends the editing session, exactly like pressing
+         * Cancel does - so the staged edits have to be published here too.
+         * Without this the operator's changes were dropped on the floor
+         * whenever the menu was closed with the panel's Settings button
+         * instead of the menu's own Cancel entry. */
+        gui_menu_commit_dirty();
+
         lv_obj_del(settings_menu_overlay);
         settings_menu_overlay = NULL;
 
